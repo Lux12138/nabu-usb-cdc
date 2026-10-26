@@ -1,0 +1,9 @@
+.cache/
+tmp/
+logs/
+*.o
+*.a
+*.bin
+*.img
+*.log
+__pycache__/
