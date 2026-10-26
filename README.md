@@ -14,7 +14,7 @@ bypass、再到主机枚举并读到内核日志的完整过程，含代码、�
 | 主机枚举 | `USB\VID_1209&PID_316D\QCOMXNUUSBDEBUG` → `COM3`，boot 后约 25–32 s |
 | 设备侧 | `init=1 phase=3 err=0`；`dr=0 ds=1 bank=0x37 le=3 lr=0x37`；`lt=8 tb=1`（DTR） |
 | 主机读取 | 单轮捕获 10,806 B / 179 行内核日志，含 APFS 挂载与 launchd/dyld 的 AMFI 拒绝正文 |
-| 复位 | 日志静止 31.7 s 后内核复位，82 s 回到 recovery，PON `0x80041` |
+| 复位 | 日志静止 31.7 s 后由**内核 20 s 狗**（`nabu-hang-reset=20`）复位，82 s 回到 recovery，PON `0x80041` |
 | 链路速率 | Full Speed（`DSTS.CONNECTSPD=1`），USB2 线缆/接口即可 |
 
 ## 两个关键发现
@@ -69,6 +69,12 @@ py -3 tools/cdc-capture.py --seconds 180 --raw com.bin --tsv com.tsv
 - 内核在 launchd/dyld 签名被拒后不再输出，约 31 s 后被复位源带走；串口窗口约 32 s。
 - 没有 banner 行：初始化后的 backlog 从 `zones` 类早期文本开始。
 - `init=1` 之后 `PE_kputc` 切到 USB，userdata 窗口不再更新；判卡点以串口为准。
+- **panic 正文到不了串口**：`nabu_panic_restart()` 排在 `qcom_usb_debug_panic_drain()` 之前，
+  panic 只能从设备屏幕上拍照读回；修顺序前不要指望串口里有 backtrace。
+- **自动复位依赖"内核还活着"**：上面那张结果表的复位来自内核 20 s 狗，它是一条普通内核线程，
+  panic 或 CPU 挂死后不会跑。官方基座（不含 Mu 侧硬件狗）在内核挂死时**从不自动回 recovery**，
+  只能长按电源。区别见 [docs/02-bringup-log.md](docs/02-bringup-log.md) 的"复位手段可用性"。
+- 捕获脚本以 `timeout` 结束时含义是"这一轮设备从未复位"，不是"脚本失败"。
 
 ## 许可与来源
 

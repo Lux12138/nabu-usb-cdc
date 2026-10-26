@@ -16,6 +16,10 @@
 | 8 | `53def85d` / `5077db95` | `init=1 dr=0 ds=1 bank=0x37 le=3 lr=37` | **bypass-bank 通**；主机 COM3 出现 32 s |
 | 9 | `e45a3c9a` / `6e55740e` | `init=1 … lt=8 tr=39 ta=1 tb=1` | Win32 逐步打开成功；读到 4096 B |
 | 10 | 同 9（未重刷） | `lt=8 tr=31 tb=1` | 持续捕获 10,806 B / 179 行；日志静止 31.7 s 后复位 |
+| 11 | `5c138303` / `5077db95`（merge 基座，两条 AMFI 参数） | `window_new=0`，串口止于 `root power domain not yet available: 19` | **早期挂住**：`cs_enforcement_disable` 是头号嫌疑，未定性 |
+| 12 | `2cb58100` / `5077db95`（只留 `amfi_get_out_of_my_way=1`） | `init=1 dr=0 ds=1`；10,602 B 到 launchd/dyld 被拒 | **AMFI 开关无效**：`unsuitable CT policy 0` 照旧 |
+| 13 | merge-r1 `53296222` / `e982ff48`（官方基座，无 `0004`） | 9,327 B，止于 `owner stage=1 … err=80`；**不复位**，PON `0x80081` | 官方基座零兜底；`1<<63` 未复现 |
+| 14 | merge-r2 `573ac9b0` / `3358c658`（+`0004`） | `owner SystemOS mount skipped` → launchd/dyld 被拒 → **panic 在屏上**；301 s 未复位 | 阶段 7 在官方基座复现；panic 进不了串口（见下） |
 
 ## r5–r7 时间线（示例）
 
@@ -38,12 +42,33 @@
   → `AMFI: '/sbin/launchd' is adhoc signed.` / `unsuitable CT policy 0 … rejecting signature.`
   → `proc 1: load code signature error 4 for file "launchd"`
   → 同样拒绝 `dyld` → `AMFI: hook..execve() killing pid 1`。
-- **之后没有 panic/backtrace**，31.7 s 后复位。
+- **之后串口没有 panic 文本 —— 但 panic 确实发生了。** 屏幕上能看到
+  `unexpected SIGKILL of launchd  with reason -- namespace 9 code 0x8 description none` + frames + `pages/free`。
+  串口拿不到的原因是**代码顺序**：`osfmk/kern/debug.c` 的 `panic_spin_forever()` 里
+  `nabu_panic_restart()` 在 `qcom_usb_debug_panic_drain()` **之前**，带 `nabu-panic-restart` 时先复位，drain 永远执行不到。
+  （本表第 1–10 轮是 dwc3 基座，args 里没有该开关，所以是内核 20 s 狗在静止 20 s 后 fire → 复位。）
 
 > 结论：内核实际已经走到 launchd；此前“窗口只到 attach-done”是 `init=1` 后日志切到 USB、
 > userdata 窗口不再更新造成的假象。
 
-## 复位与 PON
+## 复位与 PON（实测，含一次自我纠正）
 
-- 每轮回 recovery 71–81 s，PON 恒 `0x80041`（内核侧 PSCI / 复位源）。
-- 回滚线（300 s 未回 / PON `0x800c1` / 无任何输出）从未触发；板子 10 轮未挂死。
+- 第 1–10 轮（dwc3 基座）每轮 71–81 s 回 recovery，PON 恒 `0x80041`。
+  **复位者是内核 20 s 狗**（`nabu-hang-reset=20`），不是 Mu 硬件狗 —— 57–58 s 复位 ≪ 240 s bite。
+- PON 实测映射：`0x80041` = 内核侧 PSCI（**分不清**是狗 fire 还是 XNU 自己复位）；
+  `0x80081` = 冷启/人工（**长按之后也是它**）；`0x800c1` = panic 后硬复位。
+  （早先文档把 `0x800c1` 写成"长按硬复位"，是错的，此处已改。）
+- 第 13–14 轮（官方基座 merge-r1/r2）**一次都没自动复位**：301 s 未回、捕获以 `timeout` 结束、
+  COM3 全程未消失，最后 PON `0x80081`（人工长按救回）。
+
+## 复位手段可用性（这张表决定无人值守能不能成立）
+
+| 手段 | 内核活着 | panic / CPU 挂死 |
+|---|---|---|
+| 内核 20 s 狗（`nabu-hang-reset`） | ✅ 实测有效（第 1–10 轮） | ❌ 失效：panic 上下文里狗线程不再被调度（第 13–14 轮实证） |
+| `nabu-panic-restart` hook | 未验证 | **不可判**：`nabu_mark_text` 只进内存 ring、panic 路径故意不写 UFS，事后无残留 |
+| Mu APSS 硬件狗（`NabuWdtDxe`，240 s） | ✅ 独立于内核 | ✅ 唯一能救 panic 的手段（官方 FV 里**没有**这个驱动） |
+| `adb reboot` / 带内 USB `REBOOT` | ✅ | ❌ 实测 panic 后 COM3 仍在但打开报 `winerror 31`（设备不响应） |
+| 人工长按 | ✅ | ✅ 但要人到现场 |
+
+> 结论：**panic 类故障只有硬件狗能兜底**。这也是 r3 在做"可开关看门狗"的原因。

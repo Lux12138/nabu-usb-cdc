@@ -43,8 +43,30 @@
     `VID_1209/PID_316D/SER=QCOMXNUUSBDEBUG` 是设备固件常量，可以保留。
 17. 二进制（kernel/payload/boot 镜像、`.a`）不入库，只发源码与工具。
 
-## 复位
+## 复位与观测
 
 18. 任何 reboot/切 fastboot 前先 arm misc 并读回；`boot-recovery` 是一次性的，
     ABL 读过即清。
-19. PON 判读：`0x80041` = 内核侧 PSCI/复位源；`0x800c1` = 长按硬复位（视为异常）。
+19. PON 判读（实测）：`0x80041` = 内核侧 PSCI —— **分不清**是狗 fire 还是 XNU 自己复位；
+    `0x80081` = 冷启/人工（长按后也是它）；`0x800c1` = panic 后硬复位。
+20. **panic 场景内核狗必然失效**：CPU 在 panic 上下文自旋，狗线程不被调度。
+    能兜住的只有独立于内核的硬件狗（Mu `NabuWdtDxe`）。别把"每轮都能自动回来"当成基座无关的事实。
+21. **panic 文本进不了串口是代码顺序问题**：`panic_spin_forever()` 里 `nabu_panic_restart()`
+    排在 `qcom_usb_debug_panic_drain()` 之前 → 复位先发生，drain 永远到不了。
+    判据"串口没有 panic"≠"没有 panic"。
+22. `nabu_mark_text` 只写内存 ring（`NativeUfs.cpp` 里它转成 `nabu_log_puts`），**不上屏也不落盘**；
+    所以"屏幕/窗口里没看到某个标记"**不能**证明对应代码没执行。
+23. **userdata 窗口的正文会混着上一轮的残留**：`window_new` 只哈希首块（头），
+    文本块可能整批是旧内容（实测见过两轮时间戳精确到微秒相同）。
+    判"本轮到哪"必须用**只有本轮才可能出现的字符串**定位，或直接用串口。
+24. 捕获脚本以 `timeout` 结束（而不是 `disconnect`）= **端口从未消失 = 全程没有复位**；
+    判断活性看 tsv 的最后一条真实读取时间，别看脚本自己打的 summary 时间戳。
+
+## 构建与打包
+
+25. 证明"真的重编过"要用**内容差异**（归档 sha、内核符号数、新字符串是否出现），
+    不要用文件 mtime —— 复制也会刷新 mtime。
+26. `--unique-chip-id` 之外，**trust cache 是打包参数**：`payload.py` 的 `--trust-cache` 会把 bundle
+    落成 `payloads/kernel.macho.trustcache` 并写进 ADT，`DarwinBoot.c` 有消费端
+    （`ValidTrustCaches()` / ADT 里找 `TrustCache` 节点）。不带这个参数时内核会打
+    `no external trust caches found (segment length is zero)` —— 这是配置缺失，不是缺功能。

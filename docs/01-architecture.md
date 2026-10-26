@@ -77,6 +77,29 @@ bypass 只允许计划里的“地址/值”对。
   `SET_CONTROL_LINE_STATE`（置 DTR）。裸 `ReadFile` 前先 `EscapeCommFunction(SETDTR)`。
 - 写有 backlog：主机打开端口后先补发更早的日志（最早可见从 `zones` 开始）。
 
+## 控制通道（同一个 CDC 口，双向）
+
+上游本来就有一条命令通道，我们只是把它接进了内核，**不需要自己设计裸字符协议**：
+
+- 帧格式（`module/kernel/QcomUsbControl.h:182`）：
+  `SXNU1 <16hex session> <8hex seq> <VERB> <8hex crc32>`；
+  动词 `HELLO / PING / STATUS / REBOOT / SCREENSHOT / SHOTNEXT`。
+- 会话与防重放在 `sxnu_control_accept/commit`（同文件 `:236`）里，序列号回退或 CRC 不符
+  一律计入 `control_rejected`。
+- 设备侧入口 `qcom_usb_debug_control_start()`（`module/kernel/QcomXnuUsbDebug.c:1267`），
+  由我们的补丁调用（`patches/0006-nabu-usbdebug-worker.patch:167`）。
+- `REBOOT` 是**一次外交付**：`control_handle_frame()` 只回 `OK queued` 并置
+  `control_reboot_requested`（`:1208-1240`），真正复位由 worker 起的专用线程完成
+  （`patches/0006-…patch:54-98`：`qcom_usb_debug_control_take_reboot()` →
+  `arm_reboot()` → `reboot_kernel(0, NULL)`，走正常 APFS sync/unmount）。
+  没装 hook 时回 `ERR nohook`，重复请求回 `ERR busy`。
+- 观测不必加字段：`qcom_usb_debug_status` 里已有
+  `control_enabled / control_hook_owned / control_reboot_state / control_rejected`
+  （`module/include/QcomXnuUsbDebug.h:93`），直接打印即可判断通道是否真的活着。
+- 主机侧发帧脚本：`module/scripts/xnu_usb_control.py`。
+
+**没有** power-off 动词，也不建议加：关机后必须有人按电源才能再起来，与无人值守相冲。
+
 ## 状态字段（`qcom_usb_debug_status`，内核打印用）
 
 bypass 路径下的映射（结构体未加字段）：
