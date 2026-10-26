@@ -82,6 +82,7 @@ def main():
 
     total = 0
     last_read = None
+    last_read_at = None
     started = time.time()
     reason = 'timeout'
     try:
@@ -103,6 +104,7 @@ def main():
                 raw.write(data)
                 total += len(data)
                 last_read = time.time()
+                last_read_at = now()
                 tsv.write('%s %d %s\n' % (now(), len(data), data[:16].hex()))
                 sys.stdout.write(data.decode('utf-8', 'replace'))
                 sys.stdout.flush()
@@ -115,7 +117,7 @@ def main():
     gap = 'n/a' if last_read is None else '%.3fs' % (time.time() - last_read)
     log('end %s bytes=%d elapsed=%.1fs last_read=%s gap_to_end=%s'
         % (reason, total, time.time() - started,
-           'never' if last_read is None else now(), gap))
+           'never' if last_read is None else last_read_at, gap))
     return 0 if total else 4
 
 
