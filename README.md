@@ -14,7 +14,7 @@ bypass、再到主机枚举并读到内核日志的完整过程，含代码、�
 | 主机枚举 | `USB\VID_1209&PID_316D\QCOMXNUUSBDEBUG` → `COM3`，boot 后约 25–32 s |
 | 设备侧 | `init=1 phase=3 err=0`；`dr=0 ds=1 bank=0x37 le=3 lr=0x37`；`lt=8 tb=1`（DTR） |
 | 主机读取 | 单轮捕获 10,806 B / 179 行内核日志，含 APFS 挂载与 launchd/dyld 的 AMFI 拒绝正文 |
-| 复位 | 日志静止 31.7 s 后由**内核 20 s 狗**（`nabu-hang-reset=20`）复位，82 s 回到 recovery，PON `0x80041` |
+| 复位 | 日志静止约 30 s 后复位，80 s 回到 recovery，PON `0x80041`。复位源是 **Mu 侧 APSS 硬件狗**，不是内核侧的狗（三档实测见 [docs/02](docs/02-bringup-log.md)） |
 | 链路速率 | Full Speed（`DSTS.CONNECTSPD=1`），USB2 线缆/接口即可 |
 
 ## 两个关键发现
@@ -32,7 +32,7 @@ bypass、再到主机枚举并读到内核日志的完整过程，含代码、�
 module/    QcomXnuUsbDebug 的本地副本（上游 MIT；我们的改动见 docs/module-changes.patch）
 patches/   XNU 侧补丁（0005 console / 0006 worker / 0007 rebase + 诊断打印）
 tools/     主机与设备侧取证脚本（Windows / WSL）
-docs/      架构、轮次记录、踩坑、原始证据、构建方法
+docs/      架构、轮次记录、踩坑、原始证据、构建方法、dyld cache 的取法
 ```
 
 ## 快速开始
@@ -71,9 +71,9 @@ py -3 tools/cdc-capture.py --seconds 180 --raw com.bin --tsv com.tsv
 - `init=1` 之后 `PE_kputc` 切到 USB，userdata 窗口不再更新；判卡点以串口为准。
 - **panic 正文到不了串口**：`nabu_panic_restart()` 排在 `qcom_usb_debug_panic_drain()` 之前，
   panic 只能从设备屏幕上拍照读回；修顺序前不要指望串口里有 backtrace。
-- **自动复位依赖"内核还活着"**：上面那张结果表的复位来自内核 20 s 狗，它是一条普通内核线程，
-  panic 或 CPU 挂死后不会跑。官方基座（不含 Mu 侧硬件狗）在内核挂死时**从不自动回 recovery**，
-  只能长按电源。区别见 [docs/02-bringup-log.md](docs/02-bringup-log.md) 的"复位手段可用性"。
+- **自动复位只来自 Mu 侧硬件狗**：同一停点上，`WDT.CFG mode=0` 实测 109 s 以上完全不回（要人工长按），
+  `mode=1` 时 boot+60 s 自动回来。内核侧的 `nabu-hang-reset` **一次都没有 fire 过**，不要把它当兜底。
+  PON 也无法区分复位源（硬件狗与内核 PSCI 都是 `0x80041`），唯一可靠的判据是 **COM3 有没有出现**。
 - 捕获脚本以 `timeout` 结束时含义是"这一轮设备从未复位"，不是"脚本失败"。
 
 ## 许可与来源

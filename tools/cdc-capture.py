@@ -80,6 +80,15 @@ def main():
         log('could not open %s' % port)
         return 3
 
+    # The module only pumps IN data while dtr=1; pyserial asserts both on open,
+    # but make it explicit so a stale handle can never read as "zero bytes".
+    try:
+        s.dtr = True
+        s.rts = True
+        log('dtr=%s rts=%s' % (s.dtr, s.rts))
+    except Exception as e:  # noqa: BLE001
+        log('dtr/rts set failed: %s' % e)
+
     total = 0
     last_read = None
     last_read_at = None

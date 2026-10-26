@@ -47,13 +47,17 @@
 
 18. 任何 reboot/切 fastboot 前先 arm misc 并读回；`boot-recovery` 是一次性的，
     ABL 读过即清。
-19. PON 判读（实测）：`0x80041` = 内核侧 PSCI —— **分不清**是狗 fire 还是 XNU 自己复位；
+19. **PON 不能判复位源**（三档实测）：硬件狗复位的 r3a/r3b 与历史内核 PSCI 复位都是 `0x80041`；
     `0x80081` = 冷启/人工（长按后也是它）；`0x800c1` = panic 后硬复位。
-20. **panic 场景内核狗必然失效**：CPU 在 panic 上下文自旋，狗线程不被调度。
-    能兜住的只有独立于内核的硬件狗（Mu `NabuWdtDxe`）。别把"每轮都能自动回来"当成基座无关的事实。
+    要判"内核跑没跑过"只能看 **COM3 有没有出现**，别看 PON。另外**名义 bite ≠ 实际**：
+    `mode=1` 写 240 s，实测 boot+60 s 内就复位，标定前不要按名义值规划。
+20. **内核侧的 `nabu-hang-reset` 不可依赖**：三档实验（含 109 s 完全不回来的 r4）里它一次都没 fire。
+    能兜底的只有 Mu 侧硬件狗，而它的编译默认档位是 0（`NABU_WDT_DEFAULT=0`），
+    ESP 文件读不到就不武装 —— fail-safe，但也意味着"没报错"不等于"狗开着"。
 21. **panic 文本进不了串口是代码顺序问题**：`panic_spin_forever()` 里 `nabu_panic_restart()`
     排在 `qcom_usb_debug_panic_drain()` 之前 → 复位先发生，drain 永远到不了。
-    判据"串口没有 panic"≠"没有 panic"。
+    判据"串口没有 panic"≠"没有 panic"。把顺序改过来也不够：drain 在 panic 上下文里还可能因
+    `phase != ACTIVE` 或拿不到锁直接返回，所以"没有 `QCOM PANIC END`"同样不能反证没有 panic。
 22. `nabu_mark_text` 只写内存 ring（`NativeUfs.cpp` 里它转成 `nabu_log_puts`），**不上屏也不落盘**；
     所以"屏幕/窗口里没看到某个标记"**不能**证明对应代码没执行。
 23. **userdata 窗口的正文会混着上一轮的残留**：`window_new` 只哈希首块（头），

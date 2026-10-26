@@ -112,8 +112,41 @@ unexpected SIGKILL of launchd  with reason -- namespace 9 code 0x8 description n
 
 | 基座 | FV | 复位源 | 挂死时是否自动回 recovery | PON |
 |---|---|---|---|---|
-| dwc3（r5–r10） | `30468b54…`，含 `NabuWdtDxe`（`NABU_WDT_MODE 1`，bite 240 s） | 内核 20 s 狗（CPU 还活着时） | 是，71–82 s | `0x80041` |
-| 官方（merge-r1/r2） | `8bb58948…`，不含 `NabuWdtDxe` | 只有内核 20 s 狗 + panic hook | **否**，需长按 | `0x80081` |
+| dwc3（r5–r10） | `30468b54…`，含 `NabuWdtDxe`（`NABU_WDT_MODE 1`） | **Mu 侧 APSS 硬件狗** | 是，71–82 s | `0x80041` |
+| 官方（merge-r1/r2） | `8bb58948…`，不含 `NabuWdtDxe` | 无（内核 20 s 狗从未 fire） | **否**，需长按 | `0x80081` |
+
+三档开关实验（r3a/r3b/r4）见 [docs/02-bringup-log.md](02-bringup-log.md)；
+同一停点上 `WDT.CFG mode=0` 109 s 不回、`mode=1` boot+60 s 自动回，是"复位来自硬件狗"的直接证据。
+
+## 阶段 7 打通（r5，2026-10-27，`--trust-cache`）
+
+同一份内核只加了打包参数 `--trust-cache original-static-system.bundle`（61,356 B / `7416ca4f…`）：
+
+```
+attempting to load 2 external trust cache modules
+loaded external trust cache module: 0
+loaded external trust cache module: 1
+completed loading external trust cache modules
+...
+load_init_program: attempting to load /sbin/launchd
+```
+
+- 对照 r3a/r4（不带 trust cache）：`no external trust caches found (segment length is zero)`，
+  之后是 `AMFI … unsuitable CT policy 0` + `load code signature error 4`；
+  r5 里这两类行出现 **0 次**。
+- 签名层过后，launchd 真的 exec 起来，卡在下一个问题（缺 dyld shared cache）：
+
+```
+Library not loaded: /usr/lib/libSystem.dylib
+  Referenced from: <4B525992-8C69-315E-A51A-CC9433E45B51> /sbin/launchd
+  Reason: tried: '/usr/lib/libSystem.dylib' (no such file, no dyld cache)
+pid 1 exited -- exit reason namespace 6 subcode 0x1
+coredump (launchd, pid 1): failed to open core dump file /private/var/cores/launchd.core: error 2
+```
+
+- 本轮 80 s 回 recovery，PON `0x80041`（`mode=1` 的硬件狗咬）。
+- `window_new=1` 是第一次窗口头有更新，但解开是 `length=0 / dropped=15115`：
+  写入路径活着、正文没落盘就被复位 —— 无人值守的读回通道还需要单独修。
 
 ## 时间线与复位
 
