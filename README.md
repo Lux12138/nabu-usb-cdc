@@ -53,6 +53,8 @@ CONFIG_XNU_EXTRA_LD_ARCHIVES="<build>/libQcomXnuUsbDebug.a"
 
 引导参数：`qcom-usb-debug=1 qcom-usb-prepare=1`。
 
+首次 clone 后给脚本加执行位：`chmod +x tools/*.sh`。
+
 主机捕获（Windows，pyserial）：
 
 ```powershell
