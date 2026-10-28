@@ -25,7 +25,7 @@ bypass、再到主机枚举并读到内核日志的完整过程，含代码、�
 |---|---|
 | 控制通道 | `HELLO` 返回非零 session；`STATUS OK usb=3 er=0 rej=0` |
 | 串口 REBOOT | 命令被接受后**同秒 USB 消失**，`boot+12~15 s` 落 recovery |
-| 硬件狗定时停车 | 内核在 `boot+~83` 武装 APSS WDT ⇒ **boot+114（COM+86）咬合** ⇒ `boot+129` 回 recovery |
+| 硬件狗定时停车 | 内核在 `boot+~83` 武装 APSS WDT ⇒ **武装后约 32 s 咬合（boot+114，COM+86）** ⇒ `boot+129` 回 recovery |
 | 完整启动日志 | **146,128 B / 2,031 行**（与自动复位同一轮拿到） |
 | 无人值守一轮 | `reboot → TWRP → bootloader → 核 sha → flash cust → boot → 采集 → 验证`，**86 s / 轮，零人工** |
 
@@ -35,8 +35,8 @@ bypass、再到主机枚举并读到内核日志的完整过程，含代码、�
   但 `halt_all_cpus` 永不执行），必须 arm 成功后**直接 PSCI `SYSTEM_RESET`**。
 - 采集要 95 s 才够，但控制帧的 **RX 在 `boot+70~90 s` 后失效** ⇒ 必须让内核/硬件自己定时复位。
 - 内核侧四种定时写法（`delay_for_interval`、`assert_wait_deadline` 线程、worker 轮询、写路径轮询）
-  前三种都失败，最终落地为：**内核只决定"何时武装"，复位交给 APSS 硬件狗**（咬合上限 ~64 s，
-  `BITE_MS` 改大无效）。细节与判据见 [docs/07-control-channel-and-wdt-park.md](docs/07-control-channel-and-wdt-park.md)。
+  前三种都失败，最终落地为：**内核只决定"何时武装"，复位交给 APSS 硬件狗**（武装后约 32 s
+  咬合，`BITE_MS` 改大无效）。细节与判据见 [docs/07-control-channel-and-wdt-park.md](docs/07-control-channel-and-wdt-park.md)。
 
 主机侧新增两个工具：[`tools/port-session.py`](tools/port-session.py)（同一句柄既落日志又发帧）、
 [`tools/pipeline.py`](tools/pipeline.py)（整轮编排）。
@@ -108,8 +108,9 @@ py -3 tools/cdc-capture.py --seconds 180 --raw com.bin --tsv com.tsv
   板子仍能进 recovery。
 - **`kprintf` 不会进 CDC**：诊断输出必须走 `qcom_usb_debug_write()` 或直写环。
 - **`delay_us()` 拒绝 >10 ms**，并顺手把 `io_failed=1`（随后 phase 转 `IO_FAILED`、日志停发）。
-- **APSS 狗咬合上限 ~64 s**（21 位计数 × 32.768 kHz），改 `NABU_WDT_BITE_MS` 无效；
-  要更晚只能改"何时武装"。它的驱动在 `boot.img` 的固件卷里，不在 payload。
+- **APSS 狗咬合 = 武装后约 32 s**（`BARK=BITE=2097152 ticks` 实测；换算出的 64 s 不成立，
+  寄存器语义未定），改 `NABU_WDT_BITE_MS` 无效；要更晚只能改"何时武装"。
+  它的驱动在 `boot.img` 的固件卷里，不在 payload。
 
 ## 许可与来源
 

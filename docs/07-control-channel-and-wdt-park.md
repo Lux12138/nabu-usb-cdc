@@ -95,25 +95,38 @@ FS，根卷是只读 APFS，本来没有需要落盘的数据）。而 `halt_all
 
 ```
 WDT.CFG  mode=0                      # Mu 不再在 ExitBootServices 预武装
-kernel   nabu-park-after=32          # 到点调用 nabu_wdt_arm_now()
-         → WDT EN=0 → BARK=BITE=ticks → EN=1
-         → 硬件在 ~64 s 后咬合 → SoC 复位 → ABL 读 misc → recovery
+kernel   nabu-park-after=32          # 只设 deadline：boot+50.5 打 [park] arm
+         → deadline 到点（boot+82.5）才调 nabu_wdt_arm_now()，打 [park] wdt
+         → WDT EN=0 → BARK=BITE=2097152 ticks → EN=1
+         → 硬件在 ~32 s 后咬合 → SoC 复位 → ABL 读 misc → recovery
 ```
 
-实测（三轮一致）：
+实测（四轮）：
 
-| 轮次 | 配置 | arm | 咬合 | recovery | 日志 |
-|---|---|---|---|---|---|
-| r10z3s | Mu `mode=1`（预武装 240 s） | boot+0 | **boot+61** | boot+74 | 15.8 KB |
-| r10z3t | Mu `mode=1`（预武装 540 s） | boot+0 | **boot+64** | boot+76 | 15.8 KB |
-| **r10z3v** | Mu `mode=0` + XNU `park-after=32` | counter≈50.7 s | **boot+114（COM3+86）** | boot+129（+15 s） | **146 KB** |
+| 轮次 | 配置 | arm（真正执行 `nabu_wdt_arm_now()`） | 咬合 | arm→咬合 | recovery | 日志 |
+|---|---|---|---|---|---|---|
+| r10z3s | Mu `mode=1`（预武装 240 s） | 反推 boot+29 | **boot+61** | ~32 s | boot+74 | 15.8 KB |
+| r10z3t | Mu `mode=1`（预武装 540 s） | 反推 boot+32 | **boot+64** | ~32 s | boot+76 | 15.8 KB |
+| **r10z3v** | Mu `mode=0` + XNU `park-after=32` | **82.7 s**（deadline 到点） | **boot+114（COM3+86）** | **31.3 s** | boot+129（+15 s） | **146 KB** |
+| wdt-final | 同上，复现轮 | **82.5 s** | ~boot+114.5（推断） | ~32 s | boot+129 | 145,989 B |
+
+> `[park] arm n=32 ticks=614400000` 打在**设置 deadline** 的时刻（boot+50.5），不是武装时刻；
+> 武装发生在 deadline 到点、打出 `[park] wdt` 的那一刻（boot+82.5）。
+> 判据：`qcom_park_fire()` 第一件事是清 `qcom_park_deadline`，清零后 worker 循环不再打
+> `[park] wait`；而第 203/205 行在 61.7 s / 72.4 s 仍在打 `wait` ⇒ 武装不可能早于 72.4 s。
 
 ### APSS 狗的硬约束（实测）
 
 - `WDT_TICK_HZ = 32768`、`NABU_WDT_BITE_MS` 是 **Mu 编译期常量**，`WDT.CFG` 只认 `mode=N`；
-- **咬合上限约 64 s**：`BITE_MS` 240000 → 61 s，540000 → 64 s。`2097152 ticks ≈ 64 s`
-  正好是 21 位计数在 32.768 kHz 下的满量程 ⇒ **写更大的值只是回绕**。
-  "把咬合时间往后延"在硬件层做不到，只能改「什么时候武装」。
+- **咬合 = 武装后约 32 s，不是 64 s**：`BARK=BITE=2097152 ticks`，实测 r10z3v 82.7 → 114.8 s、
+  wdt-final 82.5 → ~114.5 s。早先按 `2097152 / 32768 = 64 s` 换算是错的；等效时钟更像
+  ~64.9 kHz（或有效位宽不是 21 位），**寄存器语义仍属未定**。
+- `BITE_MS` 240000 → boot+61、540000 → boot+64 只差 3 s，**不能**用来证明"有 64 s 上限"：
+  Mu 的武装时刻没有时间戳，两轮 ExitBootServices 本身的漂移就足以解释这 3 s。
+- **唯一可控的是「何时武装」**：`park-after=N` 把 deadline 设在 `[park] arm` 打出后 N 秒
+  （本轮 50.5 → 82.5），复位 ≈ 该时刻 + 32 s。要更晚只需加大 N。
+- 未定项：`EN=1` 是否清零计数器（两轮 arm 时刻差 <0.5 s，分不出来）。判别法：单开一轮
+  `park-after=52`（或 80），只看咬合是否随 arm 平移 ±20 s，不夹带其他改动。
 - Mu 的驱动 `NabuWdtDxe` 在 **boot.img 的固件卷**里，不在 payload；改它必须重打 boot 镜像。
   在内核侧武装则可以完全不碰固件。
 
@@ -156,8 +169,9 @@ step8 park：等 recovery ≤120 s（复位源=内核/WDT，非主机）
 7. **worker 循环会退出**：`if (status.phase != QCOM_USB_DEBUG_ACTIVE) break;` —— userland
    起来后 phase 变化，之后没人再检查。任何「到点做事」的逻辑，要么放在写路径，要么交给硬件。
 8. **复位归因要看来源，不要看时间窗**：落到 recovery 的事件可能正好落在预期窗口内，
-   实际却是人按的键。可靠判据只有三条：日志里出现内核侧标记（`[park] wdt`）、
-   主机收到 `REBOOT OK`、或者用户确认没按键。
+   实际却是人按的键。可靠判据只有三条：主机收到 `REBOOT OK`、用户确认没按键、
+   或者「`[park] wdt` 已出现 **且** 复位落在它之后约 32 s」。注意 `[park] wdt` 本身
+   只证明**武装**，不证明复位来源——它和复位时刻差多少才是旁证。
 9. **`reboot_kernel()` 在本移植上会卡在 `vfs_unmountall`**（见第 2 节），
    要么修卸载路径，要么用 PSCI/WDT 直接复位。
 10. **`ticks` 只证明"算对了"**：`[park] arm n=32 ticks=614400000` 正确，但到点没触发——
@@ -176,5 +190,5 @@ step8 park：等 recovery ≤120 s（复位源=内核/WDT，非主机）
 - 引导参数：`qcom-usb-debug=1 qcom-usb-ctl=1 nabu-park-after=32`。
 - 主机侧：`tools/port-session.py`（单句柄）+ `tools/pipeline.py`（编排）。
 
-预期：`boot+28` 出现 COM，`boot+81` 日志静默（~146 KB），`boot+114` 咬合，
-`boot+129` 回到 recovery，全程不需要按键。
+预期：`boot+28` 出现 COM；`boot+50.5` 打 `[park] arm`（设 deadline）、`boot+82.5` 打
+`[park] wdt`（武装）；`boot+114` 咬合，`boot+129` 回到 recovery，全程不需要按键。
