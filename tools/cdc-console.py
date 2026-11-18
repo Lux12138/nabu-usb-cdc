@@ -54,6 +54,9 @@ except ImportError:  # pragma: no cover
 
 VID, PID = 0x1209, 0x316D
 REPLY_RE = re.compile(rb"SXNU1R ([0-9a-f]{16}) ([0-8][0-9a-f]{7}) ([A-Z]+) (.*) ([0-9a-f]{8})$")
+# 只认 nabu: spawn/exec 的 t= —— 它才是设备 uptime（19.2 MHz）。
+# nabu-display 和 NativeAdrenoProfile 的 t= 是另外两套时钟，混用会得出假的空洞。
+DEV_TIME_RE = re.compile(rb"^nabu: (?:spawn|exec)[^\n]*?\bt=(\d{6,})\b")
 
 
 def now_hms():
@@ -153,6 +156,8 @@ class Session:
         self.lost_at = None
         self.running = True
         self.muted = set()          # 被静音的行前缀（控制台里 `mute <前缀>`）
+        self.dev_time = None        # 最近一次读到的设备 uptime（秒）
+        self.dev_time_at = 0.0      # 读到它时的主机时刻
         self._partial = b""
         self._partial_at = 0.0
         self.s = serial.Serial(port, 115200, timeout=0.05, write_timeout=2.0)
@@ -218,6 +223,15 @@ class Session:
     def _on_line(self, line):
         with self.lock:
             self.lines += 1
+        # 设备 uptime：nabu: spawn/exec 的 t= 是 19.2 MHz 计数。其它 t= 是别的时钟，
+        # 混算会得出假的“黑洞”（见 docs/08），所以只认这一套。
+        m = DEV_TIME_RE.search(line)
+        if m:
+            try:
+                self.dev_time = int(m.group(1)) / 19200000.0
+                self.dev_time_at = time.time()
+            except ValueError:
+                pass
         text = line.decode("utf-8", "replace")
         if line.startswith(b"SXNU1R"):
             self.replies.put(line)
@@ -231,6 +245,12 @@ class Session:
                 return
         if self.echo:
             self._emit(text)
+
+    def uptime(self):
+        """设备 uptime 的当前估计（秒），拿不到就返回 None。"""
+        if self.dev_time is None:
+            return None
+        return self.dev_time + (time.time() - self.dev_time_at)
 
     # ---------------- control ----------------
     def send(self, payload):
@@ -305,6 +325,11 @@ def main():
     ap.add_argument("--drop", action="append", default=[],
                     help="启动就静音的行前缀，可重复，如 --drop NativeAdrenoBO")
     ap.add_argument("--self-test", action="store_true", help="只跑内置自测，不碰串口")
+    ap.add_argument("--arm-reboot", type=int, default=0, metavar="SEC",
+                    help="武装：设备时间达到 SEC 秒后自动发 REBOOT（回 Recovery）。"
+                         "0=不武装。可用命令文件 'reboot-now' / 'reboot-cancel' 现场控制")
+    ap.add_argument("--reboot-window", type=int, default=90,
+                    help="武装后，只在 SEC..SEC+N 这段内尝试（默认 90 s），过期就放弃并报 ARM_EXPIRED")
     args = ap.parse_args()
 
     if args.self_test:
@@ -382,6 +407,19 @@ def main():
 
     log("elapsed 0 s. 输入 help 看命令；日志正在落 %s" % raw_path)
 
+    # 自动复位状态。会武装在设备 uptime 上，不看主机时间 —— 主机时间和设备时间
+    # 差一个固定偏移（刷机到内核启动的间隔），用主机时间会偏。
+    arm_state = {
+        "mode": "wait" if args.arm_reboot > 0 else "off",
+        "at": float(args.arm_reboot),
+        "sent": False,
+        "result": None,
+        "last_note": 0.0,
+    }
+    if arm_state["mode"] == "wait":
+        log("[arm] 已武装：设备时间 %.0fs 时自动发 REBOOT（窗口 %.0f..%.0f s）"
+            % (arm_state["at"], arm_state["at"], arm_state["at"] + args.reboot_window))
+
     stdin_dead = False
     cmd_file = os.path.join(outdir, "%s-console.cmd" % args.tag)
     cmd_pos = 0
@@ -426,13 +464,36 @@ def main():
                 if args.deadline and el > args.deadline:
                     log("deadline %.0fs reached" % args.deadline)
                     break
+                # ---- 自动复位（武装在设备 uptime 上，不看主机时间）----
+                if arm_state["mode"] != "off" and not arm_state["sent"]:
+                    up = sess.uptime()
+                    if up is None:
+                        if el - arm_state["last_note"] > 20:
+                            arm_state["last_note"] = el
+                            log("[arm] 还没读到设备 uptime（等 nabu: spawn/exec 的 t=），暂不发")
+                    elif arm_state["mode"] == "wait" and up > arm_state["at"] + args.reboot_window:
+                        # 先判过期，再判到点：否则 up 一旦越过 at 就永远走不到这里，
+                        # 窗口形同虚设（设备可能在控制台接上之前就跑过了目标时刻）。
+                        log("[arm] 超过窗口（%.1fs > %.1fs + %ds），放弃"
+                            % (up, arm_state["at"], args.reboot_window))
+                        arm_state["mode"] = "expired"
+                    elif arm_state["mode"] == "wait" and up >= arm_state["at"]:
+                        log("[arm] 设备时间 %.1fs >= %.1fs，发 REBOOT"
+                            % (up, arm_state["at"]))
+                        tail = do_verb("REBOOT", timeout=3.0)
+                        arm_state["sent"] = True
+                        arm_state["mode"] = "done"
+                        arm_state["result"] = tail
+                        log("[arm] REBOOT -> %s" % (tail if tail else "无回复"))
                 if el - last_stats > 30:
                     last_stats = el
                     with sess.lock:
                         b, ln = sess.bytes, sess.lines
                     age = "-" if sess.last_data is None else "%.1fs" % (time.time() - sess.last_data)
-                    log("[stats] %.0fs  %d B / %d 行  最后数据 %s  %s"
-                        % (el, b, ln, age, "ALIVE" if sess.alive else "LOST"))
+                    up = sess.uptime()
+                    log("[stats] %.0fs  %d B / %d 行  最后数据 %s  %s  设备时间 %s"
+                        % (el, b, ln, age, "ALIVE" if sess.alive else "LOST",
+                           "-" if up is None else "%.0fs" % up))
                 if not sess.alive and not args.reconnect:
                     log("USB LOST，控制台退出（--reconnect 可改）")
                     rc = 4
@@ -454,10 +515,13 @@ def main():
                 with sess.lock:
                     b, ln = sess.bytes, sess.lines
                 age = "-" if sess.last_data is None else "%.1fs" % (time.time() - sess.last_data)
+                up = sess.uptime()
                 print("elapsed=%.1fs bytes=%d lines=%d last_data_age=%s alive=%s "
-                      "session=%016x seq=%d tx=%d rx=%d rej=%d"
+                      "dev_uptime=%s session=%016x seq=%d txok=%d rej=%d arm=%s"
                       % (time.time() - t0, b, ln, age, sess.alive,
-                         ctl.session, ctl.seq, ctl.acked, ctl.acked, ctl.rejected), flush=True)
+                         "-" if up is None else "%.1fs" % up,
+                         ctl.session, ctl.seq, ctl.acked, ctl.rejected,
+                         arm_state["mode"]), flush=True)
             elif cmd == "mark":
                 stamp = "[mark] %s" % rest
                 log(stamp)
@@ -485,6 +549,27 @@ def main():
                 else:
                     do_verb("REBOOT", timeout=3.0)
                     print("板子会复位，USB 会掉；本工具不自动重连。", flush=True)
+            elif cmd == "reboot-now":
+                # 现场手动触发，不等武装时刻
+                log("[arm] 手动触发 REBOOT")
+                tail = do_verb("REBOOT", timeout=3.0)
+                arm_state["mode"] = "done"
+                arm_state["sent"] = True
+                arm_state["result"] = tail
+                log("[arm] REBOOT -> %s" % (tail if tail else "无回复"))
+                print("板子会复位，USB 会掉。", flush=True)
+            elif cmd == "reboot-cancel":
+                arm_state["mode"] = "cancelled"
+                log("[arm] 已取消自动复位")
+            elif cmd == "reboot-at":
+                try:
+                    arm_state["at"] = float(rest)
+                except ValueError:
+                    print("reboot-at 后面跟秒数，如：reboot-at 260", flush=True)
+                else:
+                    arm_state["mode"] = "wait"
+                    arm_state["sent"] = False
+                    log("[arm] 重新武装：设备时间 %.0fs 时发 REBOOT" % arm_state["at"])
             else:
                 print("unknown: %s（help 看命令）" % cmd, flush=True)
 
@@ -501,22 +586,33 @@ def main():
 
 
 HELP = """\
-命令：
+【控制帧】（SXNU1 协议，同一个句柄发出去）
   hello             建立 session（HELLO 必须 session=0 seq=0）
   ping              rx / rxo / tx / poll 快照
   status            usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=
   screenshot        让内核抓一帧写 UFS
   shotnext          等下一个 flip 再抓
-  reboot --confirm  让板子复位（走 PSCI，会掉 USB）
-  mark <文字>       插一条主机时间锚点（同时写进原始日志）
-  mute <前缀>       静音某类刷屏行，如 mute NativeAdrenoBO
-  unmute <前缀>     取消静音
-  stats             本地统计
-  quit              退出（会正常关闭句柄）
 
-注意：
-  * 一个 boot 周期只有一个句柄。退出后不要立刻重开，会撞 120 s 阻塞或 ERROR_GEN_FAILURE(31)。
-  * 控制帧的 RX 在 boot+70~90 s 后失效，发帧没回复是设备侧已知行为。
+【复位】（走 PSCI SYSTEM_RESET，ABL 读 misc=boot-recovery 后进 Recovery）
+  reboot --confirm  让板子复位
+  reboot-now        立刻复位（走武装通道，会记 [arm] 日志）
+  reboot-at <秒>    重新武装：设备时间到 <秒> 时自动复位
+  reboot-cancel     取消自动复位
+
+【本地操作】（不发帧）
+  mark <文字>       插一条主机时间锚点（同时写进原始日志）
+  mute <前缀>       静音某类刷屏行，如 mute NativeAdrenoBO（只影响终端，日志仍完整）
+  unmute <前缀>     取消静音
+  stats             本地统计（含设备 uptime）
+  help / ?          显示本帮助
+  quit / exit / q   退出（会正常关闭句柄）
+
+【注意】
+  * 一个 boot 周期只有一个句柄。退出后不要立刻重开，会撞 120 s 阻塞
+    或 ERROR_GEN_FAILURE(31)。多步操作必须同进程同句柄。
+  * 控制帧只在「系统还能响应」时可用。实测设备 uptime 592 s 发 HELLO 仍成功，
+    但系统开始抽搐后数秒连 TX 都会超时 —— 判据是板子还活不活，不是 boot 后多少秒。
+  * REBOOT 实测：应答 24 ms，USB 2.8 s 后消失，13.6 s 后进 Recovery（共约 17 s）。
 """
 
 

@@ -75,18 +75,61 @@ python -I tools/cdc-console.py --tag r900 --wait 600   # 开机前先起
 python -I tools/cdc-console.py --self-test             # 不需要板子
 ```
 
-进入后的命令：
+进入后的命令（完整清单，与 `help` 输出一致）：
+
+**控制帧**（SXNU1，同一个句柄发出去）
 
 | 命令 | 作用 |
 |---|---|
 | `hello` | 建 session（HELLO 必须 session=0 seq=0）|
 | `status` | `usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=` |
 | `ping` | `rx/rxo/tx/poll` 快照 |
-| `screenshot` / `shotnext` | 抓帧写 UFS |
-| `reboot --confirm` | PSCI 复位（会掉 USB）|
+| `screenshot` / `shotnext` | 抓帧写 UFS / 等下次 flip 再抓 |
+
+**复位**（PSCI `SYSTEM_RESET`；ABL 读 `misc=boot-recovery` 后进 Recovery）
+
+| 命令 | 作用 |
+|---|---|
+| `reboot --confirm` | 让板子复位 |
+| `reboot-now` | 立刻复位（走武装通道，记 `[arm]` 日志）|
+| `reboot-at <秒>` | 重新武装：设备时间到 `<秒>` 时自动复位 |
+| `reboot-cancel` | 取消自动复位 |
+
+**本地操作**（不发帧）
+
+| 命令 | 作用 |
+|---|---|
 | `mark <文字>` | 主机时间锚点，同时写进原始日志 |
 | `mute / unmute <前缀>` | 只静音终端回显，**原始日志仍完整** |
-| `stats` / `quit` | 本地统计 / 退出 |
+| `stats` | 本地统计：elapsed / bytes / lines / last_data_age / alive / **dev_uptime** / session / seq / txok / rej / arm |
+| `help` / `?` | 显示帮助 |
+| `quit` / `exit` / `q` | 退出（正常关闭句柄）|
+
+**命令行参数**
+
+| 参数 | 作用 |
+|---|---|
+| `--tag NAME` | 输出文件名前缀 |
+| `--port PORT` | 指定端口；默认按 `VID_1209:PID_316D` 自动匹配 |
+| `--wait N` | 等端口出现的最长秒数（默认 300）|
+| `--deadline N` | 最多跑 N 秒后自退（0=不限）|
+| `--arm-reboot SEC` | **武装自动复位**：设备时间到 SEC 秒时发 `REBOOT` |
+| `--reboot-window N` | 武装后只在 `SEC..SEC+N` 内尝试（默认 90 s），过期报 `[arm] 超过窗口` |
+| `--drop PREFIX` | 启动即静音某前缀，可重复 |
+| `--no-echo` | 不回显日志到终端 |
+| `--reconnect` | 掉线后尝试重开（**违反单句柄约束**，只在明确知道后果时用）|
+| `--self-test` | 跑内置自测，不碰串口 |
+
+**`REBOOT` 实测耗时**（2026-11-18，基线 `bd3814d6`）：
+
+```
+TX REBOOT   →  RX OK state=queued     24 ms
+            →  USB LOST                2.8 s
+            →  adb 看到 recovery      13.6 s
+                                合计约 17 s
+```
+
+**这比等 WDT 咬合（300–600 s）快两个数量级，而且不依赖 `pet` 补丁是否正确。**
 
 产出 `logs/<tag>-console.bin`（原始字节）+ `logs/<tag>-console.ctl.txt`（TX/RX 与事件）。
 `--wait N` 开机前先起；`--deadline N` 到点自退；`--drop PREFIX` 启动即静音；
