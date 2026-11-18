@@ -53,6 +53,23 @@ def main():
 
     port = a.port
     if not port:
+        # Phase 1: wait for the CDC port to DISAPPEAR (device in TWRP/fastboot
+        # shows a ghost COM3 with dead USB function -> ERROR_GEN_FAILURE(31)).
+        # Phase 2: wait for it to REAPPEAR (XNU boots, CDC re-enumerates).
+        ghost_deadline = time.time() + 120
+        had_ghost = False
+        while time.time() < ghost_deadline:
+            hits = cdc_ports()
+            if not hits:
+                if had_ghost:
+                    log('CDC ghost port gone, waiting for fresh enumeration ...')
+                else:
+                    log('no CDC port yet, waiting for enumeration ...')
+                break
+            had_ghost = True
+            log('ghost CDC %s present (TWRP/fastboot?), waiting for disconnect ... %.0fs left' % (hits[0][0], ghost_deadline - time.time()))
+            time.sleep(2)
+        # Phase 2: wait for the fresh CDC port
         deadline = time.time() + a.wait
         while time.time() < deadline:
             hits = cdc_ports()
