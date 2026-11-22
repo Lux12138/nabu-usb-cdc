@@ -1,0 +1,62 @@
+diff --git a/osfmk/kdp/kdp_udp.c b/osfmk/kdp/kdp_udp.c
+index a0ad7d8..63f763a 100644
+--- a/osfmk/kdp/kdp_udp.c
++++ b/osfmk/kdp/kdp_udp.c
+@@ -1476,11 +1476,17 @@ again:
+ 
+ 	kdp_sync_cache();
+ 
+-#if defined(__x86_64__)
+-	/* We only support returning from KDP on x86 */
+-	if (reattach_wait == 1)
+-#endif
+-	{
++	/* T39-a plan B #1: honour reattach_wait on every architecture.
++	 *
++	 * Upstream only compiles the guard on x86, making `goto again`
++	 * unconditional elsewhere -- which is why an arm64 KDP session can never
++	 * return to the kernel (kdp_disconnect clears is_conn, the loop comes
++	 * straight back here, and connection_wait runs again forever).
++	 *
++	 * With the guard compiled in, kdp_disconnect() leaves reattach_wait == 0
++	 * (it only sets it for the panic path) and control falls through to
++	 * exit_debugger_loop. */
++	if (reattach_wait == 1) {
+ 		goto again;
+ 	}
+ 
+@@ -2148,11 +2154,34 @@ abort_panic_transfer(void)
+ 
+ static boolean_t needs_serial_init = TRUE;
+ 
++/* kb-28 (T41-c): route KDP replies onto the CDC.
++ *
++ * pal_serial_putc_nocr() -> serial_putc() -> uart_putc() walks gPESF, and the
++ * nabu CDC backend was registered receive-only -- its transmit_data() was a
++ * no-op -- so every reply this function produced was discarded. The console
++ * printed "Connected to remote debugger." and then the host saw silence
++ * (kb-27 capture ends exactly there).
++ *
++ * qcom_usb_debug_kdp_tx_mode(1) narrows the forwarding in that backend to this
++ * call only, so kprintf output keeps its own path and the USB write path is
++ * never re-entered from inside kprintf (the reason the hook used to be a
++ * no-op). Without the module the calls compile out. */
++#if XNU_QCOM_USB_DEBUG
++extern void qcom_usb_debug_kdp_tx_mode(int on);
++#define KDP_TX_BEGIN()  qcom_usb_debug_kdp_tx_mode(1)
++#define KDP_TX_END()    qcom_usb_debug_kdp_tx_mode(0)
++#else
++#define KDP_TX_BEGIN()  do { } while (0)
++#define KDP_TX_END()    do { } while (0)
++#endif
++
+ static void
+ kdp_serial_send(void *rpkt, unsigned int rpkt_len)
+ {
+ 	//	printf("tx\n");
++	KDP_TX_BEGIN();
+ 	kdp_serialize_packet((unsigned char *)rpkt, rpkt_len, pal_serial_putc_nocr);
++	KDP_TX_END();
+ }
+ 
+ static void

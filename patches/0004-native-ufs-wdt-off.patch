@@ -1,0 +1,28 @@
+--- /root/merge/_backup_kb34_wdtoff/NativeUfs.cpp.orig	2026-11-22 02:02:29.684770400 +0800
++++ /root/merge/l738-device/drivers/NativeUfs/NativeUfs.cpp	2026-11-23 07:13:09.334278301 +0800
+@@ -3474,6 +3474,25 @@
+ static void nabu_wdt_arm (void)
+ {
+   if (gWdtArmed || gWdtRegs == nullptr) return;
++  /* kb-34: real "watchdog off" switch.
++   *
++   * nabu-wdt-arm-delay only chooses WHEN to arm (armDelay == 0 -> now, anything
++   * else -> at gWdtArmAt), so there was no way to leave the watchdog disabled for
++   * a whole boot: 86400 merely postponed the bite by a day. A debugger round needs
++   * the opposite -- a wedged kernel that stays observable instead of being reset
++   * 58 s after arming.
++   *
++   * Placed AFTER the caller's disarm write (see the init block) but BEFORE EN 0->1,
++   * so the bootloader's inherited deadline is still cleared and the SoC is left
++   * with no watchdog at all. Default path unchanged: with the boot-arg absent this
++   * is one PE_parse_boot_argn that finds nothing. */
++  {
++    int wdtOff = 0;
++    if (PE_parse_boot_argn ("nabu-wdt-off", &wdtOff, sizeof (wdtOff)) && wdtOff) {
++      nabu_log_puts ("ufs:wdt-off\n");
++      return;
++    }
++  }
+   gWdtRegs[0x08 / 4] = 0;
+   gWdtRegs[0x08 / 4] = 1;
+   gWdtArmed = 1;

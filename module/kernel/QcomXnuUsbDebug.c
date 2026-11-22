@@ -49,6 +49,9 @@ extern void Debugger(const char *message) __attribute__((weak_import));
  * (which runs from kprintf) and the DEBUGGER verb both consult them
  * long before the ring implementation further down. */
 static volatile uint32_t kdp_rx_armed;
+/* kb-32: the shared bounded DWC3 RX drain, defined far below. The KDP input
+ * predicates call it while armed so a request sent after CONNECT is seen. */
+static void serial_rx_drain(void);
 static uint32_t kdp_rx_used;
 /* kb-28 (T41-c #1): bytes dropped because the ring was full. Lives here for
  * the same reason as the two above -- KDPPUSH and DEBUGGER report it and both
@@ -1054,7 +1057,25 @@ static int poll_owned(void)
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE) return 0;
     backlog_drain_owned();
     loss_notice_owned();
-    ret = dwc3_poll(native.core, 1);
+    /* kb-32: drain more events per call while the kernel is in the debugger.
+     *
+     * pump() refuses to start an IN transfer while d->active[EP_IN] is set, and
+     * that flag only clears when a XFERCOMPLETE event is handled. With budget=1
+     * a single poll retires one event, so a reply longer than one packet leaves
+     * active[EP_IN] set across calls and the next pump() bails -- the rest of
+     * the reply just sits in the 16 KiB tx ring.
+     *
+     * Measured three times, always on the third reply of a session: kb-30
+     * HOSTINFO(seq=2) stopped after 24 B, kb-31 READMEM64(seq=2) stopped after
+     * ~30 B, while the same session's second reply (69 B) completed. That is
+     * event starvation, not a controller fault.
+     *
+     * 64 is still bounded (dwc3_poll clamps at 256) and every event it handles
+     * is the same work a single event was: rearm an endpoint or copy a
+     * completed transfer. Outside the debugger budget stays at 1, where the
+     * worker's 5 ms tick provides the pacing and a large budget would just add
+     * latency under the USB lock. */
+    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ? 64u : 1u);
     native.status.poll_calls++;
     native.status.last_poll_events = ret < 0 ? 0u : (uint32_t)ret;
     buffer_status_owned();
@@ -2585,8 +2606,22 @@ qcom_usb_debug_serial_pending(void)
 {
     /* kdp_rx only: console traffic must never make receive_ready() true.
      * While armed, report only the KDP ring so the serial keyboard thread sees
-     * "no input" and stops eating staged frames. */
+     * "no input" and stops eating staged frames.
+     *
+     * kb-32: while armed, also pull whatever the controller has buffered.
+     *
+     * The 5 ms worker that normally calls serial_rx_drain() is blocked on the
+     * other side of the trap, so in the debugger the DWC3 RX ring is only
+     * serviced if somebody asks for input -- and kdp_serial_receive() polls
+     * exactly this predicate. Draining here is what turns "preload everything
+     * up front" into an interactive session: the host can send another request
+     * after CONNECT and it will be seen.
+     *
+     * serial_rx_drain() takes usb_busy with a non-blocking exchange, so a
+     * concurrent worker or a re-entrant call simply leaves the ring to the
+     * next poll; it can never deadlock from here. */
     if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
+    if (kdp_rx_used == 0) serial_rx_drain();
     return kdp_rx_used;
 }
 
@@ -2597,7 +2632,8 @@ qcom_usb_debug_serial_getc(void)
     /* While armed only the KDP ring is served, so a keyboard poll can never
      * steal a staged frame. Disarmed consumers see the console ring as before. */
     if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
-        (void)kdp_rx_pop(&c);
+        if (kdp_rx_used == 0) serial_rx_drain();   /* kb-32: see serial_pending() */
+        if (!kdp_rx_pop(&c)) return 0;
         return c;
     }
     (void)serial_rx_pop(&c);
@@ -2644,6 +2680,28 @@ serial_rx_drain(void)
         }
         text[text_count++] = b;
     }
+
+    /* kb-32: while the kernel sits in the debugger, feed the KDP ring too.
+     *
+     * Until now a staged frame was the ONLY way in: qcom_usb_debug_serial_pending()
+     * reports kdp_rx only, and this drain routed wire bytes to usb_serial_rx, so
+     * anything the host sent after CONNECT landed in a ring the debugger never
+     * reads. That is why every round had to preload its whole request list and
+     * could never ask a second question interactively.
+     *
+     * Re-parse the same bytes into kdp_rx while armed. The console ring keeps its
+     * copy, so nothing that used to work stops working; the KDP unserialiser is
+     * stateful and ignores everything outside a 0xFA..0xFB run anyway, so
+     * leftover text is harmless.
+     *
+     * Guarded by kdp_rx_armed, which the DEBUGGER verb raises immediately before
+     * the trap -- so normal operation, including the boot path, never sees this. */
+    if (rx_count != 0 && __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+        for (size_t i = 0; i < rx_count; i++) {
+            (void)kdp_rx_push(rx[i]);
+        }
+    }
+
     if (text_count != 0 && __atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE))
         control_service(text, text_count, generation, &status);
 }

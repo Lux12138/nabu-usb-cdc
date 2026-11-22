@@ -1,0 +1,325 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index f5bae27..a96394b 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -788,9 +788,306 @@ serial_hibernation_cleanup(void)
+ }
+ #endif /* HIBERNATION */
+ 
++/*
++ * nabu: framebuffer "serial" console. kprintf output is drawn directly into
++ * the boot framebuffer described by PE_state.video; no UART is required.
++ * Each character row clears only its own height, and lines wrap at the top.
++ */
++extern unsigned char iso_font[256 * 16];
++
++#define FBCON_SCALE 2
++#define FBCON_FG    0xffffffffu
++#define FBCON_BG    0xff000000u
++
++static volatile uint32_t *fbcon_base;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++static boolean_t fbcon_ready;
++
++unsigned nabu_fbcon_state = 0;	/* 0 not probed, 1 registered, 2 geometry rejected,
++ * 4 registered but switched off by nabu-fbcon=0 (never paints); l505's 3 (unregistered)
++ * is gone - unregistering is what silenced CDC. */
++unsigned nabu_fbcon_rows = 0;	/* l505: text rows the console may use, set by fbcon_init */
++static void
++fbcon_clear_row(uint32_t row)
++{
++	uint32_t y0 = row * 16 * FBCON_SCALE;
++	uint32_t y1 = y0 + 16 * FBCON_SCALE;
++
++	if (y1 > fbcon_height) {
++		y1 = fbcon_height;
++	}
++	for (uint32_t y = y0; y < y1; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++}
++
++static void
++fbcon_newline(void)
++{
++	fbcon_col = 0;
++	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_clear_row(fbcon_row);
++	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++}
++
++static void
++fbcon_init(void)
++{
++	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
++	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
++	{ unsigned r=0; PE_parse_boot_argn("nabu-fbcon-rows",&r,sizeof(r)); if(r!=0 && fbcon_rows>r) fbcon_rows=r; }	/* l505: shrink the log region */
++	nabu_fbcon_rows = fbcon_rows;
++	fbcon_col = 0;
++	fbcon_row = 0;
++	for (uint32_t r = 0; r < fbcon_rows; r++) {
++		fbcon_clear_row(r);
++	}
++}
++
++static unsigned int
++fbcon_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++fbcon_transmit_data(uint8_t c)
++{
++	if (nabu_fbcon_state == 4U) {
++		return;
++	}
++	if (c == '\r') {
++		fbcon_col = 0;
++		return;
++	}
++	if (c == '\n') {
++		fbcon_newline();
++		return;
++	}
++	if (fbcon_col >= fbcon_cols) {
++		fbcon_newline();
++	}
++	const unsigned char *glyph = iso_font + c * 16;
++	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE;
++	uint32_t y0 = fbcon_row * 16 * FBCON_SCALE;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			volatile uint32_t *line = fbcon_base +
++			    (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					line[gx * FBCON_SCALE + sx] = px;
++				}
++			}
++		}
++	}
++	fbcon_col++;
++}
++
++static unsigned int
++fbcon_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++fbcon_receive_data(void)
++{
++	return 0;
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) nabu_fbcon_serial_functions =
++{
++	.init = fbcon_init,
++	.transmit_ready = fbcon_transmit_ready,
++	.transmit_data = fbcon_transmit_data,
++	.receive_ready = fbcon_receive_ready,
++	.receive_data = fbcon_receive_data,
++	.device = SERIAL_NABU_FBCON
++};
++
++static void
++fbcon_probe(void)
++{
++	vm_offset_t base;
++	vm_size_t size;
++
++	{ unsigned fb=1; PE_parse_boot_argn("nabu-fbcon",&fb,sizeof(fb)); if(fb==0){ nabu_fbcon_state=4U; } }
++	/* l506: the switch must NOT unregister this console. l505 returned early here, so
++	 * register_serial_functions(SERIAL_NABU_FBCON) never ran, the registered-function set that
++	 * serial_init() consults changed, and CDC went silent from that boot on. State 4 now means
++	 * "registered, never paint": the paint path returns, everything else is byte-for-byte l504. */
++	if (fbcon_ready || PE_state.video.v_baseAddr == 0 ||
++	    PE_state.video.v_depth != 32 || PE_state.video.v_width == 0 ||
++	    PE_state.video.v_height == 0 ||
++	    PE_state.video.v_rowBytes < PE_state.video.v_width * 4) {
++		if (!fbcon_ready) { nabu_fbcon_state = 2U; }
++		return;
++	}
++	base = (vm_offset_t)PE_state.video.v_baseAddr;
++	size = (vm_size_t)PE_state.video.v_rowBytes * PE_state.video.v_height;
++	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(base, size);
++	if (fbcon_base == NULL) {
++		return;
++	}
++	fbcon_width  = PE_state.video.v_width;
++	fbcon_height = PE_state.video.v_height;
++	fbcon_stride = PE_state.video.v_rowBytes;
++	fbcon_ready  = TRUE;
++	if (nabu_fbcon_state != 4U) {
++		nabu_fbcon_state = 1U;
++	}
++	register_serial_functions(&nabu_fbcon_serial_functions);
++}
++
++/* ---- nabu: CDC serial RX backend -------------------------------------------
++ * Output already reaches the CDC because pe_kprintf.c calls
++ * qcom_usb_debug_putc() directly. Input had no such path: uart_getc() only
++ * walks gPESF, and the sole registered backend (nabu_fbcon) returns 0 from
++ * receive_data() unconditionally. That made kdp_getc() always read 0, so the
++ * 'c' rescue in kdp_connection_wait() could never fire.
++ *
++ * The USB module already exports the three callbacks this needs, so this is
++ * registration only. Every call is safe before the native core is ACTIVE:
++ * pending() reports 0 and poll() returns without touching the ring.
++ *
++ * Registered after fbcon_probe() (register_serial_functions prepends), so
++ * uart_getc() reaches CDC before the always-empty fbcon entry. */
++extern size_t qcom_usb_debug_serial_pending(void);
++extern uint8_t qcom_usb_debug_serial_getc(void);
++extern void qcom_usb_debug_serial_poll(void);
++extern int qcom_usb_debug_kdp_tx_active(void);
++extern void qcom_usb_debug_putc(char c);
++/* This backend is RECEIVE-ONLY on purpose.
++ *
++ * kprintf already reaches the CDC twice-over through qcom_usb_tee()
++ * (pe_kprintf.c): once via qcom_usb_debug_putc() and once via PE_kputc. Adding
++ * CDC to gPESF flips serial_init() to TRUE, which makes PE_kputc =
++ * serial_putc_crlf -> uart_putc -> uart_putc_device -> these callbacks. If they
++ * forward to qcom_usb_debug_putc() the USB write path is re-entered from inside
++ * kprintf (interrupts off, kprintf_lock held) and boot dies before enumeration
++ * -- measured twice.
++ *
++ * So: never transmit, never spin, never touch USB from here. Only input needs
++ * gPESF, because kdp_getc() -> uart_getc() walks this list.
++ *
++ * uart_putc_device() dereferences transmit_ready() unconditionally
++ * (pe_serial.c:1291), so it must be a real function returning "always ready";
++ * transmit_data must exist but do nothing. */
++static unsigned int
++nabu_cdc_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++nabu_cdc_transmit_data(uint8_t c)
++{
++	/* kb-28 (T41-c): forward only while kdp_serial_send() is serialising a KDP
++	 * reply. KDP replies travel uart_putc() -- pal_serial_putc_nocr() ->
++	 * serial_putc() -> uart_putc() -> uart_putc_device() -> this hook -- so with
++	 * a no-op here a CONNECT reply was discarded and the host saw nothing after
++	 * "Connected to remote debugger." (measured on kb-27).
++	 *
++	 * Everywhere else this stays a no-op, which is what keeps kprintf from
++	 * re-entering the USB write path: kprintf already reaches the CDC through
++	 * qcom_usb_tee(), and letting PE_kputc forward as well would both duplicate
++	 * output and re-enter qcom_usb_debug_putc() with kprintf_lock held and
++	 * interrupts off. That re-entry killed boot twice. */
++	if (qcom_usb_debug_kdp_tx_active()) {
++		qcom_usb_debug_putc((char)c);
++	}
++}
++
++static unsigned int
++nabu_cdc_receive_ready(void)
++{
++	/* Pure predicate: the worker already drains the DWC3 ring every 5 ms, and
++	 * this is called from the KDP poll loop where taking the USB lock would be
++	 * re-entrant. Just report what is buffered. */
++	return qcom_usb_debug_serial_pending() != 0 ? 1 : 0;
++}
++
++static uint8_t
++nabu_cdc_receive_data(void)
++{
++	return qcom_usb_debug_serial_getc();
++}
++
++static void
++nabu_cdc_init(void)
++{
++}
++
++/* NOT SECURITY_READ_ONLY_LATE.
++ *
++ * register_serial_functions() writes fns->next, and that section is read-only by
++ * the time serial_init() runs. Measured on hardware: writing the next field of a
++ * SECURITY_READ_ONLY_LATE entry from the console killed the control channel
++ * immediately while the kernel stayed alive (data abort into the panic/KDP path),
++ * and registering the same struct during boot made the CDC never enumerate at all.
++ * nabu_fbcon_serial_functions gets away with the modifier only because it is never
++ * registered on this board (nabu-fbcon=0 leaves it unlinked).
++ *
++ * A plain static lands in a writable section, which is what a list node needs. */
++static struct pe_serial_functions nabu_cdc_serial_functions =
++{
++	.init = nabu_cdc_init,
++	.transmit_ready = nabu_cdc_transmit_ready,
++	.transmit_data = nabu_cdc_transmit_data,
++	.receive_ready = nabu_cdc_receive_ready,
++	.receive_data = nabu_cdc_receive_data,
++	.device = SERIAL_NABU_CDC
++};
++
++/* 1 if the CDC backend is linked into gPESF. */
++int
++nabu_cdc_rx_attached(void)
++{
++	return get_serial_functions(SERIAL_NABU_CDC) != NULL ? 1 : 0;
++}
++
++/* Attach the CDC receive backend to gPESF.
++ *
++ * T37: registered inside serial_init() after the uart_initted early return,
++ * and idempotent, because serial_init() runs at least twice per boot.
++ * Returns 1 if attached, 0 if the boot-arg is off, -1 if already attached. */
++int
++nabu_cdc_rx_attach(void)
++{
++	int cdc_rx = 0;
++
++	PE_parse_boot_argn("nabu-cdc-rx", &cdc_rx, sizeof(cdc_rx));
++	if (cdc_rx == 0) {
++		return 0;
++	}
++	/* T37: registering twice makes gPESF self-link (fns->next = fns) and the
++	 * uart_initted walk below then spins forever -- before dwc3_start(), so the
++	 * CDC never enumerates. serial_init() runs at least twice (arm_init.c and
++	 * inside PE_init_kprintf), so this MUST be idempotent. */
++	if (get_serial_functions(SERIAL_NABU_CDC) != NULL) {
++		return -1;
++	}
++	register_serial_functions(&nabu_cdc_serial_functions);
++	return 1;
++}
++
+ int
+ serial_init(void)
+ {
++	fbcon_probe();
++	/* The CDC receive backend is attached LATER, from PE_init_kprintf() once
++	 * qcom_usb_debug_init() has brought the USB core up. Registering here (in the
++	 * earliest startup phase) made the CDC never enumerate at all, across four
++	 * different implementations; the failure is not about the section modifier,
++	 * the callbacks, or the list position. `nabu_cdc_rx_attach` is that later
++	 * hook. It is still gated on nabu-cdc-rx (default OFF). */
++	(void)0;
+ 	DTEntry         entryP = NULL;
+ 	uint32_t        prop_size;
+ 	vm_offset_t     soc_base;
+@@ -960,6 +1257,13 @@ serial_init(void)
+ 	}
+ #endif /* APPLE_UART */
+ 
++	/* T37: register here, after the uart_initted early-return and before the
++	 * init walk, so the new node is initialised in the same pass but can never be
++	 * added twice. Registering earlier (before the uart_initted check) ran once
++	 * per serial_init() call -- at least three times per boot -- which self-linked
++	 * gPESF and hung the walk before USB was ever initialised. */
++	(void)nabu_cdc_rx_attach();
++
+ 	fns = gPESF;
+ 	while (fns != NULL) {
+ 		serial_do_transmit = 1;

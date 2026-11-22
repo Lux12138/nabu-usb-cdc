@@ -1,0 +1,250 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e9daeed..96a60b6 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -343,7 +343,19 @@ uuid_string_t auxkc_uuid_string;
+  *
+  * Return from Debugger() is currently only implemented on x86
+  */
+-static boolean_t debugger_is_panic = TRUE;
++static volatile boolean_t debugger_is_panic = TRUE;
++
++#if defined(__arm64__)
++/* T39-a plan B #2 support: only an explicit kdp_match_name request may turn
++ * Debugger() into a returnable trap. kdp_explicitly_requested is set by
++ * panic_init() from that boot-arg (debug.c, arm64 block). */
++static boolean_t
++debugger_is_panic_narrowed_by_kdp(void)
++{
++	return kdp_explicitly_requested;
++}
++#endif
++
+ 
+ TUNABLE(unsigned int, debug_boot_arg, "debug", 0);
+ 
+@@ -435,15 +447,44 @@ panic_init(void)
+ 
+ #endif /* MACH_KDP */
+ 
+-#if defined (__x86_64__)
+ 	/*
+ 	 * By default we treat Debugger() the same as calls to panic(), unless
+ 	 * we have debug boot-args present and the DB_KERN_DUMP_ON_NMI *NOT* set.
+ 	 * If DB_KERN_DUMP_ON_NMI is *NOT* set, return from Debugger() is supported.
+ 	 * This is because writing an on-device corefile is a destructive operation.
+ 	 *
+-	 * Return from Debugger() is currently only implemented on x86
++	 * T39-a plan B #2: allow the same early return on arm64, but ONLY when the
++	 * host explicitly asked for KDP (kdp_match_name=...). Without that
++	 * narrowing, a watchdog-triggered Debugger() would stop writing a panic log,
++	 * which is exactly the telemetry we still need on this port.
++	 *
++	 * Requires plan B #1 (kdp_udp.c): clearing debugger_is_panic only makes the
++	 * return path reachable once `goto again` is guarded by reattach_wait.
+ 	 */
++	/* kb-37: arm64 gates on kdp_explicitly_requested alone.
++	 *
++	 * The original x86 condition starts with PE_i_can_has_debugger(NULL), which
++	 * returns debug_enabled -- measured 0 on this board (KDP read of
++	 * 0xfffffff00725a4cc and again of 0xfffffff0072... in kb-33/kb-35 sessions).
++	 * Keeping that term makes the whole condition permanently false on arm64, so
++	 * debugger_is_panic keeps its TRUE initialiser and every KDP_DISCONNECT ends
++	 * in panic_spin_forever() / PSCI reset.
++	 *
++	 * Proof from the flashed kb-36 kernel: _panic_init begins with
++	 *   bl _PE_i_can_has_debugger ; cbz w0, skip
++	 * and only reaches `str wzr, [x8, #0x320]` (debugger_is_panic = 0) when that
++	 * returns non-zero. It never does here.
++	 *
++	 * kdp_explicitly_requested is set only from kdp_match_name=... a few lines
++	 * above, so a watchdog-triggered Debugger() still keeps debugger_is_panic at
++	 * TRUE and its panic log is written.
++	 */
++#if defined(__arm64__)
++	if (debugger_is_panic_narrowed_by_kdp() &&
++	    !(debug_boot_arg & DB_KERN_DUMP_ON_NMI)) {
++		debugger_is_panic = FALSE;
++	}
++#else
+ 	if (PE_i_can_has_debugger(NULL) && !(debug_boot_arg & DB_KERN_DUMP_ON_NMI)) {
+ 		debugger_is_panic = FALSE;
+ 	}
+@@ -1126,6 +1167,10 @@ panic_with_thread_context(unsigned int reason, void *ctx, uint64_t debugger_opti
+ }
+ #endif /* defined (__x86_64__) */
+ 
++#if XNU_QCOM_USB_DEBUG
++#include <QcomXnuUsbDebug.h>
++#endif
++
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wmissing-noreturn"
+ void
+@@ -1134,6 +1179,10 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ {
+ #pragma clang diagnostic pop
+ 
++#if XNU_QCOM_USB_DEBUG
++	qcom_usb_debug_panic_prepare();
++#endif
++
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+ #endif
+@@ -1236,9 +1285,112 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	__builtin_unreachable();
+ }
+ 
++
++/* nabu-panic-hook: 29 */
++/* nabu: panic restart ---------------------------------------------------------
++ * Reset through PSCI SYSTEM_RESET. The reset is direct because PE_halt_restart
++ * is NULL on this port: PEHaltRestart() only returns -1 and halts in place.
++ * Boot arg nabu-panic-restart selects how much runs before the reset:
++ *   0  off
++ *   1  reset only
++ *   2  copy the ring tail to the reserved DRAM window, then reset (default)
++ * Every step paints a marker, so a screen that stops moving says which one hung.
++ */
++extern void nabu_log_print_matches(unsigned bytes);
++extern void nabu_log_putc(int ch);
++extern void nabu_log_puts(const char *s);
++
++static void
++nabu_ring_kputc(int ch, void *arg)
++{
++	(void)arg;
++	nabu_log_putc(ch);
++}
++
++/* Format one panic string straight into the ring. check_and_handle_nested_panic()
++ * runs for every debugger entry, so the first message is captured even when its
++ * console print never completes. */
++static void
++nabu_panic_note(const char *fmt, va_list *args)
++{
++	va_list copy;
++
++	if (fmt == 0 || args == 0) {
++		return;
++	}
++	va_copy(copy, *args);
++	nabu_log_puts("PANICSTR: ");
++	_doprnt(fmt, &copy, nabu_ring_kputc, 0);
++	nabu_log_puts("\n");
++	va_end(copy);
++}
++extern unsigned long long nabu_psci_reset(void);
++/* Bounded busy wait before PSCI, for the panic path only: the CDC FIFO needs a few
++ * hundred milliseconds to drain, and PSCI was cutting it off. Reads CNTVCT_EL0 only --
++ * no locks, no sleep, no UFS touch (a write in this context froze the reset twice). */
++static void
++nabu_busy_wait_ms(unsigned ms)
++{
++	unsigned long long freq = 0, start = 0, now = 0, span = 0;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
++	if (freq == 0) {
++		return;
++	}
++	span = (freq / 1000ULL) * (unsigned long long) ms;
++	__asm__ volatile ("mrs %0, cntvct_el0" : "=r" (start));
++	/* Hard cap as well: if the counter ever stopped, a bare spin would wedge the board
++	 * instead of resetting it, and the unattended loop depends on the reset. */
++	{
++		unsigned long long iter = 0;
++		do {
++			__asm__ volatile ("mrs %0, cntvct_el0" : "=r" (now));
++			if (++iter > 1000000000ULL) {
++				break;
++			}
++		} while ((now - start) < span);
++	}
++}
++extern void nabu_mark_text(const char *s, unsigned int y);
++
++static void
++nabu_panic_restart(void)
++{
++	int mode = 2;
++	PE_parse_boot_argn("nabu-panic-restart", &mode, sizeof(mode));
++	nabu_mark_text("nabu:panic", 2500);
++	/* The diagnostic print comes first: with nabu-panic-restart=0 the hook returns
++	 * below, and the ring is the only place the panic text is recorded. */
++	{
++		unsigned print = 0;
++		PE_parse_boot_argn("nabu-panic-print", &print, sizeof(print));
++		if (print) {
++			nabu_log_print_matches(print);
++		}
++	}
++	if (mode == 0) {
++		nabu_mark_text("nabu:panic-off", 2500);
++		return;
++	}
++	if (mode >= 2) {
++		/* Nothing touches UFS here: a write in this context froze the reset twice
++		 * (2026-10-24 and again 2026-10-26 15:11, lock_mtx.c:194 with preemption
++		 * disabled). Mark, then reset. */
++		nabu_mark_text("nabu:reset-only", 2500);
++	}
++	nabu_mark_text("nabu:reset", 2420);
++	nabu_busy_wait_ms(300);
++	nabu_psci_reset();
++	nabu_mark_text("nabu:reset-failed", 2500);
++}
++/* ---- end nabu panic restart ------------------------------------------------ */
++
+ void
+ panic_spin_forever(void)
+ {
++	nabu_panic_restart();
++#if XNU_QCOM_USB_DEBUG
++	qcom_usb_debug_panic_drain();
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+@@ -1252,6 +1404,17 @@ panic_spin_forever(void)
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++	if (type == kPEPanicRestartCPU) {
++		nabu_panic_restart();
++	}
++	if (type == kPEHangCPU) {
++		int nabu_mode = 2;
++		PE_parse_boot_argn("nabu-panic-restart", &nabu_mode, sizeof(nabu_mode));
++		if (nabu_mode == 0) {
++			nabu_mark_text("nabu:hang-hold", 2500);
++			return;
++		}
++	}
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+@@ -1369,7 +1532,15 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 		}
+ 		paniclog_append_noflush("\n");
+ 	}
+-#if defined(__x86_64__)
++	/* T39-a plan B #3: on arm64 this guard used to be compiled out, so the
++	 * block below ran unconditionally -- every Debugger() call went on to
++	 * SavePanicInfo(), which writes the panic log to UFS while the other cores
++	 * are halted. That is where our console trap stalled: "Using serial KDP."
++	 * never printed because kdp_connection_wait() was never reached.
++	 *
++	 * With debugger_is_panic cleared for an explicit kdp_match_name request
++	 * (plan B #2), the condition now protects arm64 too: a plain Debugger()
++	 * skips the panic-log write, a real panic still writes it. */
+ 	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
+ 		paniclog_append_noflush("Debugger called: <%s>\n", debugger_message ? debugger_message : "");
+ 	}
+@@ -1380,7 +1551,6 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 	 * conventional sense.
+ 	 */
+ 	if (debugger_current_op == DBOP_PANIC || ((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic))
+-#endif /* __x86_64__ */
+ 	{
+ 		kdp_callouts(KDP_EVENT_PANICLOG);
+ 

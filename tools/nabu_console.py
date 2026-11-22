@@ -313,6 +313,12 @@ def main():
     def send_cmd(verb, arg, timeout=None):
         """发一条 SXNU1 帧并等 reply，同步 seq/session。返回 reply 或 None。"""
         verb = verb.upper()
+        if timeout is None:
+            # 慢命令给更长的默认超时：READPA 要经 worker 的 5 ms tick 做真实 MMIO 读取，
+            # 64 字节窗口实测偶尔超过 10 s 默认值（kb-38 上连续两次超时后才成功）。
+            # READ/DUMP/RDBLK 会走内存或存储，可能卡在缺页或介质访问上，同样放宽。
+            slow = verb.startswith(("READPA", "READ", "DUMP", "RDBLK"))
+            timeout = args.cmd_timeout * (3.0 if slow else 1.0)
         if ctl.is_hello(verb):
             ctl.session, ctl.seq = 0, 0
         elif not ctl.hello_done:
@@ -323,7 +329,7 @@ def main():
         frame = ctl.build(verb, arg)
         log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
         sess.send(frame)
-        reply = sess.wait_reply(verb, timeout or args.cmd_timeout)
+        reply = sess.wait_reply(verb, timeout)
         if reply:
             log("RX %s" % reply)
             event(kind="cmd", verb=verb, ok=True, reply=reply)
@@ -337,7 +343,7 @@ def main():
                         except ValueError: pass
                 ctl.hello_done = True
         else:
-            log("! no reply within %.1fs for %s" % (timeout or args.cmd_timeout, verb))
+            log("! no reply within %.1fs for %s" % (timeout, verb))
             event(kind="cmd", verb=verb, ok=False)
         return reply
 
@@ -468,6 +474,31 @@ def main():
         with open(outpath, "wb") as f:
             f.write(data)
         log("DUMP OK %s: %d B / %d chunks crc=%08x" % (outpath, len(data), chunks, got_crc))
+
+    def cmd_kdpraw(hexstr):
+        """Write raw bytes straight to the serial port, bypassing SXNU1.
+
+        This is the live path into KDP once the kernel is in the debugger: the
+        control channel stops answering there, so KDPPUSH (an SXNU1 verb) cannot
+        be used. kb-32 makes the module feed wire RX into kdp_rx while armed, so
+        a frame written here is picked up by kdp_poll().
+
+        A KDP serial frame is self-delimiting (0xFA ... 0xFB), so unlike
+        kdppush there is no need to chunk: write the whole thing at once.
+        """
+        hexstr = "".join(hexstr.split())
+        if not hexstr or len(hexstr) % 2:
+            log("用法: kdpraw <hex>（偶数个 hex 字符）")
+            return False
+        try:
+            raw = bytes.fromhex(hexstr)
+        except ValueError:
+            log("! kdpraw: 非法 hex")
+            return False
+        sess.send(raw)
+        log("kdpraw TX %d B: %s%s" % (len(raw), raw[:16].hex(),
+                                      "..." if len(raw) > 16 else ""))
+        return True
 
     def cmd_kdppush(hexstr):
         """Queue raw bytes into the KDP ring, splitting to fit the 127 B line.
@@ -717,7 +748,9 @@ def main():
                 parts = raw.split(None, 1)
                 verb = parts[0].upper()
                 rest = parts[1] if len(parts) > 1 else ""
-                if verb == "KDPPUSH":
+                if verb == "KDPRAW":
+                    cmd_kdpraw(rest)
+                elif verb == "KDPPUSH":
                     cmd_kdppush(rest)
                 elif verb == "KDP":
                     do_kdp(rest)
@@ -775,7 +808,9 @@ def main():
                     parts = raw.split(None, 1)
                     verb = parts[0].upper()
                     rest = parts[1] if len(parts) > 1 else ""
-                    if verb == "KDPPUSH":
+                    if verb == "KDPRAW":
+                        cmd_kdpraw(rest)
+                    elif verb == "KDPPUSH":
                         cmd_kdppush(rest)
                     elif verb == "KDP":
                         do_kdp(rest)
