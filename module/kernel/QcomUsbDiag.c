@@ -258,6 +258,8 @@ qud_diag_write_phys(uint64_t pa, const void *src, size_t len, uint32_t *readback
  * without the UFS log window still builds (verb returns unsupported).
  * The worker calls qud_dump_ufs_progress() every 5 ms; each tick writes at
  * most a few 4 KiB blocks, so no single call blocks the CDC path >10 ms. */
+extern int native_ufs_log_open(uint64_t *first_lba, uint64_t *blocks, const char **why)
+    __attribute__((weak_import));
 extern int native_ufs_export_write(uint64_t rel, uint32_t blocks, const void *src)
     __attribute__((weak_import));
 extern uint64_t native_ufs_export_blocks(void) __attribute__((weak_import));
@@ -279,7 +281,16 @@ static uint8_t qud_dump_scratch[4096];
 
 int qud_dump_ufs_available(void)
 {
-    return (&native_ufs_export_write != 0) && (&native_ufs_export_blocks != 0);
+    if (&native_ufs_export_write == 0 || &native_ufs_export_blocks == 0 ||
+        &native_ufs_log_open == 0) return 0;
+    /* The export window is opened lazily by the log writer (APFS mount).
+     * Try once here so a dump issued early in boot still works; retry on
+     * the next command if the UFS driver is not ready yet. */
+    if (native_ufs_export_blocks() == 0) {
+        uint64_t first = 0, blocks = 0; const char *why = "";
+        (void)native_ufs_log_open(&first, &blocks, &why);
+    }
+    return native_ufs_export_blocks() != 0;
 }
 
 /* Enqueue a dump. Returns slot index 0..N-1, or -1 full, -2 unsupported,

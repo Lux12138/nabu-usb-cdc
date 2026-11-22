@@ -156,6 +156,8 @@ def main():
     ap.add_argument("--wait", type=int, default=300, help="等 COM3 出现的最长秒数")
     ap.add_argument("--deadline", type=int, default=0, help="总运行时限，0=不限")
     ap.add_argument("--cmd-timeout", type=float, default=10.0, help="每条命令等 reply 的超时")
+    ap.add_argument("--script", default=None,
+                    help="预置命令文件：open COM3 + HELLO 后立即紧凑发完所有命令（抓短窗口用）")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -177,6 +179,37 @@ def main():
         kw["ts"] = now_hms()
         with open(evt_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(kw, ensure_ascii=False) + "\n")
+
+    def send_cmd(verb, arg):
+        """发一条 SXNU1 帧并等 reply，同步 seq/session。返回 reply 或 None。"""
+        verb = verb.upper()
+        if ctl.is_hello(verb):
+            ctl.session, ctl.seq = 0, 0
+        elif not ctl.hello_done:
+            log("! skip %s: HELLO 尚未成功" % verb)
+            return None
+        else:
+            ctl.seq += 1
+        frame = ctl.build(verb, arg)
+        log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
+        sess.send(frame)
+        reply = sess.wait_reply(verb, args.cmd_timeout)
+        if reply:
+            log("RX %s" % reply)
+            event(kind="cmd", verb=verb, ok=True, reply=reply)
+            if ctl.is_hello(verb):
+                for t in reply.split():
+                    if t.startswith("session="):
+                        try: ctl.session = int(t.split("=", 1)[1], 16)
+                        except ValueError: pass
+                    if t.startswith("last_seq="):
+                        try: ctl.seq = int(t.split("=", 1)[1], 16)
+                        except ValueError: pass
+                ctl.hello_done = True
+        else:
+            log("! no reply within %.1fs for %s" % (args.cmd_timeout, verb))
+            event(kind="cmd", verb=verb, ok=False)
+        return reply
 
     # 端口：显式直接用；否则等 COM3 出现（先起控制台→再刷机的场景）
     port = args.port
@@ -205,6 +238,19 @@ def main():
     last_total = 0
     last_idle_check = time.time()
 
+    # 预置脚本模式：open 后立即发 HELLO + 脚本全部命令（紧凑，抓短窗口）
+    if args.script and os.path.exists(args.script):
+        log("=== auto script: %s ===" % args.script)
+        send_cmd("HELLO", "")                      # 必须先建 session
+        with open(args.script, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = raw.split(None, 1)
+                send_cmd(parts[0], parts[1] if len(parts) > 1 else "")
+        log("=== auto script done ===")
+
     while sess.alive:
         if args.deadline and time.time() - t0 > args.deadline:
             log("deadline reached")
@@ -222,37 +268,7 @@ def main():
                     if not raw or raw.startswith("#"):
                         continue
                     parts = raw.split(None, 1)
-                    verb = parts[0].upper()
-                    arg = parts[1] if len(parts) > 1 else ""
-                    # HELLO 固定 session=0/seq=0；其它命令 seq 严格 +1
-                    if ctl.is_hello(verb):
-                        ctl.session, ctl.seq = 0, 0
-                    elif not ctl.hello_done:
-                        log("! skip %s: HELLO 尚未成功" % verb)
-                        continue
-                    else:
-                        ctl.seq += 1
-                    frame = ctl.build(verb, arg)
-                    log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
-                    sess.send(frame)
-                    reply = sess.wait_reply(verb, args.cmd_timeout)
-                    if reply:
-                        log("RX %s" % reply)
-                        event(kind="cmd", verb=verb, ok=True, reply=reply)
-                        # 从 HELLO reply 提取 session，并把 seq 设为内核 last_seq
-                        if ctl.is_hello(verb):
-                            toks = reply.split()
-                            for t in toks:
-                                if t.startswith("session="):
-                                    try: ctl.session = int(t.split("=", 1)[1], 16)
-                                    except ValueError: pass
-                                if t.startswith("last_seq="):
-                                    try: ctl.seq = int(t.split("=", 1)[1], 16)
-                                    except ValueError: pass
-                            ctl.hello_done = True
-                    else:
-                        log("! no reply within %.1fs for %s" % (args.cmd_timeout, verb))
-                        event(kind="cmd", verb=verb, ok=False)
+                    send_cmd(parts[0], parts[1] if len(parts) > 1 else "")
         except Exception as e:
             log("CMD ERR %s" % e)
         # --- 被动判据：仅记录字节增量，绝不发帧 ---

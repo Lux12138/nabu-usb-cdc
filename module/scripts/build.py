@@ -112,7 +112,7 @@ def main():
                    '_bzero', '_memcpy', '_memset', '_memmove',
                    '_mmu_kvtop', '_phystokv', '_ml_io_unmap',
                    '_native_ufs_export_write', '_native_ufs_export_blocks',
-                   '_native_ufs_export_first'}
+                   '_native_ufs_export_first', '_native_ufs_log_open'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in
