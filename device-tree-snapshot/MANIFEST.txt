@@ -1,0 +1,34 @@
+设备树改动快照 20261123-003850
+
+用途：记录本轮所有手工改动，供回滚/移植/重建编译树时重放。
+
+NabuAdreno/NativeAdrenoGpuProfile.cpp               21630  77687a9d935466d8e945436aaecebd4e76748757e10e11eec3cb85566cd76801
+  源: /root/merge/l738-device/drivers/NabuAdreno/NativeAdrenoGpuProfile.cpp
+NabuAdreno/NativeAdrenoGpuProfile.h                  2021  4fb547172004b4a1b7deb736ca444d6ef84071d6d4b99432ee6978b71fb8b1fd
+  源: /root/merge/l738-device/drivers/NabuAdreno/NativeAdrenoGpuProfile.h
+NabuAdreno/NativeAdrenoService.cpp                  71239  ba47e1ddab62d5c1b51a1c3fe1cc51e3251170f9432111b28033dc0f81cd1adb
+  源: /root/merge/l738-device/drivers/NabuAdreno/NativeAdrenoService.cpp
+xnu-work/bsd/kern/bsd_init.c                        57744  9e9cf1628357304424b75e1c4d4eeb569103631ac76cfe00cc9f7e17ffdede67
+  源: /root/merge/out-v6/nabu/ipados-17.7.11-21H461/nabu/tree/.cache/xnu-work/bsd/kern/bsd_init.c
+
+重放要点：
+1) 驱动三个文件：cp 到 /root/merge/{l738-device,UniXNU-nabu}/drivers/NabuAdreno/
+   （编译树用 symlink 指向它们，见 tree/drivers/NabuAdreno -> UniXNU-nabu/...）
+2) bsd_init.c：只在编译树 .cache/xnu-work 里改过；若 unixnu tree 重建需重新应用
+   （改动点：reboot 线程 arm_reboot 成功后调 qcom_usb_debug_platform_reset()）
+3) 模块 .a 用 D:\_nabu-usb-cdc 构建（commit c5de86e），defconfig 指向
+   /root/merge/UniXNU-nabu/build/libQcomXnuUsbDebug.a
+
+=== T30 相关（从 _backup_t30_realtree 的 .orig 生成 diff）===
+pe_serial.t30.diff             现文件快照 files/xnu-work__pexpert__arm__pe_serial.c
+protos.t30.diff                现文件快照 files/xnu-work__pexpert__pexpert__arm__protos.h
+serial_console.t30.diff        现文件快照 files/xnu-work__osfmk__console__serial_console.c
+
+=== 快照时发现的事实（2026-11-23 00:40）===
+1) 当前编译树 pe_serial.c/protos.h 里【没有】T30 补丁 A 的改动
+   （nabu_cdc_serial_functions=0, SERIAL_NABU_CDC=0），树文件时间 11-21 05:05，
+   说明 T30 的 pe_serial 注册从未进入该树。
+2) 但内核 kb-11 里有 qcom_usb_debug_serial_poll（模块侧 T30 符号）——
+   T30 只有模块侧生效，pe_serial 侧未生效。
+3) KDP 已由 T34 证明一直激活（CDC 抓包窗口假阴性所致），故此缺口当前不影响功能。
+4) 若要补齐 pe_serial 注册：把 T30 补丁 A 应用到 tree/.cache/xnu-work 后重编即可。

@@ -1,0 +1,18 @@
+--- /root/merge/_backup_t30_realtree/bsd_init.c.before-psci	2026-11-21 05:05:10.950611204 +0800
++++ /root/merge/_snapshot_device_20261123-003850/files/xnu-work__bsd__kern__bsd_init.c	2026-11-23 00:19:14.525413685 +0800
+@@ -1360,9 +1360,12 @@
+ 		qcom_usb_debug_control_reboot_failed(-4);
+ 		goto out;
+ 	}
+-	reboot_result = reboot_kernel(0, NULL);
+-	/* reboot_kernel only returns on failure; clear the request and report it. */
+-	qcom_usb_debug_control_reboot_failed(reboot_result ? reboot_result : -5);
++	/* reboot_kernel() stalls in vfs_unmountall() on this port (launchd is gone
++	 * but halt_all_cpus never runs). Use PSCI SYSTEM_RESET directly instead;
++	 * the arm step above already proved the hook, phase and dma are ready. */
++	qcom_usb_debug_platform_reset();
++	/* Not reached. */
++	qcom_usb_debug_control_reboot_failed(-5);
+ 
+ out:
+ 	__atomic_store_n(&qcom_usb_reboot_state, 4u, __ATOMIC_RELEASE);
