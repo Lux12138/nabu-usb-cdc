@@ -122,6 +122,9 @@ unsigned int qcom_usb_debug_serial_ready(void);
 size_t qcom_usb_debug_serial_pending(void);
 uint8_t qcom_usb_debug_serial_getc(void);
 void qcom_usb_debug_serial_poll(void);
+/* PSCI SYSTEM_RESET; does not return. Used by the control REBOOT path
+ * because reboot_kernel() stalls in vfs_unmountall() on this port. */
+void qcom_usb_debug_platform_reset(void);
 /* Worker-only opt-in. A qualified SoC profile may install the final PSCI
  * restart callback once, only when PE_halt_restart is NULL. No command runs. */
 int qcom_usb_debug_control_start(void);

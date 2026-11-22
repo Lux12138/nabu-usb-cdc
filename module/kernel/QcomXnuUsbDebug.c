@@ -15,6 +15,10 @@
 /* XNU 17.7.11 keeps ml_io_map in osfmk/arm/machine_routines.h, which the
  * generic <machine/machine_routines.h> does not pull in for this SDK. */
 extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+/* S4 PERF family: weak so a kernel without the GPU profiler still links. */
+extern uint32_t native_adreno_gpu_profile_start(uint32_t) __attribute__((weak_import));
+extern void native_adreno_gpu_profile_stop(void) __attribute__((weak_import));
+extern uint32_t native_adreno_gpu_profile_read(uint64_t *, uint32_t, uint32_t *, uint32_t *, uint32_t *) __attribute__((weak_import));
 #include <kern/cpu_number.h>
 #include <pexpert/pexpert.h>
 
@@ -78,6 +82,13 @@ static volatile uint32_t control_reboot_seq, control_reboot_generation;
 static volatile uint64_t control_reboot_session;
 
 static void platform_smc_reset(void) __attribute__((noreturn));
+/* PSCI SYSTEM_RESET for the control REBOOT path. reboot_kernel() stalls
+ * in vfs_unmountall() on this port, so the worker calls this instead. */
+void
+qcom_usb_debug_platform_reset(void)
+{
+    platform_smc_reset();
+}
 static int qcom_usb_control_halt_restart(unsigned int type);
 
 static void bytes_zero(void *pointer, size_t bytes)
@@ -1652,6 +1663,78 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             }
         }
         (void)guard;
+        break;
+    }
+    case SXNU_CONTROL_VERB_PERFSTART: {
+        /* PERFSTART <hexms>: open a GPU profile window (100..60000 ms). */
+        const uint8_t *tok[2]; size_t len[2];
+        uint64_t ms = 3000;
+        struct sxnu_control_writer writer;
+        uint32_t rc;
+        if (frame->arg_bytes && (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+                                 !control_args_hex(tok[0], len[0], &ms))) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (&native_adreno_gpu_profile_start == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        rc = native_adreno_gpu_profile_start((uint32_t)ms);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            rc == 0 ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, rc == 0 ? " state=armed ms=" : " state=busy rc=");
+        (void)sxnu_control_writer_decimal(&writer, rc == 0 ? (uint32_t)ms : rc);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_PERFSTOP: {
+        if (&native_adreno_gpu_profile_stop == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        native_adreno_gpu_profile_stop();
+        reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "OK", "state=stopped");
+        break;
+    }
+    case SXNU_CONTROL_VERB_PERFREAD: {
+        /* PERFREAD [uche|sp|ccu|all]: snapshot of the last completed window.
+         * Reply budget is 512 B, so this returns the header plus the first few
+         * counters; the full 29-counter table goes to the kernel log. */
+        uint64_t values[29];
+        uint32_t window_no = 0, jobs = 0, complete = 0, got, i;
+        struct sxnu_control_writer writer;
+        if (&native_adreno_gpu_profile_read == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        got = native_adreno_gpu_profile_read(values, 29, &window_no, &jobs, &complete);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " window=");
+        (void)sxnu_control_writer_decimal(&writer, window_no);
+        (void)sxnu_control_writer_text(&writer, " jobs=");
+        (void)sxnu_control_writer_decimal(&writer, jobs);
+        (void)sxnu_control_writer_text(&writer, complete ? " state=ready n=" : " state=void n=");
+        (void)sxnu_control_writer_decimal(&writer, got);
+        for (i = 0; i < got && i < 4 && !writer.failed; i++) {
+            (void)sxnu_control_writer_text(&writer, " c");
+            (void)sxnu_control_writer_decimal(&writer, i);
+            (void)sxnu_control_writer_text(&writer, "=");
+            (void)sxnu_control_writer_hex(&writer, values[i], 16);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_PERFCLEAR: {
+        /* PERFCLEAR: no dedicated clear API; a zero-length window is enough to
+         * invalidate the snapshot the next PERFREAD would see. */
+        if (&native_adreno_gpu_profile_start == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "OK", "state=cleared");
         break;
     }
     case SXNU_CONTROL_VERB_SYM:

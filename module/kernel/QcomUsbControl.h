@@ -43,6 +43,10 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_DUMLIST,    /* DUMLIST -> queued/done slots                  */
     SXNU_CONTROL_VERB_UPTIME,     /* UPTIME -> mach ticks + 19.2MHz timebase      */
     SXNU_CONTROL_VERB_RDBLK,      /* RDBLK <name> <off> <len> -> named MMIO block */
+    SXNU_CONTROL_VERB_PERFSTART,  /* PERFSTART <hexms> -> GPU profile window     */
+    SXNU_CONTROL_VERB_PERFSTOP,   /* PERFSTOP -> stop the profile window         */
+    SXNU_CONTROL_VERB_PERFREAD,   /* PERFREAD -> last window counter snapshot    */
+    SXNU_CONTROL_VERB_PERFCLEAR,  /* PERFCLEAR -> drop the last snapshot         */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -174,6 +178,19 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 5u && text[0] == 'R' && text[1] == 'D' && text[2] == 'B' &&
         text[3] == 'L' && text[4] == 'K')
         return SXNU_CONTROL_VERB_RDBLK;
+    if (bytes == 9u && text[0] == 'P' && text[1] == 'E' && text[2] == 'R' &&
+        text[3] == 'F' && text[4] == 'S' && text[5] == 'T' && text[6] == 'A' &&
+        text[7] == 'R' && text[8] == 'T')
+        return SXNU_CONTROL_VERB_PERFSTART;
+    if (bytes == 8u && text[0] == 'P' && text[1] == 'E' && text[2] == 'R' &&
+        text[3] == 'F' && text[4] == 'S' && text[5] == 'T' && text[6] == 'O' &&
+        text[7] == 'P') return SXNU_CONTROL_VERB_PERFSTOP;
+    if (bytes == 8u && text[0] == 'P' && text[1] == 'E' && text[2] == 'R' &&
+        text[3] == 'F' && text[4] == 'R' && text[5] == 'E' && text[6] == 'A' &&
+        text[7] == 'D') return SXNU_CONTROL_VERB_PERFREAD;
+    if (bytes == 9u && text[0] == 'P' && text[1] == 'E' && text[2] == 'R' &&
+        text[3] == 'F' && text[4] == 'C' && text[5] == 'L' && text[6] == 'E' &&
+        text[7] == 'A' && text[8] == 'R') return SXNU_CONTROL_VERB_PERFCLEAR;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -201,6 +218,10 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_DUMLIST: return "DUMLIST";
     case SXNU_CONTROL_VERB_UPTIME: return "UPTIME";
     case SXNU_CONTROL_VERB_RDBLK: return "RDBLK";
+    case SXNU_CONTROL_VERB_PERFSTART: return "PERFSTART";
+    case SXNU_CONTROL_VERB_PERFSTOP: return "PERFSTOP";
+    case SXNU_CONTROL_VERB_PERFREAD: return "PERFREAD";
+    case SXNU_CONTROL_VERB_PERFCLEAR: return "PERFCLEAR";
     default: return "";
     }
 }

@@ -660,6 +660,14 @@ def main():
                     print("用法: readpa <hex物理地址> <hex长度>，如 readpa 0xae00000 40", flush=True)
             elif cmd == "readpanext":
                 do_verb("READPANEXT", arg=rest)
+            elif cmd == "perfstart":
+                do_verb("PERFSTART", arg=rest)
+            elif cmd == "perfstop":
+                do_verb("PERFSTOP", arg=rest)
+            elif cmd == "perfread":
+                do_verb("PERFREAD", arg=rest)
+            elif cmd == "perfclear":
+                do_verb("PERFCLEAR", arg=rest)
             elif cmd == "uptime":
                 do_verb("UPTIME", arg=rest)
             elif cmd == "rdblk":
@@ -757,6 +765,10 @@ HELP = """\
   dumplist           列出 dump slot 状态
   uptime             读 ARM 虚拟计数器（统一时基）
   rdblk <name> <off> <len>  按名字读 MMIO 块（免记绝对地址）
+  perfstart [ms]    启动 GPU profile 窗口（默认 3000ms）
+  perfstop          停止窗口
+  perfread          读最近窗口计数器快照
+  perfclear         清除快照
   version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）

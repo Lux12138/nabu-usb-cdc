@@ -121,6 +121,10 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_DUMLIST, "DUMLIST", 1);
     check_accept(SXNU_CONTROL_VERB_UPTIME, "UPTIME", 1);
     check_accept(SXNU_CONTROL_VERB_RDBLK, "RDBLK mdp 0 40", 1);
+    check_accept(SXNU_CONTROL_VERB_PERFSTART, "PERFSTART bb8", 1);
+    check_accept(SXNU_CONTROL_VERB_PERFSTOP, "PERFSTOP", 1);
+    check_accept(SXNU_CONTROL_VERB_PERFREAD, "PERFREAD", 1);
+    check_accept(SXNU_CONTROL_VERB_PERFCLEAR, "PERFCLEAR", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -151,6 +155,10 @@ main(void)
     check("DUMLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
     check("UPTIME", 1, SXNU_CONTROL_VERB_UPTIME, "");
     check("RDBLK mdp 0 40", 1, SXNU_CONTROL_VERB_RDBLK, "mdp 0 40");
+    check("PERFSTART bb8", 1, SXNU_CONTROL_VERB_PERFSTART, "bb8");
+    check("PERFSTOP", 1, SXNU_CONTROL_VERB_PERFSTOP, "");
+    check("PERFREAD", 1, SXNU_CONTROL_VERB_PERFREAD, "");
+    check("PERFCLEAR", 1, SXNU_CONTROL_VERB_PERFCLEAR, "");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");
