@@ -386,6 +386,10 @@ public:
     IOReturn start();
     void poll();
     void dump() const;
+    /* Runtime HWCG switch (GPUHWCG verb). */
+    IOReturn setHwcg(bool enable);
+    /* Read-only view of the power/A6xx tables for the GPUFREQ verb. */
+    const NativeAdrenoA6xxTables &powerTables() const;
 };
 
 A640State *state=nullptr;
@@ -1380,6 +1384,49 @@ IOReturn A640State::start()
         }
     }
     return kIOReturnSuccess;
+}
+
+const NativeAdrenoA6xxTables &A640State::powerTables() const
+{
+    return power_.tables();
+}
+
+IOReturn A640State::setHwcg(bool enable)
+{
+    if(!ready_ || !ringIo_.write32 || !ringIo_.barrier) {
+        return kIOReturnNotReady;
+    }
+    return NativeAdrenoA6xxHwInit::setClockGating(&ringIo_, enable);
+}
+
+/* GPUFREQ: report the requested GPU clock straight out of the driver's own
+ * performance table. Reading the GPUCC PLL registers instead panics with an
+ * unaligned data abort whenever the GPU is not powered (ml_io_map returns an
+ * unusable window), so keep this path allocation-free and MMIO-free. */
+extern "C" uint32_t native_adreno_get_gpu_freq(uint32_t *requested_khz,
+                                                uint32_t *vote,
+                                                uint32_t *ready)
+{
+    if(requested_khz) *requested_khz = 0;
+    if(vote) *vote = 0;
+    if(ready) *ready = 0;
+    if(!state) return 0;
+    {
+        const NativeAdrenoA6xxTables &tables = state->powerTables();
+        if(requested_khz) *requested_khz = tables.performance[7];
+        if(vote) *vote = tables.performance[5];
+    }
+    if(ready) *ready = 1;
+    return 1;
+}
+
+extern "C" int native_adreno_set_hwcg(int enable)
+{
+    IOReturn status;
+    if(!state) return int(kIOReturnNotReady);
+    status = state->setHwcg(enable ? true : false);
+    IOLog("NativeAdrenoA6xx: GPUHWCG enable=%d -> %08x\n", enable ? 1 : 0, uint32_t(status));
+    return int(status);
 }
 
 void A640State::poll()

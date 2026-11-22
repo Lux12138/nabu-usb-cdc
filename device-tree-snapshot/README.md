@@ -39,3 +39,14 @@
 3. 应用 `bsd_init.c` PSCI 改动（若树被重建）
 4. `unixnu build kernel`
 5. NOP18 → 打包 → gate → 上板
+
+## 2026-11-23 01:15 追加：GPU 运行时控制（GPUFREQ / GPUHWCG）
+
+| 文件 | 改了什么 |
+|---|---|
+| `NativeAdrenoService.cpp` | ① `A640State::setHwcg(bool)` + `native_adreno_set_hwcg()`（GPUHWCG）② `A640State::powerTables()` + `native_adreno_get_gpu_freq()`（GPUFREQ 读驱动性能表） |
+| `NativeAdrenoA6xxHwInit.cpp/.h` | `setClockGating(io, enable)`：enable=false 把每个 HWCG 寄存器写 0，true 重放原表 |
+
+**关键教训**：`ml_io_map(0x2c90000)`（GPUCC）在 **GPU 未上电时返回不可访问的窗口**，直接解引用 = Unaligned kernel data abort（实测 panic 两次）。
+⇒ 读 GPU 寄存器必须走驱动接口（它自己管电源和状态），不要裸 ml_io_map。
+MDSS（0xae01000）不受影响，一直可读。
