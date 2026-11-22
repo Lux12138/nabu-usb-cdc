@@ -47,6 +47,8 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_PERFSTOP,   /* PERFSTOP -> stop the profile window         */
     SXNU_CONTROL_VERB_PERFREAD,   /* PERFREAD -> last window counter snapshot    */
     SXNU_CONTROL_VERB_PERFCLEAR,  /* PERFCLEAR -> drop the last snapshot         */
+    SXNU_CONTROL_VERB_GPUFREQ,    /* GPUFREQ -> current GPU clock / vote          */
+    SXNU_CONTROL_VERB_GPUHWCG,    /* GPUHWCG <on|off> -> runtime clock gating     */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -191,6 +193,12 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 9u && text[0] == 'P' && text[1] == 'E' && text[2] == 'R' &&
         text[3] == 'F' && text[4] == 'C' && text[5] == 'L' && text[6] == 'E' &&
         text[7] == 'A' && text[8] == 'R') return SXNU_CONTROL_VERB_PERFCLEAR;
+    if (bytes == 7u && text[0] == 'G' && text[1] == 'P' && text[2] == 'U' &&
+        text[3] == 'F' && text[4] == 'R' && text[5] == 'E' && text[6] == 'Q')
+        return SXNU_CONTROL_VERB_GPUFREQ;
+    if (bytes == 7u && text[0] == 'G' && text[1] == 'P' && text[2] == 'U' &&
+        text[3] == 'H' && text[4] == 'W' && text[5] == 'C' && text[6] == 'G')
+        return SXNU_CONTROL_VERB_GPUHWCG;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -222,6 +230,8 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_PERFSTOP: return "PERFSTOP";
     case SXNU_CONTROL_VERB_PERFREAD: return "PERFREAD";
     case SXNU_CONTROL_VERB_PERFCLEAR: return "PERFCLEAR";
+    case SXNU_CONTROL_VERB_GPUFREQ: return "GPUFREQ";
+    case SXNU_CONTROL_VERB_GPUHWCG: return "GPUHWCG";
     default: return "";
     }
 }

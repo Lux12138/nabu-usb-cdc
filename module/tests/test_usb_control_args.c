@@ -125,6 +125,8 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_PERFSTOP, "PERFSTOP", 1);
     check_accept(SXNU_CONTROL_VERB_PERFREAD, "PERFREAD", 1);
     check_accept(SXNU_CONTROL_VERB_PERFCLEAR, "PERFCLEAR", 1);
+    check_accept(SXNU_CONTROL_VERB_GPUFREQ, "GPUFREQ", 1);
+    check_accept(SXNU_CONTROL_VERB_GPUHWCG, "GPUHWCG on", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -159,6 +161,8 @@ main(void)
     check("PERFSTOP", 1, SXNU_CONTROL_VERB_PERFSTOP, "");
     check("PERFREAD", 1, SXNU_CONTROL_VERB_PERFREAD, "");
     check("PERFCLEAR", 1, SXNU_CONTROL_VERB_PERFCLEAR, "");
+    check("GPUFREQ", 1, SXNU_CONTROL_VERB_GPUFREQ, "");
+    check("GPUHWCG off", 1, SXNU_CONTROL_VERB_GPUHWCG, "off");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

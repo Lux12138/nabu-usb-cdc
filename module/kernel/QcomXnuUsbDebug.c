@@ -15,6 +15,10 @@
 /* XNU 17.7.11 keeps ml_io_map in osfmk/arm/machine_routines.h, which the
  * generic <machine/machine_routines.h> does not pull in for this SDK. */
 extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+/* GPU runtime control (GPUHWCG); weak so a kernel without the driver links. */
+extern int native_adreno_set_hwcg(int enable) __attribute__((weak_import));
+extern uint32_t native_adreno_get_gpu_freq(uint32_t *requested_khz,
+    uint32_t *vote, uint32_t *ready) __attribute__((weak_import));
 /* S4 PERF family: weak so a kernel without the GPU profiler still links. */
 extern uint32_t native_adreno_gpu_profile_start(uint32_t) __attribute__((weak_import));
 extern void native_adreno_gpu_profile_stop(void) __attribute__((weak_import));
@@ -1756,6 +1760,65 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             break;
         }
         reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "OK", "state=cleared");
+        break;
+    }
+    case SXNU_CONTROL_VERB_GPUFREQ: {
+        /* GPUFREQ: read the driver's own performance table.
+         * Reading the GPUCC PLL registers directly (ml_io_map on 0x2c90000)
+         * panicked with an unaligned data abort whenever the GPU was not
+         * powered -- ml_io_map handed back an unusable window. The table read
+         * touches no MMIO and is always safe. */
+        struct sxnu_control_writer writer;
+        uint32_t khz = 0, vote = 0, ready = 0;
+        uint32_t ok;
+        if (&native_adreno_get_gpu_freq == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        ok = native_adreno_get_gpu_freq(&khz, &vote, &ready);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            ok ? "OK" : "ERR");
+        if (ok) {
+            (void)sxnu_control_writer_text(&writer, " requested_khz=");
+            (void)sxnu_control_writer_decimal(&writer, khz);
+            (void)sxnu_control_writer_text(&writer, " vote=");
+            (void)sxnu_control_writer_hex(&writer, vote, 8);
+            (void)sxnu_control_writer_text(&writer, " ready=");
+            (void)sxnu_control_writer_decimal(&writer, ready);
+        } else {
+            (void)sxnu_control_writer_text(&writer, " state=notready");
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_GPUHWCG: {
+        /* GPUHWCG <on|off>: runtime clock-gating switch (A/B the stutter). */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        int enable = -1, rc;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (len[0] == 2u && tok[0][0] == 'o' && tok[0][1] == 'n') enable = 1;
+        else if (len[0] == 3u && tok[0][0] == 'o' && tok[0][1] == 'f' && tok[0][2] == 'f') enable = 0;
+        if (enable < 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (&native_adreno_set_hwcg == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        rc = native_adreno_set_hwcg(enable);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            rc == 0 ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, rc == 0 ? " hwcg=" : " state=notready rc=");
+        (void)sxnu_control_writer_text(&writer, rc == 0 ? (enable ? "on" : "off") : "");
+        if (rc != 0) (void)sxnu_control_writer_decimal(&writer, (uint32_t)rc);
+        reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
     case SXNU_CONTROL_VERB_SYM:

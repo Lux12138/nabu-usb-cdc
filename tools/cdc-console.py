@@ -666,6 +666,13 @@ def main():
                 do_verb("PERFSTOP", arg=rest)
             elif cmd == "perfread":
                 do_verb("PERFREAD", arg=rest)
+            elif cmd == "gpufreq":
+                do_verb("GPUFREQ", arg=rest)
+            elif cmd == "gpuhwcg":
+                if rest:
+                    do_verb("GPUHWCG", arg=rest)
+                else:
+                    print("用法: gpuhwcg <on|off>", flush=True)
             elif cmd == "perfclear":
                 do_verb("PERFCLEAR", arg=rest)
             elif cmd == "uptime":
@@ -769,6 +776,8 @@ HELP = """\
   perfstop          停止窗口
   perfread          读最近窗口计数器快照
   perfclear         清除快照
+  gpufreq           读 GPUCC PLL 寄存器
+  gpuhwcg <on|off>  运行时开关 GPU 时钟门控
   version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
