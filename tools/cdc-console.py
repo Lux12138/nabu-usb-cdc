@@ -660,6 +660,10 @@ def main():
                     print("用法: readpa <hex物理地址> <hex长度>，如 readpa 0xae00000 40", flush=True)
             elif cmd == "readpanext":
                 do_verb("READPANEXT", arg=rest)
+            elif cmd == "dumpufs":
+                do_verb("DUMPUFS", arg=rest)
+            elif cmd == "dumplist":
+                do_verb("DUMLIST", arg=rest)
             elif cmd == "bootargs":
                 tail = do_verb("BOOTARGS", arg=rest)
                 if tail and "hex=" in tail:
@@ -742,6 +746,8 @@ HELP = """\
   readpa <pa> <len>  读物理地址（寄存器/MMIO，如 readpa 0xae00000 40）
   writepa <pa> <hex> 写物理地址（仅 MMIO 白名单，需 qcom-usb-write=1）
   bootargs           读内核命令行（PE_boot_args）
+  dumpufs <pa> <len> <tag>  异步写 UFS 导出区（4KiB 对齐）
+  dumplist           列出 dump slot 状态
   version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）

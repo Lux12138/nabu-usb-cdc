@@ -39,6 +39,8 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_WRITEPA,    /* WRITEPA <hexpa> <hexbytes>, MMIO whitelist only */
     SXNU_CONTROL_VERB_BOOTARGS,   /* BOOTARGS [all] -> kernel command line         */
     SXNU_CONTROL_VERB_VERSION,    /* VERSION -> build/xnu/soc identity            */
+    SXNU_CONTROL_VERB_DUMPUFS,    /* DUMPUFS <hexpa> <hexlen> <tag> -> UFS         */
+    SXNU_CONTROL_VERB_DUMLIST,    /* DUMLIST -> queued/done slots                  */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -158,6 +160,12 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'V' && text[1] == 'E' && text[2] == 'R' &&
         text[3] == 'S' && text[4] == 'I' && text[5] == 'O' && text[6] == 'N')
         return SXNU_CONTROL_VERB_VERSION;
+    if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
+        text[3] == 'P' && text[4] == 'U' && text[5] == 'F' && text[6] == 'S')
+        return SXNU_CONTROL_VERB_DUMPUFS;
+    if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
+        text[3] == 'L' && text[4] == 'I' && text[5] == 'S' && text[6] == 'T')
+        return SXNU_CONTROL_VERB_DUMLIST;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -181,6 +189,8 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_WRITEPA: return "WRITEPA";
     case SXNU_CONTROL_VERB_BOOTARGS: return "BOOTARGS";
     case SXNU_CONTROL_VERB_VERSION: return "VERSION";
+    case SXNU_CONTROL_VERB_DUMPUFS: return "DUMPUFS";
+    case SXNU_CONTROL_VERB_DUMLIST: return "DUMLIST";
     default: return "";
     }
 }

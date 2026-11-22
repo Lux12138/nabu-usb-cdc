@@ -113,6 +113,15 @@ void qcom_usb_debug_putc(char c);
 size_t qcom_usb_debug_write(const void *bytes, size_t count);
 /* At most one USB event and a bounded pump; schedule externally if needed. */
 void qcom_usb_debug_poll(void);
+
+/* pe_serial CDC backend: raw serial console / KDP link.  Safe to call before
+ * qcom_usb_debug_init(); the serial callbacks simply see "no room"/"no data"
+ * until the native core is ACTIVE. */
+int qcom_usb_debug_serial_available(void);
+unsigned int qcom_usb_debug_serial_ready(void);
+size_t qcom_usb_debug_serial_pending(void);
+uint8_t qcom_usb_debug_serial_getc(void);
+void qcom_usb_debug_serial_poll(void);
 /* Worker-only opt-in. A qualified SoC profile may install the final PSCI
  * restart callback once, only when PE_halt_restart is NULL. No command runs. */
 int qcom_usb_debug_control_start(void);

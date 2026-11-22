@@ -252,6 +252,93 @@ qud_diag_write_phys(uint64_t pa, const void *src, size_t len, uint32_t *readback
     return 1;
 }
 
+
+/* ---- DUMPUFS: kernel-side async dump to UFS export region ----------------
+ * Storage driver exports native_ufs_export_write(); weak_import so a kernel
+ * without the UFS log window still builds (verb returns unsupported).
+ * The worker calls qud_dump_ufs_progress() every 5 ms; each tick writes at
+ * most a few 4 KiB blocks, so no single call blocks the CDC path >10 ms. */
+extern int native_ufs_export_write(uint64_t rel, uint32_t blocks, const void *src)
+    __attribute__((weak_import));
+extern uint64_t native_ufs_export_blocks(void) __attribute__((weak_import));
+extern uint64_t native_ufs_export_first(void) __attribute__((weak_import));
+
+#define QUD_DUMP_SLOTS 4u
+#define QUD_DUMP_TICKBYTES (16u * 4096u)   /* <=64 KiB per 5 ms tick */
+
+struct qud_dump_slot {
+    uint64_t pa;          /* source physical address */
+    uint32_t len;         /* total bytes */
+    uint32_t done;        /* bytes written so far */
+    uint32_t rel;         /* export-region block offset */
+    uint8_t  state;       /* 0 free 1 queued 2 running 3 done 4 error */
+    uint8_t  tag[16];     /* NUL-padded host tag */
+};
+static struct qud_dump_slot qud_dump_slots[QUD_DUMP_SLOTS];
+static uint8_t qud_dump_scratch[4096];
+
+int qud_dump_ufs_available(void)
+{
+    return (&native_ufs_export_write != 0) && (&native_ufs_export_blocks != 0);
+}
+
+/* Enqueue a dump. Returns slot index 0..N-1, or -1 full, -2 unsupported,
+ * -3 bad args. Only the worker calls native_ufs_export_write(). */
+int qud_dump_ufs_enqueue(uint64_t pa, uint32_t len, const uint8_t *tag, uint32_t taglen)
+{
+    if (!qud_dump_ufs_available()) return -2;
+    if (!len || (len & 0xfffu) || native_ufs_export_blocks() < (len / 4096u)) return -3;
+    for (uint32_t i = 0; i < QUD_DUMP_SLOTS; i++) {
+        struct qud_dump_slot *s = &qud_dump_slots[i];
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 0) continue;
+        s->pa = pa; s->len = len; s->done = 0; s->rel = 0;
+        memset(s->tag, 0, sizeof(s->tag));
+        for (uint32_t j = 0; j < taglen && j < sizeof(s->tag) - 1; j++)
+            s->tag[j] = tag[j];
+        __atomic_store_n(&s->state, 1u, __ATOMIC_RELEASE);
+        return (int)i;
+    }
+    return -1;
+}
+
+/* Worker tick: advance queued/running dumps by at most QUD_DUMP_TICKBYTES.
+ * Runs outside the USB busy lock; reads PA through the cached IO window. */
+void qud_dump_ufs_progress(void)
+{
+    if (!qud_dump_ufs_available()) return;
+    for (uint32_t i = 0; i < QUD_DUMP_SLOTS; i++) {
+        struct qud_dump_slot *s = &qud_dump_slots[i];
+        uint32_t st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+        if (st != 1 && st != 2) continue;
+        __atomic_store_n(&s->state, 2u, __ATOMIC_RELEASE);
+        uint32_t budget = QUD_DUMP_TICKBYTES;
+        while (s->done < s->len && budget >= 4096u) {
+            size_t got = qud_diag_read_phys(s->pa + s->done, qud_dump_scratch, 4096u);
+            if (got != 4096u) { __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE); break; }
+            if (!native_ufs_export_write(s->rel, 1u, qud_dump_scratch)) {
+                __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE); break;
+            }
+            s->done += 4096u; s->rel++; budget -= 4096u;
+        }
+        if (s->done >= s->len) __atomic_store_n(&s->state, 3u, __ATOMIC_RELEASE);
+        return;   /* one slot per tick */
+    }
+}
+
+/* Snapshot a slot for DUMLIST. Returns state; fills outs. */
+uint32_t qud_dump_ufs_slot(uint32_t idx, uint64_t *pa, uint32_t *len,
+                            uint32_t *done, const char **tag)
+{
+    if (idx >= QUD_DUMP_SLOTS) return 0xffu;
+    struct qud_dump_slot *s = &qud_dump_slots[idx];
+    uint32_t st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+    if (pa) *pa = s->pa;
+    if (len) *len = s->len;
+    if (done) *done = s->done;
+    if (tag) *tag = (const char *)s->tag;
+    return st;
+}
+
 /* ---- READ / READNEXT ---------------------------------------------------- */
 
 /* Starts a buffered read so the host can pull large ranges 128 bytes at a

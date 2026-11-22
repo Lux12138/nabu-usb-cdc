@@ -1488,7 +1488,11 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             /* Hex-encode the command line: no spaces, no parse ambiguity with
              * the space-delimited SXNU1R reply. Two hex chars per byte. */
             static const char hex[] = "0123456789abcdef";
-            while (cmdline[n] && n < 1024u && !writer.failed) {
+            /* Reply cap is 512B (SXNU_CONTROL_REPLY_BYTES); header ~70B +
+             * 2 hex chars/byte + len= field. 200 bytes -> 400 hex chars
+             * keeps the whole frame under the cap.  Truncation is fine:
+             * the leading boot-args (debug=, qcom-usb-*) are what matter. */
+            while (cmdline[n] && n < 200u && !writer.failed) {
                 const unsigned char c = (unsigned char)cmdline[n];
                 (void)sxnu_control_writer_char(&writer, hex[c >> 4]);
                 (void)sxnu_control_writer_char(&writer, hex[c & 0xf]);
@@ -1505,6 +1509,66 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         sxnu_control_writer_init(&writer, reply, sizeof(reply));
         (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
         (void)sxnu_control_writer_text(&writer, " build=qcom-xnu-usb-console xnu=17.7.11-21H461 soc=sm8150");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_DUMPUFS: {
+        /* DUMPUFS <hexpa> <hexlen> <tag>: enqueue async UFS dump. */
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t pa = 0, n = 0;
+        struct sxnu_control_writer writer;
+        int slot;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) < 2 ||
+            !control_args_hex(tok[0], len[0], &pa) ||
+            !control_args_hex(tok[1], len[1], &n) || (n & 0xfffu) ||
+            n > (64u << 20)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (!qud_dump_ufs_available()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        slot = qud_dump_ufs_enqueue(pa, (uint32_t)n,
+                                    len[2] ? tok[2] : (const uint8_t *)"dump",
+                                    len[2] ? len[2] : 4);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            slot >= 0 ? "OK" : "ERR");
+        if (slot >= 0) {
+            (void)sxnu_control_writer_text(&writer, " state=queued slot=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)slot);
+            (void)sxnu_control_writer_text(&writer, " est=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)n);
+        } else {
+            (void)sxnu_control_writer_text(&writer, " ");
+            (void)sxnu_control_writer_text(&writer,
+                slot == -1 ? "state=busy" : slot == -2 ? "state=unsupported" : "state=args");
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_DUMLIST: {
+        struct sxnu_control_writer writer;
+        uint32_t i;
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        for (i = 0; i < 4u && !writer.failed; i++) {
+            uint64_t pa = 0; uint32_t len = 0, done = 0; const char *tag = "";
+            uint32_t st = qud_dump_ufs_slot(i, &pa, &len, &done, &tag);
+            if (st == 0) continue;
+            (void)sxnu_control_writer_text(&writer, " slot=");
+            (void)sxnu_control_writer_decimal(&writer, i);
+            (void)sxnu_control_writer_text(&writer, " state=");
+            (void)sxnu_control_writer_decimal(&writer, st);
+            (void)sxnu_control_writer_text(&writer, " done=");
+            (void)sxnu_control_writer_decimal(&writer, done);
+            (void)sxnu_control_writer_text(&writer, "/");
+            (void)sxnu_control_writer_decimal(&writer, len);
+            (void)sxnu_control_writer_text(&writer, " tag=");
+            (void)sxnu_control_writer_text(&writer, tag);
+        }
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
@@ -1710,28 +1774,134 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
     release(flags); return accepted;
 }
 void qcom_usb_debug_putc(char c) { (void)qcom_usb_debug_write(&c, 1); }
-void qcom_usb_debug_poll(void)
+/* ---- pe_serial CDC backend: raw serial console / KDP RX --------------------
+ * KDP frames are 0xFA + CRC32(4) + 0xFA + escaped payload + 0xFB
+ * (osfmk/kdp/kdp_serial.c).  0xFA/0xFB/0xFE never appear unescaped inside a
+ * KDP payload, so a raw 0xFA starts a KDP run and a raw 0xFB ends it.  Bytes
+ * outside a KDP run are SXNU1 text and still go to the control parser. */
+#define SERIAL_KDP_START  0xFAu
+#define SERIAL_KDP_END    0xFBu
+#define SERIAL_RX_BYTES   4096u
+
+static uint8_t usb_serial_rx[SERIAL_RX_BYTES];
+static uint32_t usb_serial_rx_head, usb_serial_rx_tail, usb_serial_rx_used;
+static uint32_t usb_serial_rx_overflow;
+static volatile uint8_t usb_serial_rx_kdp;
+
+static void
+serial_rx_push(uint8_t c)
+{
+    uint64_t daif;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (usb_serial_rx_used < SERIAL_RX_BYTES) {
+        usb_serial_rx[usb_serial_rx_head] = c;
+        usb_serial_rx_head = (usb_serial_rx_head + 1u) % SERIAL_RX_BYTES;
+        usb_serial_rx_used++;
+    } else {
+        usb_serial_rx_overflow++;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+static int
+serial_rx_pop(uint8_t *c)
+{
+    uint64_t daif;
+    int ok = 0;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (usb_serial_rx_used != 0) {
+        *c = usb_serial_rx[usb_serial_rx_tail];
+        usb_serial_rx_tail = (usb_serial_rx_tail + 1u) % SERIAL_RX_BYTES;
+        usb_serial_rx_used--;
+        ok = 1;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+    return ok;
+}
+
+int
+qcom_usb_debug_serial_available(void)
+{
+    return native.status.phase == QCOM_USB_DEBUG_ACTIVE;
+}
+
+unsigned int
+qcom_usb_debug_serial_ready(void)
+{
+    /* v1 never blocks: qcom_usb_debug_write() is non-blocking and absorbs into
+     * the 4 MiB CPU backlog.  Reporting "no room" would let uart_putc_device()
+     * spin forever if the host stops draining the 16 KiB DWC3 ring. */
+    return 1u;
+}
+
+size_t
+qcom_usb_debug_serial_pending(void)
+{
+    return usb_serial_rx_used;
+}
+
+uint8_t
+qcom_usb_debug_serial_getc(void)
+{
+    uint8_t c = 0;
+    (void)serial_rx_pop(&c);
+    return c;
+}
+
+/* One bounded drain of the DWC3 RX ring.  Master CPU only, same constraint as
+ * dwc3_poll()/dwc3_read().  Shared by the worker and by the pe_serial receive
+ * path so KDP does not have to wait for the next 5 ms worker tick. */
+static void
+serial_rx_drain(void)
 {
     uint64_t flags;
-    uint8_t control_bytes[SXNU_CONTROL_WORK_BYTES];
-    struct qcom_usb_debug_status control_status = {0};
+    uint8_t rx[SXNU_CONTROL_WORK_BYTES];
+    uint8_t text[SXNU_CONTROL_WORK_BYTES];
+    struct qcom_usb_debug_status status = {0};
     uint32_t generation = 0;
-    size_t control_bytes_count = 0;
+    size_t rx_count = 0, text_count = 0;
     int observed = 0;
+
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return;
     (void)poll_owned();
-    if (__atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE) &&
-        native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
+    if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
         buffer_status_owned();
-        bytes_copy(&control_status, &native.status, sizeof(control_status));
+        bytes_copy(&status, &native.status, sizeof(status));
         generation = dwc3_rx_generation(native.core);
-        control_bytes_count = dwc3_read(native.core, control_bytes,
-                                            sizeof(control_bytes));
+        rx_count = dwc3_read(native.core, rx, sizeof(rx));
         observed = 1;
     }
     release(flags);
-    if (observed)
-        control_service(control_bytes, control_bytes_count, generation, &control_status);
+    if (!observed) return;
+
+    for (size_t i = 0; i < rx_count; i++) {
+        uint8_t b = rx[i];
+        if (usb_serial_rx_kdp) {
+            serial_rx_push(b);
+            if (b == SERIAL_KDP_END) usb_serial_rx_kdp = 0;
+            continue;
+        }
+        if (b == SERIAL_KDP_START) {
+            usb_serial_rx_kdp = 1;
+            serial_rx_push(b);
+            continue;
+        }
+        text[text_count++] = b;
+    }
+    if (text_count != 0 && __atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE))
+        control_service(text, text_count, generation, &status);
+}
+
+void
+qcom_usb_debug_serial_poll(void)
+{
+    serial_rx_drain();
+}
+
+void qcom_usb_debug_poll(void)
+{
+    serial_rx_drain();
+    qud_dump_ufs_progress();   /* async UFS dump, outside the USB lock */
 }
 void qcom_usb_debug_panic_prepare(void)
 {

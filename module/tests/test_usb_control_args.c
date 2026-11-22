@@ -117,6 +117,8 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_WRITEPA, "WRITEPA 0xae02000 08000003", 1);
     check_accept(SXNU_CONTROL_VERB_BOOTARGS, "BOOTARGS", 1);
     check_accept(SXNU_CONTROL_VERB_VERSION, "VERSION", 1);
+    check_accept(SXNU_CONTROL_VERB_DUMPUFS, "DUMPUFS 0x1008000 0x1000 smmu", 1);
+    check_accept(SXNU_CONTROL_VERB_DUMLIST, "DUMLIST", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -143,6 +145,8 @@ main(void)
           "0xae02000 08000003");
     check("BOOTARGS", 1, SXNU_CONTROL_VERB_BOOTARGS, "");
     check("VERSION", 1, SXNU_CONTROL_VERB_VERSION, "");
+    check("DUMPUFS 0x1008000 0x1000 smmu", 1, SXNU_CONTROL_VERB_DUMPUFS, "0x1008000 0x1000 smmu");
+    check("DUMLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

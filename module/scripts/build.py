@@ -110,7 +110,9 @@ def main():
         allowed = {'_PE_halt_restart', '_PE_parse_boot_argn', '_PE_boot_args', '_cpu_number', '_master_cpu',
                    '_ml_io_map', '_ml_static_vtop', '___stack_chk_guard', '___stack_chk_fail',
                    '_bzero', '_memcpy', '_memset', '_memmove',
-                   '_mmu_kvtop', '_phystokv', '_ml_io_unmap'}
+                   '_mmu_kvtop', '_phystokv', '_ml_io_unmap',
+                   '_native_ufs_export_write', '_native_ufs_export_blocks',
+                   '_native_ufs_export_first'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in
