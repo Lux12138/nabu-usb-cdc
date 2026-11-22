@@ -45,6 +45,12 @@ extern void Debugger(const char *message) __attribute__((weak_import));
 /* Arbitrary kernel memory access for the diagnostics verbs; QcomUsbDiag.c. */
 #include "QcomUsbDiag.c"
 
+/* kb-17u KDP ring state. Declared up here because qcom_usb_debug_write()
+ * (which runs from kprintf) and the DEBUGGER verb both consult them
+ * long before the ring implementation further down. */
+static volatile uint32_t kdp_rx_armed;
+static uint32_t kdp_rx_used;
+
 #define NATIVE_CONTEXT_BYTES DWC3_CONTEXT_BYTES
 #define GCC_BYTES QUD_GCC_BYTES
 #define USB_BYTES QUD_DWC3_BYTES
@@ -2050,10 +2056,51 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
             (void)sxnu_control_writer_text(&writer, " state=entering queued=");
             (void)sxnu_control_writer_decimal(&writer, queued);
+            (void)sxnu_control_writer_text(&writer, " pending=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_used);
             reply_bytes = sxnu_control_reply_finish(&writer);
         }
+        /* Arm only now: the trap is next, so the byte storms that would have
+         * consumed the ring (keyboard poll, video console poll) cannot run. */
+        __atomic_store_n(&kdp_rx_armed, 1u, __ATOMIC_RELEASE);
         Debugger("qcom_usb_debug");
 debugger_done:
+        break;
+    }
+    case SXNU_CONTROL_VERB_KDPPUSH: {
+        /* KDPPUSH <hexbytes>: append raw bytes to the KDP ring WITHOUT trapping.
+         *
+         * Use this to build a KDP frame across several commands (the ring's
+         * unserialiser is a persistent state machine, so order is preserved),
+         * then send DEBUGGER with an empty payload to enter. Unlike DEBUGGER's
+         * own argument this never enters the debugger, so a full CONNECT frame
+         * can be staged in pieces. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        unsigned queued = 0, rejected = 0;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+            (len[0] & 1u) || len[0] / 2u > QUD_DIAG_CHUNK) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        for (size_t i = 0; i < len[0] / 2u; i++) {
+            uint64_t byte = 0;
+            if (!sxnu_control_parse_hex(tok[0] + i * 2u, 2u, &byte)) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                goto kdppush_done;
+            }
+            queued += (unsigned)qcom_usb_debug_kdp_push((uint8_t)byte);
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " queued=");
+        (void)sxnu_control_writer_decimal(&writer, queued);
+        (void)sxnu_control_writer_text(&writer, " rejected=");
+        (void)sxnu_control_writer_decimal(&writer, rejected);
+        (void)sxnu_control_writer_text(&writer, " used=");
+        (void)sxnu_control_writer_decimal(&writer, (uint32_t)qcom_usb_debug_serial_pending());
+        reply_bytes = sxnu_control_reply_finish(&writer);
+    kdppush_done:
         break;
     }
     case SXNU_CONTROL_VERB_SYM:
@@ -2231,6 +2278,59 @@ int qcom_usb_debug_wait_drained(unsigned int timeout_ms)
         delay_us(0, 1000);
     }
 }
+/* kb-17u: the debugger gets its own ring.
+ *
+ * usb_serial_rx keeps its original meaning (SXNU1 text plus 0xFA-framed
+ * runs). kdp_rx carries only the bytes the debugger may consume. Keeping
+ * them apart matters: receive_ready() must not go true just because console
+ * traffic is flowing -- that is exactly what hung kprintf last time. */
+/* 512 B: a worst-case CONNECT frame with every byte escaped is 4x its wire
+ * size, and a session needs CONNECT + a few requests queued ahead. */
+#define SERIAL_KDP_RX_BYTES 512u
+static uint8_t kdp_rx[SERIAL_KDP_RX_BYTES];
+static uint32_t kdp_rx_head, kdp_rx_tail;
+/* Set as soon as the host stages KDP bytes.
+ *
+ * The serial keyboard thread polls _serial_getc() every 16 ms and would swallow
+ * a staged frame before the debugger ever saw it (measured: kdp_rx_used came
+ * back 0 after every KDPPUSH chunk). Once armed, receive_ready() reports the
+ * KDP ring only, so the keyboard gets -1 and stops consuming. The keyboard has
+ * never been verified working on this board, KDP is the actual goal. */
+
+static void
+kdp_rx_push(uint8_t c)
+{
+    uint64_t daif;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (kdp_rx_used < SERIAL_KDP_RX_BYTES) {
+        kdp_rx[kdp_rx_head] = c;
+        kdp_rx_head = (kdp_rx_head + 1u) % SERIAL_KDP_RX_BYTES;
+        kdp_rx_used++;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+/* Forward declaration: the DEBUGGER verb queues bytes before trap entry. */
+int qcom_usb_debug_kdp_push(uint8_t c);
+
+static int
+kdp_rx_pop(uint8_t *c)
+{
+    uint64_t daif;
+    int ok = 0;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (kdp_rx_used != 0) {
+        *c = kdp_rx[kdp_rx_tail];
+        kdp_rx_tail = (kdp_rx_tail + 1u) % SERIAL_KDP_RX_BYTES;
+        kdp_rx_used--;
+        ok = 1;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+    return ok;
+}
+
+/* kb-17u ring state, declared before first use (definitions stay below). */
+
 size_t qcom_usb_debug_write(const void *bytes, size_t count)
 {
     uint64_t flags;
@@ -2238,6 +2338,8 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
     if (!bytes || !count || native.status.phase == QCOM_USB_DEBUG_DISABLED ||
         native.status.phase == QCOM_USB_DEBUG_STOPPED) return 0;
     accepted = backlog_write(bytes, count);
+    /* Armed == the kernel is inside the debugger: never touch DWC3 there. */
+    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return accepted;
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return accepted;
     if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
         (void)poll_owned();
@@ -2272,47 +2374,6 @@ static uint32_t usb_serial_rx_head, usb_serial_rx_tail, usb_serial_rx_used;
 static uint32_t usb_serial_rx_overflow;
 static volatile uint8_t usb_serial_rx_kdp;
 
-/* kb-17u: the debugger gets its own ring.
- *
- * usb_serial_rx keeps its original meaning (SXNU1 text plus 0xFA-framed
- * runs). kdp_rx carries only the bytes the debugger may consume. Keeping
- * them apart matters: receive_ready() must not go true just because console
- * traffic is flowing -- that is exactly what hung kprintf last time. */
-#define SERIAL_KDP_RX_BYTES 64u
-static uint8_t kdp_rx[SERIAL_KDP_RX_BYTES];
-static uint32_t kdp_rx_head, kdp_rx_tail, kdp_rx_used;
-
-static void
-kdp_rx_push(uint8_t c)
-{
-    uint64_t daif;
-    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
-    if (kdp_rx_used < SERIAL_KDP_RX_BYTES) {
-        kdp_rx[kdp_rx_head] = c;
-        kdp_rx_head = (kdp_rx_head + 1u) % SERIAL_KDP_RX_BYTES;
-        kdp_rx_used++;
-    }
-    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
-}
-
-/* Forward declaration: the DEBUGGER verb queues bytes before trap entry. */
-int qcom_usb_debug_kdp_push(uint8_t c);
-
-static int
-kdp_rx_pop(uint8_t *c)
-{
-    uint64_t daif;
-    int ok = 0;
-    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
-    if (kdp_rx_used != 0) {
-        *c = kdp_rx[kdp_rx_tail];
-        kdp_rx_tail = (kdp_rx_tail + 1u) % SERIAL_KDP_RX_BYTES;
-        kdp_rx_used--;
-        ok = 1;
-    }
-    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
-    return ok;
-}
 
 static void
 serial_rx_push(uint8_t c)
@@ -2375,7 +2436,9 @@ size_t
 qcom_usb_debug_serial_pending(void)
 {
     /* kdp_rx only: console traffic must never make receive_ready() true.
-     * See the note above kdp_rx_push(). */
+     * While armed, report only the KDP ring so the serial keyboard thread sees
+     * "no input" and stops eating staged frames. */
+    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
     return kdp_rx_used;
 }
 
@@ -2383,8 +2446,12 @@ uint8_t
 qcom_usb_debug_serial_getc(void)
 {
     uint8_t c = 0;
-    /* Debugger path first, then the console ring. */
-    if (kdp_rx_pop(&c)) return c;
+    /* While armed only the KDP ring is served, so a keyboard poll can never
+     * steal a staged frame. Disarmed consumers see the console ring as before. */
+    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+        (void)kdp_rx_pop(&c);
+        return c;
+    }
     (void)serial_rx_pop(&c);
     return c;
 }

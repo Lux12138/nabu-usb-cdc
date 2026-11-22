@@ -134,6 +134,7 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_FLIPNOW, "FLIPNOW", 1);
     check_accept(SXNU_CONTROL_VERB_SMMUDUMP, "SMMUDUMP", 1);
     check_accept(SXNU_CONTROL_VERB_DEBUGGER, "DEBUGGER", 1);
+    check_accept(SXNU_CONTROL_VERB_KDPPUSH, "KDPPUSH fa0102", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -177,6 +178,7 @@ main(void)
     check("FLIPNOW", 1, SXNU_CONTROL_VERB_FLIPNOW, "");
     check("SMMUDUMP", 1, SXNU_CONTROL_VERB_SMMUDUMP, "");
     check("DEBUGGER", 1, SXNU_CONTROL_VERB_DEBUGGER, "");
+    check("KDPPUSH fa01", 1, SXNU_CONTROL_VERB_KDPPUSH, "fa01");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

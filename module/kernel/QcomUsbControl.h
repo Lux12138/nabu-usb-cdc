@@ -55,6 +55,7 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_FLIPNOW,   /* FLIPNOW -> flips / transfers / surfaces      */
     SXNU_CONTROL_VERB_SMMUDUMP,  /* SMMUDUMP -> display SMMU bank / CB state     */
     SXNU_CONTROL_VERB_DEBUGGER,  /* DEBUGGER -> enter the kernel debugger (KDP)  */
+    SXNU_CONTROL_VERB_KDPPUSH,   /* KDPPUSH <hex> -> queue bytes for KDP (no trap) */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -224,6 +225,9 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 8u && text[0] == 'D' && text[1] == 'E' && text[2] == 'B' &&
         text[3] == 'U' && text[4] == 'G' && text[5] == 'G' && text[6] == 'E' &&
         text[7] == 'R') return SXNU_CONTROL_VERB_DEBUGGER;
+    if (bytes == 7u && text[0] == 'K' && text[1] == 'D' && text[2] == 'P' &&
+        text[3] == 'P' && text[4] == 'U' && text[5] == 'S' && text[6] == 'H')
+        return SXNU_CONTROL_VERB_KDPPUSH;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -263,6 +267,7 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_FLIPNOW: return "FLIPNOW";
     case SXNU_CONTROL_VERB_SMMUDUMP: return "SMMUDUMP";
     case SXNU_CONTROL_VERB_DEBUGGER: return "DEBUGGER";
+    case SXNU_CONTROL_VERB_KDPPUSH: return "KDPPUSH";
     default: return "";
     }
 }

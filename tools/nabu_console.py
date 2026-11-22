@@ -35,6 +35,8 @@
 KDP（单句柄下的自动握手，不需要另开脚本）：
   echo kdp >> E:/nabu/logs/R-cmd.txt          # 进调试器 + connect
   echo kdp enter 63 >> E:/nabu/logs/R-cmd.txt # 进调试器并预置 'c'（自动 Continuing）
+  echo kdppush fa04e4eccafa00000800dec03713fb >> ...   # 预置一个完整 KDP 帧（不进调试器）
+  echo kdp enter >> ...                                # 之后再进，帧已在环里
   echo kdp version >> E:/nabu/logs/R-cmd.txt  # 后续任意 kdp_cli 子命令
   echo kdp leave >> E:/nabu/logs/R-cmd.txt    # disconnect，内核从 Debugger() 返回
   echo kdp resume >> E:/nabu/logs/R-cmd.txt   # 发 'c' 救出调试器（Debugger() 屏蔽了 WDT）
@@ -118,6 +120,17 @@ class Session:
         self.log = log
         self.t = threading.Thread(target=self._reader, daemon=True)
         self.t.start()
+        # Writes go through their own thread.
+        #
+        # serial.write() blocks inside the Windows driver when the kernel stops
+        # servicing the CDC (measured: the process became unkillable and held
+        # COM3 forever, because a thread parked in that kernel wait cannot be
+        # terminated). With a writer thread the main loop keeps running, so the
+        # stall watchdog can still fire and close the port cleanly.
+        self.wq = queue.Queue()
+        self.w = threading.Thread(target=self._writer, daemon=True)
+        self.w.start()
+        self.write_stuck = False
 
     def _reader(self):
         while self.running:
@@ -152,8 +165,27 @@ class Session:
             return None
         return self.dev_time + (time.time() - self.dev_time_at)
 
+    def _writer(self):
+        while self.running:
+            try:
+                payload = self.wq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if payload is None:
+                break
+            try:
+                self.s.write(payload)
+                self.s.flush()
+            except Exception as e:
+                # A write failure means the kernel is not reading; flag it and
+                # let the main loop decide (the watchdog will close the port).
+                self.write_stuck = True
+                self.log("WRITE ERR %s" % e)
+                break
+
     def send(self, payload):
-        self.s.write(payload); self.s.flush()
+        """Enqueue a frame. Never blocks on the device."""
+        self.wq.put(payload)
 
     def wait_reply(self, verb, timeout):
         deadline = time.time() + timeout
@@ -184,6 +216,16 @@ class Session:
         """
         self.running = False
         try:
+            self.wq.put(None)
+        except Exception:
+            pass
+        writer_stuck = False
+        try:
+            self.w.join(timeout=2)
+            writer_stuck = self.w.is_alive()
+        except Exception:
+            writer_stuck = True
+        try:
             self.s.cancel_read()
         except Exception:
             pass
@@ -197,6 +239,13 @@ class Session:
             self.out.close()
         except Exception:
             pass
+        if writer_stuck:
+            # Closing a port whose writer thread is parked in a kernel wait would
+            # block this thread too, re-creating the unkillable-process problem.
+            # Leaving it to process exit is the least-bad option: the OS reclaims
+            # the handle when the process dies.
+            self.log("! writer thread stuck; skipping port close (handle freed on exit)")
+            return
         try:
             self.s.close()
         except Exception:
@@ -228,6 +277,8 @@ def main():
     ap.add_argument("--wait", type=int, default=300, help="等 COM3 出现的最长秒数")
     ap.add_argument("--deadline", type=int, default=0, help="总运行时限，0=不限")
     ap.add_argument("--cmd-timeout", type=float, default=10.0)
+    ap.add_argument("--stall-exit", type=float, default=20.0,
+                    help="设备 N 秒无任何输出就主动退出并释放端口（0=不启用，默认 20）")
     ap.add_argument("--script", default=None, help="预置命令文件：open 后立即紧凑发完")
     ap.add_argument("--arm-at", type=float, default=0, help="设备 uptime 到该秒数自动发 REBOOT（0=不武装）")
     ap.add_argument("--kdp-dir", default=r"E:\nabu\state\bridge\answers\kdp_client",
@@ -417,6 +468,36 @@ def main():
         with open(outpath, "wb") as f:
             f.write(data)
         log("DUMP OK %s: %d B / %d chunks crc=%08x" % (outpath, len(data), chunks, got_crc))
+
+    def cmd_kdppush(hexstr):
+        """Queue raw bytes into the KDP ring, splitting to fit the 127 B line.
+
+        A SXNU1 line is capped at SXNU_CONTROL_LINE_BYTES = 127, and the fixed
+        part (session, seq, verb, crc) eats about 51 of them, so at most ~24
+        raw bytes fit per command. kdp_unserialize_packet() keeps its state in
+        static variables, so splitting a frame across several calls is safe as
+        long as the order is preserved.
+        """
+        hexstr = "".join(hexstr.split())
+        if not hexstr or len(hexstr) % 2:
+            log("用法: kdppush <hex>（偶数个 hex 字符）")
+            return
+        try:
+            raw = bytes.fromhex(hexstr)
+        except ValueError:
+            log("! kdppush: 非法 hex")
+            return
+        CHUNK = 24
+        ok = True
+        for off in range(0, len(raw), CHUNK):
+            part = raw[off:off + CHUNK]
+            reply = send_cmd("KDPPUSH", part.hex())
+            if not reply or "queued=" not in reply:
+                log("! kdppush 第 %d 段失败: %s" % (off // CHUNK + 1, reply or "无回复"))
+                ok = False
+                break
+        if ok:
+            log("kdppush OK: %d B in %d chunks" % (len(raw), (len(raw) + CHUNK - 1) // CHUNK))
 
     def cmd_stats():
         up = sess.uptime()
@@ -611,6 +692,8 @@ def main():
     t0 = time.time()
     last_total = 0
     last_idle_check = time.time()
+    last_output_at = time.time()
+    last_output_total = 0
     last_arm_note = 0
     arm_sent = False
     if args.arm_at > 0:
@@ -629,7 +712,9 @@ def main():
                 parts = raw.split(None, 1)
                 verb = parts[0].upper()
                 rest = parts[1] if len(parts) > 1 else ""
-                if verb == "KDP":
+                if verb == "KDPPUSH":
+                    cmd_kdppush(rest)
+                elif verb == "KDP":
                     do_kdp(rest)
                 elif verb == "SYM":
                     cmd_sym(rest)
@@ -652,6 +737,24 @@ def main():
         if args.deadline and el > args.deadline:
             log("deadline reached"); break
 
+        # stall_watchdog: if the device stops producing bytes for too long the
+        # kernel is almost certainly wedged (e.g. inside the debugger, where it
+        # no longer services the CDC). Exiting here is what actually releases
+        # the Windows handle: a blocked serial.read() keeps the OS handle alive
+        # and Stop-Process cannot kill a thread stuck in that kernel wait.
+        if sess.write_stuck:
+            log(">>> write stuck (kernel not servicing the CDC); releasing the port")
+            event(kind="write_stuck")
+            break
+        if sess.total != last_output_total:
+            last_output_total = sess.total
+            last_output_at = time.time()
+        elif args.stall_exit > 0 and (time.time() - last_output_at) > args.stall_exit:
+            log(">>> no device output for %.0fs (stall watchdog); releasing the port"
+                % (time.time() - last_output_at))
+            event(kind="stall_exit", idle=round(time.time() - last_output_at, 1))
+            break
+
         # --- 命令文件 ---
         try:
             size = os.path.getsize(cmd_path)
@@ -667,7 +770,9 @@ def main():
                     parts = raw.split(None, 1)
                     verb = parts[0].upper()
                     rest = parts[1] if len(parts) > 1 else ""
-                    if verb == "KDP":
+                    if verb == "KDPPUSH":
+                        cmd_kdppush(rest)
+                    elif verb == "KDP":
                         do_kdp(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
