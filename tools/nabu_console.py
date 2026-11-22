@@ -589,19 +589,24 @@ def main():
             if kdp_state["entered"]:
                 log("[kdp] already in the debugger")
                 return True
-            # Default payload: several 'c' bytes (0x63).
+            # NO default payload. This used to send "6363", on the theory that
+            # kdp_getc() needs a spare 'c' to reach its loop. That is only true
+            # when the point of the round is to enter and immediately continue.
+            # When a KDP frame is staged ahead of the trap, any extra byte lands
+            # in the ring AFTER the frame and can be consumed by the pre-loop
+            # kdp_getc() -- which is exactly the byte that must be the dummy
+            # 0x00, not a 'c'. Sending one here corrupted the connect attempt.
             #
-            # kdp_connection_wait() consumes ONE byte in its pre-loop check that
-            # prints the Options banner, and only then enters the kdp_getc()
-            # loop. Queuing a single byte therefore gets eaten before the loop
-            # ever runs (measured: "Options.....    Type" printed, no
-            # "Continuing..."). Queue several so the loop still finds one.
-            # An explicit argument overrides the default.
-            # Two bytes exactly: the first is consumed by the pre-loop check
-            # that prints the Options banner, the second ends up in the
-            # kdp_getc() loop and returns the debugger. More than two makes the
-            # kernel re-enter the debugger once per extra byte.
-            payload = words[1] if len(words) > 1 else "63" * 2
+            # So: bare `kdp enter` stages nothing. Ask for the rescue explicitly
+            # with `kdp enter 6363`, which queues two 'c' bytes: the pre-loop
+            # check eats one (printing the Options banner) and the loop eats the
+            # other, printing "Continuing..." (verified on kb-26).
+            #
+            # `kdp enter raw` is accepted too, as an explicit spelling of
+            # "stage nothing", for scripts that would rather be unambiguous.
+            payload = ""
+            if len(words) > 1 and words[1].lower() != "raw":
+                payload = words[1]
             if not send_frame_only("DEBUGGER", payload):
                 return False
             drain_until = time.time() + 6
