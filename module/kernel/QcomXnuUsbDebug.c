@@ -2338,8 +2338,21 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
     if (!bytes || !count || native.status.phase == QCOM_USB_DEBUG_DISABLED ||
         native.status.phase == QCOM_USB_DEBUG_STOPPED) return 0;
     accepted = backlog_write(bytes, count);
-    /* Armed == the kernel is inside the debugger: never touch DWC3 there. */
-    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return accepted;
+    /* Armed == the kernel is inside the debugger.
+     *
+     * Do NOT call poll_owned() here: it is a real DWC3 MMIO pump and the
+     * controller no longer services it once the other cores are halted (that
+     * is what froze kprintf mid-word at "Using s"). But output still matters --
+     * "Using serial KDP.", the Options banner and "Connected to remote
+     * debugger." are the only evidence we get -- so push straight into the TX
+     * ring instead. dwc3_queue() is a memcpy into the mapped ring plus the
+     * doorbell write; it takes no USB lock and does no polling. */
+    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+        if (native.status.phase == QCOM_USB_DEBUG_ACTIVE && dwc3_ready(native.core)) {
+            (void)dwc3_queue(native.core, bytes, count);
+        }
+        return accepted;
+    }
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return accepted;
     if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
         (void)poll_owned();
