@@ -660,6 +660,24 @@ def main():
                     print("用法: readpa <hex物理地址> <hex长度>，如 readpa 0xae00000 40", flush=True)
             elif cmd == "readpanext":
                 do_verb("READPANEXT", arg=rest)
+            elif cmd == "bootargs":
+                tail = do_verb("BOOTARGS", arg=rest)
+                if tail and "hex=" in tail:
+                    import binascii as _ba
+                    kv = dict(x.split("=", 1) for x in tail.split() if "=" in x)
+                    h = kv.get("hex", "")
+                    try:
+                        decoded = _ba.unhexlify(h).decode("utf-8", "replace")
+                        print("BOOTARGS: " + decoded, flush=True)
+                    except Exception:
+                        print("BOOTARGS (raw): " + tail, flush=True)
+            elif cmd == "version":
+                do_verb("VERSION", arg=rest)
+            elif cmd == "writepa":
+                if rest:
+                    do_verb("WRITEPA", arg=rest)
+                else:
+                    print("用法: writepa <hex物理地址> <hex字节(4对齐)>，如 writepa 0xae02000 08000003", flush=True)
             elif cmd == "read":
                 if rest:
                     do_verb("READ", arg=rest)
@@ -722,6 +740,9 @@ HELP = """\
   dump <addr> <len> <file>   流式读虚拟地址并落主机文件（CRC 校验）
   dumppa <pa> <len> <file>   流式读物理地址并落主机文件
   readpa <pa> <len>  读物理地址（寄存器/MMIO，如 readpa 0xae00000 40）
+  writepa <pa> <hex> 写物理地址（仅 MMIO 白名单，需 qcom-usb-write=1）
+  bootargs           读内核命令行（PE_boot_args）
+  version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
   readnext [n]       取 READ 的下一块（默认 128 字节）

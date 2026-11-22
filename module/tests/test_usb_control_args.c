@@ -114,6 +114,9 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_SYMS, "SYMS nabu_", 1);
     check_accept(SXNU_CONTROL_VERB_READPA, "READPA 0xae00000 40", 1);
     check_accept(SXNU_CONTROL_VERB_READPANEXT, "READPANEXT 80", 1);
+    check_accept(SXNU_CONTROL_VERB_WRITEPA, "WRITEPA 0xae02000 08000003", 1);
+    check_accept(SXNU_CONTROL_VERB_BOOTARGS, "BOOTARGS", 1);
+    check_accept(SXNU_CONTROL_VERB_VERSION, "VERSION", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -136,6 +139,10 @@ main(void)
     check("SYMS nabu_", 1, SXNU_CONTROL_VERB_SYMS, "nabu_");
     check("READPA 0xae00000 40", 1, SXNU_CONTROL_VERB_READPA, "0xae00000 40");
     check("READPANEXT 80", 1, SXNU_CONTROL_VERB_READPANEXT, "80");
+    check("WRITEPA 0xae02000 08000003", 1, SXNU_CONTROL_VERB_WRITEPA,
+          "0xae02000 08000003");
+    check("BOOTARGS", 1, SXNU_CONTROL_VERB_BOOTARGS, "");
+    check("VERSION", 1, SXNU_CONTROL_VERB_VERSION, "");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

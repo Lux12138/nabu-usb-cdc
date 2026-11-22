@@ -188,6 +188,70 @@ qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
     return len;
 }
 
+/* ---- WRITEPA: MMIO-only physical write ---------------------------------- */
+/* Whitelist of MMIO windows a WRITEPA may touch. DDR physical addresses are
+ * deliberately excluded: a stray write to RAM would corrupt a running system
+ * without any fault. Only the SoC register blocks the console needs are listed
+ * here; anything else returns "denied". Ranges are [lo, hi) in bytes. */
+struct qud_mmio_range { uint64_t lo, hi; };
+static const struct qud_mmio_range qud_write_whitelist[] = {
+    { UINT64_C(0x0a600000), UINT64_C(0x0a700000) }, /* DWC3 USB controller */
+    { UINT64_C(0x01000000), UINT64_C(0x01010000) }, /* SMMU */
+    { UINT64_C(0x01050000), UINT64_C(0x01090000) }, /* GCC (partial) */
+    { UINT64_C(0x02c90000), UINT64_C(0x02ca0000) }, /* GPUCC */
+    { UINT64_C(0x0ae00000), UINT64_C(0x0af00000) }, /* MDSS */
+    { UINT64_C(0x0af00000), UINT64_C(0x0af01000) }, /* disp_cc */
+};
+
+/* Returns 1 if the whole [pa, pa+len) lies inside one whitelisted MMIO range. */
+static int
+qud_write_pa_allowed(uint64_t pa, size_t len)
+{
+    if (!len) return 0;
+    for (unsigned i = 0; i < sizeof(qud_write_whitelist)/sizeof(qud_write_whitelist[0]); i++) {
+        const struct qud_mmio_range *r = &qud_write_whitelist[i];
+        if (pa >= r->lo && (pa + (uint64_t)len) <= r->hi) return 1;
+    }
+    return 0;
+}
+
+/* Write len bytes to a physical MMIO address through the cached device window.
+ * Returns 1 on success, 0 on bad args, -1 when writes are boot-arg disabled,
+ * -2 when the PA is outside the MMIO whitelist, -3 on mapping failure.
+ * A successful write is self-checked by reading back the first 32-bit word. */
+static int
+qud_diag_write_phys(uint64_t pa, const void *src, size_t len, uint32_t *readback)
+{
+    const uint64_t base = pa & ~UINT64_C(0xfff);
+    const uint64_t off = pa & UINT64_C(0xfff);
+    const uint64_t span = (off + len + 0xfffu) & ~UINT64_C(0xfff);
+    uintptr_t va;
+    volatile uint32_t *dst;
+
+    if (!qud_diag_writes_allowed()) return -1;
+    if (!src || !len) return 0;
+    if (!qud_write_pa_allowed(pa, len)) return -2;
+    /* MMIO registers are 32-bit; require 4-byte alignment and length. */
+    if (pa & 3u) return 0;
+    if (len & 3u) return 0;
+
+    if (phys_cache_va && base >= phys_cache_base &&
+        (base + span) <= (phys_cache_base + phys_cache_span)) {
+        va = phys_cache_va;
+    } else {
+        va = ml_io_map(base, span);
+        if (!va) return -3;
+        phys_cache_base = base;
+        phys_cache_span = span;
+        phys_cache_va = va;
+    }
+    dst = (volatile uint32_t *)(va + off);
+    memcpy((void *)dst, src, len);
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (readback) *readback = dst[0];   /* self-attest: first word */
+    return 1;
+}
+
 /* ---- READ / READNEXT ---------------------------------------------------- */
 
 /* Starts a buffered read so the host can pull large ranges 128 bytes at a

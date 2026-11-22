@@ -1424,6 +1424,90 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_WRITEPA: {
+        /* WRITEPA <hexpa> <hexbytes>. MMIO-whitelisted only; boot-arg gated. */
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t pa = 0;
+        uint8_t staged[QUD_DIAG_CHUNK];
+        size_t staged_bytes = 0;
+        struct sxnu_control_writer writer;
+        uint32_t readback = 0;
+        int result;
+        int bad = 0;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) != 2 ||
+            !control_args_hex(tok[0], len[0], &pa) ||
+            (len[1] & 1u) || len[1] / 2u > sizeof(staged)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        for (size_t i = 0; i < len[1] / 2u; i++) {
+            uint64_t byte = 0;
+            if (!sxnu_control_parse_hex(tok[1] + i * 2u, 2u, &byte)) { bad = 1; break; }
+            staged[staged_bytes++] = (uint8_t)byte;
+        }
+        if (bad || !staged_bytes) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        result = qud_diag_write_phys(pa, staged, staged_bytes, &readback);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            result == 1 ? "OK" : "ERR");
+        if (result == 1) {
+            (void)sxnu_control_writer_text(&writer, " pa=0x");
+            (void)sxnu_control_writer_hex(&writer, pa, 8);
+            (void)sxnu_control_writer_text(&writer, " bytes=");
+            (void)sxnu_control_writer_decimal(&writer, staged_bytes);
+            (void)sxnu_control_writer_text(&writer, " readback=");
+            (void)sxnu_control_writer_hex(&writer, readback, 8);
+        } else {
+            (void)sxnu_control_writer_text(&writer, " ");
+            (void)sxnu_control_writer_text(&writer,
+                result == -1 ? "state=disabled" :
+                result == -2 ? "state=denied"  :
+                result == -3 ? "state=mapfail" : "state=args");
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_BOOTARGS: {
+        /* Return the kernel command line from PE_boot_args() (the exact string
+         * PE_parse_boot_argn parses). Bounded to the reply buffer; the host can
+         * issue BOOTARGS all for the full line via repeated reads if needed, but
+         * the boot line is normally < 1 KiB and the useful subset fits here. */
+        struct sxnu_control_writer writer;
+        const char *cmdline = PE_boot_args();
+        size_t n = 0;
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " hex=");
+        if (!cmdline) {
+            (void)sxnu_control_writer_text(&writer, "(null)");
+        } else {
+            /* Hex-encode the command line: no spaces, no parse ambiguity with
+             * the space-delimited SXNU1R reply. Two hex chars per byte. */
+            static const char hex[] = "0123456789abcdef";
+            while (cmdline[n] && n < 1024u && !writer.failed) {
+                const unsigned char c = (unsigned char)cmdline[n];
+                (void)sxnu_control_writer_char(&writer, hex[c >> 4]);
+                (void)sxnu_control_writer_char(&writer, hex[c & 0xf]);
+                n++;
+            }
+        }
+        (void)sxnu_control_writer_text(&writer, " len=");
+        (void)sxnu_control_writer_decimal(&writer, n);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_VERSION: {
+        struct sxnu_control_writer writer;
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " build=qcom-xnu-usb-console xnu=17.7.11-21H461 soc=sm8150");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host
