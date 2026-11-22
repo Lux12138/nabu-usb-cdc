@@ -93,11 +93,13 @@ class Control:
         self.rejected = 0
         self.acked = 0
 
-    def frame(self, verb):
+    def frame(self, verb, arg=""):
         body = "SXNU1 %016x %08x %s" % (self.session, self.seq, verb)
+        if arg:
+            body += " " + arg
         return ("%s %08x\n" % (body, crc32(body.encode()))).encode()
 
-    def build(self, verb):
+    def build(self, verb, arg=""):
         verb = verb.upper()
         if verb == "HELLO":
             self.session, self.seq = 0, 0
@@ -106,7 +108,7 @@ class Control:
                 raise RuntimeError("no session: 先发 hello")
             self.seq += 1
         self.pending = verb
-        return self.frame(verb)
+        return self.frame(verb, arg)
 
     def on_reply(self, line):
         """返回 (verb, tail) 或 None。"""
@@ -383,7 +385,7 @@ def main():
 
     def do_verb(verb, arg="", timeout=10.0):
         try:
-            payload = ctl.build(verb)
+            payload = ctl.build(verb, arg)
         except RuntimeError as e:
             log("! %s" % e)
             return None
@@ -541,6 +543,13 @@ def main():
                 print("muted=%d" % len(sess.muted), flush=True)
             elif cmd == "hello":
                 do_verb("HELLO")
+            elif cmd == "read":
+                if rest:
+                    do_verb("READ", arg=rest)
+                else:
+                    print("用法: read <hex地址> <hex长度>，如 read 0xfffffff007004000 40", flush=True)
+            elif cmd == "readnext":
+                do_verb("READNEXT", arg=rest)
             elif cmd in ("ping", "status", "screenshot", "shotnext"):
                 do_verb(cmd.upper())
             elif cmd == "reboot":
@@ -590,7 +599,9 @@ HELP = """\
   hello             建立 session（HELLO 必须 session=0 seq=0）
   ping              rx / rxo / tx / poll 快照
   status            usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=
-  screenshot        让内核抓一帧写 UFS
+  read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
+  readnext [n]       取 READ 的下一块（默认 128 字节）
+  screenshot         让内核抓一帧写 UFS
   shotnext          等下一个 flip 再抓
 
 【复位】（走 PSCI SYSTEM_RESET，ABL 读 misc=boot-recovery 后进 Recovery）

@@ -18,6 +18,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 #include <kern/cpu_number.h>
 #include <pexpert/pexpert.h>
 
+/* Arbitrary kernel memory access for the diagnostics verbs; QcomUsbDiag.c. */
+#include "QcomUsbDiag.c"
+
 #define NATIVE_CONTEXT_BYTES DWC3_CONTEXT_BYTES
 #define GCC_BYTES QUD_GCC_BYTES
 #define USB_BYTES QUD_DWC3_BYTES
@@ -1126,6 +1129,38 @@ static size_t control_reply_reboot(char *reply, size_t capacity,
         !sxnu_control_writer_text(&writer, reason)) return 0;
     return sxnu_control_reply_finish(&writer);
 }
+/* Split the argument span into up to max whitespace-separated tokens. */
+static unsigned
+control_args_split(const uint8_t *text, size_t bytes, const uint8_t **tok,
+                   size_t *len, unsigned max)
+{
+    unsigned count = 0;
+    size_t i = 0;
+    if (!text || !bytes) return 0;
+    while (i < bytes && count < max) {
+        while (i < bytes && text[i] == (uint8_t)' ') i++;
+        if (i >= bytes) break;
+        const size_t start = i;
+        while (i < bytes && text[i] != (uint8_t)' ') i++;
+        tok[count] = text + start;
+        len[count] = i - start;
+        count++;
+    }
+    return count;
+}
+
+/* Accept bare hex and 0x-prefixed hex. */
+static int
+control_args_hex(const uint8_t *text, size_t bytes, uint64_t *value)
+{
+    if (bytes > 2u && text[0] == (uint8_t)'0' &&
+        (text[1] == (uint8_t)'x' || text[1] == (uint8_t)'X')) {
+        text += 2;
+        bytes -= 2;
+    }
+    return sxnu_control_parse_hex(text, bytes, value);
+}
+
 static void control_handle_frame(const struct sxnu_control_frame *frame,
                                  const struct qcom_usb_debug_status *status,
                                  uint32_t generation)
@@ -1205,6 +1240,123 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_READ: {
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t va = 0, count = 0;
+        struct sxnu_control_writer writer;
+        uint8_t chunk[QUD_DIAG_CHUNK];
+        uint32_t offset = 0, frame_no = 0;
+        size_t got;
+        int opened;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) != 2 ||
+            !control_args_hex(tok[0], len[0], &va) ||
+            !control_args_hex(tok[1], len[1], &count) ||
+            !count || count > QUD_DIAG_MAX_LEN) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        opened = qud_diag_read_begin(va, (uint32_t)count, frame->seq);
+        if (opened != 1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                opened == -2 ? "unmapped" : "args");
+            break;
+        }
+        got = qud_diag_read_next(chunk, sizeof(chunk), &offset, &frame_no);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=ready len=");
+        (void)sxnu_control_writer_decimal(&writer, qud_diag_cursor_length());
+        (void)sxnu_control_writer_text(&writer, " crc32=");
+        (void)sxnu_control_writer_hex(&writer, qud_diag_cursor_crc(), 8);
+        (void)sxnu_control_writer_text(&writer, " offset=");
+        (void)sxnu_control_writer_decimal(&writer, offset);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (size_t i = 0; i < got; ++i)
+            (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_READNEXT: {
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t want = QUD_DIAG_CHUNK;
+        struct sxnu_control_writer writer;
+        uint8_t chunk[QUD_DIAG_CHUNK];
+        uint32_t offset = 0, frame_no = 0;
+        size_t got;
+        if (!qud_diag_cursor_active()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "noimage");
+            break;
+        }
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) == 1) {
+            if (!control_args_hex(tok[0], len[0], &want) ||
+                !want || want > QUD_DIAG_CHUNK) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        got = qud_diag_read_next(chunk, (size_t)want, &offset, &frame_no);
+        if (!got) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "done");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=data frame=");
+        (void)sxnu_control_writer_decimal(&writer, frame_no);
+        (void)sxnu_control_writer_text(&writer, " offset=");
+        (void)sxnu_control_writer_decimal(&writer, offset);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (size_t i = 0; i < got; ++i)
+            (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_WRITE: {
+        /* WRITE <hexva> <hexbytes>. Refused unless qcom-usb-write=1. */
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t va = 0;
+        uint8_t staged[QUD_DIAG_CHUNK];
+        size_t staged_bytes = 0;
+        struct sxnu_control_writer writer;
+        int result;
+        int bad = 0;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) != 2 ||
+            !control_args_hex(tok[0], len[0], &va) ||
+            (len[1] & 1u) || len[1] / 2u > sizeof(staged)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        for (size_t i = 0; i < len[1] / 2u; i++) {
+            uint64_t byte = 0;
+            if (!sxnu_control_parse_hex(tok[1] + i * 2u, 2u, &byte)) {
+                bad = 1;
+                break;
+            }
+            staged[staged_bytes++] = (uint8_t)byte;
+        }
+        if (bad || !staged_bytes) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        result = qud_diag_write(va, staged, staged_bytes);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            result == 1 ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, result == 1 ? " state=written bytes=" :
+            result < 0 ? " state=disabled bytes=" : " state=unmapped bytes=");
+        (void)sxnu_control_writer_decimal(&writer, staged_bytes);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_SYM:
+    case SXNU_CONTROL_VERB_SYMS:
+        /* The kernel symbol table is not reachable from this module; the host
+         * resolves addresses from the boot kernelcache and uses READ. */
+        reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+        break;
     case SXNU_CONTROL_VERB_REBOOT:
         if (!__atomic_load_n(&control_hook_owned, __ATOMIC_ACQUIRE))
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "nohook");

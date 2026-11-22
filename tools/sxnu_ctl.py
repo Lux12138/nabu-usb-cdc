@@ -46,8 +46,10 @@ class Sxnu:
     def _drain(self):
         self.tio.reset_input_buffer()
 
-    def _frame(self, verb: str) -> bytes:
+    def _frame(self, verb: str, arg: str = "") -> bytes:
         body = "SXNU1 %016x %08x %s" % (self.session, self.seq, verb)
+        if arg:
+            body += " " + arg
         return ("%s %08x\n" % (body, crc32(body.encode()))).encode()
 
     def _read_reply(self, verb: str):

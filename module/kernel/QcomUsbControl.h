@@ -25,7 +25,16 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_STATUS,
     SXNU_CONTROL_VERB_REBOOT,
     SXNU_CONTROL_VERB_SCREENSHOT,
-    SXNU_CONTROL_VERB_SHOTNEXT
+    SXNU_CONTROL_VERB_SHOTNEXT,
+    /* Argument-bearing diagnostics. This layer still performs no memory
+     * access: the verbs only carry text to QcomUsbDiag.c, reached from
+     * control_handle_frame(). */
+    SXNU_CONTROL_VERB_READ,       /* READ <hexva> <hexlen>    */
+    SXNU_CONTROL_VERB_READNEXT,   /* READNEXT [<hexchars>]    */
+    SXNU_CONTROL_VERB_WRITE,      /* WRITE <hexva> <hexbytes> */
+    SXNU_CONTROL_VERB_SYM,        /* SYM <text>               */
+    SXNU_CONTROL_VERB_SYMS,       /* SYMS [prefix]            */
+    SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
 struct sxnu_control_frame {
@@ -33,6 +42,10 @@ struct sxnu_control_frame {
     uint32_t seq;
     uint32_t crc;
     enum sxnu_control_verb verb;
+    /* Argument text between the verb and the CRC; points into the caller's
+     * line buffer and is not NUL-terminated. Zero length when absent. */
+    const uint8_t *args;
+    size_t arg_bytes;
 };
 
 struct sxnu_control_parser {
@@ -115,6 +128,17 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 8u && text[0] == 'S' && text[1] == 'H' && text[2] == 'O' &&
         text[3] == 'T' && text[4] == 'N' && text[5] == 'E' && text[6] == 'X' &&
         text[7] == 'T') return SXNU_CONTROL_VERB_SHOTNEXT;
+    if (bytes == 4u && text[0] == 'R' && text[1] == 'E' && text[2] == 'A' &&
+        text[3] == 'D') return SXNU_CONTROL_VERB_READ;
+    if (bytes == 8u && text[0] == 'R' && text[1] == 'E' && text[2] == 'A' &&
+        text[3] == 'D' && text[4] == 'N' && text[5] == 'E' && text[6] == 'X' &&
+        text[7] == 'T') return SXNU_CONTROL_VERB_READNEXT;
+    if (bytes == 5u && text[0] == 'W' && text[1] == 'R' && text[2] == 'I' &&
+        text[3] == 'T' && text[4] == 'E') return SXNU_CONTROL_VERB_WRITE;
+    if (bytes == 3u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'M')
+        return SXNU_CONTROL_VERB_SYM;
+    if (bytes == 4u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'M' &&
+        text[3] == 'S') return SXNU_CONTROL_VERB_SYMS;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -128,6 +152,11 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_REBOOT: return "REBOOT";
     case SXNU_CONTROL_VERB_SCREENSHOT: return "SCREENSHOT";
     case SXNU_CONTROL_VERB_SHOTNEXT: return "SHOTNEXT";
+    case SXNU_CONTROL_VERB_READ: return "READ";
+    case SXNU_CONTROL_VERB_READNEXT: return "READNEXT";
+    case SXNU_CONTROL_VERB_WRITE: return "WRITE";
+    case SXNU_CONTROL_VERB_SYM: return "SYM";
+    case SXNU_CONTROL_VERB_SYMS: return "SYMS";
     default: return "";
     }
 }
@@ -201,17 +230,33 @@ sxnu_control_parse(const char *line, size_t bytes, struct sxnu_control_frame *fr
     cursor += SXNU_CONTROL_SEQ_HEX;
     if (cursor >= bytes || p[cursor++] != (uint8_t)' ') return 0;
 
+    /* The CRC is always the last 8 hex digits, preceded by a space, so it
+     * is located before the verb is split off. Whatever lies between the
+     * verb and that space is the argument text; with none present the verb
+     * span is exactly what the argument-free grammar used to accept. */
+    if (bytes < SXNU_CONTROL_CRC_HEX + 2u) return 0;
+    crc_start = bytes - SXNU_CONTROL_CRC_HEX;
+    if (p[crc_start - 1u] != (uint8_t)' ') return 0;
+    if (!sxnu_control_parse_hex(p + crc_start, SXNU_CONTROL_CRC_HEX, &crc)) return 0;
+    if ((uint32_t)crc != sxnu_control_crc32(line, crc_start - 1u)) return 0;
     verb_start = cursor;
     while (cursor < bytes && p[cursor] != (uint8_t)' ') cursor++;
     if (cursor == verb_start || cursor >= bytes) return 0;
     verb_bytes = cursor - verb_start;
     verb = sxnu_control_parse_verb(p + verb_start, verb_bytes);
     if (verb == SXNU_CONTROL_VERB_INVALID) return 0;
-    cursor++;
-    crc_start = cursor;
-    if (crc_start > bytes || bytes - crc_start != SXNU_CONTROL_CRC_HEX) return 0;
-    if (!sxnu_control_parse_hex(p + crc_start, SXNU_CONTROL_CRC_HEX, &crc)) return 0;
-    if ((uint32_t)crc != sxnu_control_crc32(line, crc_start - 1u)) return 0;
+    {
+        /* cursor sits on the space that follows the verb. Without arguments
+         * that space is the one before the CRC, so cursor+1 == crc_start. */
+        const size_t arg_start = cursor + 1u;
+        if (arg_start < crc_start) {
+            frame->args = p + arg_start;
+            frame->arg_bytes = crc_start - 1u - arg_start;
+        } else {
+            frame->args = NULL;
+            frame->arg_bytes = 0u;
+        }
+    }
 
     frame->session = session;
     frame->seq = (uint32_t)seq;
@@ -239,7 +284,7 @@ sxnu_control_accept(const struct sxnu_control_state *state,
 {
     if (!state || !frame) return SXNU_CONTROL_VERB_INVALID;
     if (frame->verb < SXNU_CONTROL_VERB_HELLO ||
-        frame->verb > SXNU_CONTROL_VERB_SHOTNEXT) return SXNU_CONTROL_VERB_INVALID;
+        frame->verb >= SXNU_CONTROL_VERB_LAST) return SXNU_CONTROL_VERB_INVALID;
     if (frame->verb == SXNU_CONTROL_VERB_HELLO)
         return frame->session == 0 && frame->seq == 0 ?
                SXNU_CONTROL_VERB_HELLO : SXNU_CONTROL_VERB_INVALID;
@@ -255,7 +300,7 @@ sxnu_control_commit(struct sxnu_control_state *state,
                     enum sxnu_control_verb accepted)
 {
     if (!state || !frame || accepted < SXNU_CONTROL_VERB_HELLO ||
-        accepted > SXNU_CONTROL_VERB_SHOTNEXT || frame->verb != accepted) return 0;
+        accepted >= SXNU_CONTROL_VERB_LAST || frame->verb != accepted) return 0;
     if (accepted == SXNU_CONTROL_VERB_HELLO)
         return frame->session == 0 && frame->seq == 0;
     if (!state->session || frame->seq == 0 || frame->session != state->session ||
