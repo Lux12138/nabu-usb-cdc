@@ -264,6 +264,7 @@ extern int native_ufs_export_write(uint64_t rel, uint32_t blocks, const void *sr
     __attribute__((weak_import));
 extern uint64_t native_ufs_export_blocks(void) __attribute__((weak_import));
 extern uint64_t native_ufs_export_first(void) __attribute__((weak_import));
+extern int native_ufs_log_sync(void) __attribute__((weak_import));
 
 #define QUD_DUMP_SLOTS 4u
 #define QUD_DUMP_TICKBYTES (16u * 4096u)   /* <=64 KiB per 5 ms tick */
@@ -310,6 +311,51 @@ int qud_dump_ufs_enqueue(uint64_t pa, uint32_t len, const uint8_t *tag, uint32_t
         return (int)i;
     }
     return -1;
+}
+
+/* Synchronous first block (T35-s3 Q3 criterion): write one 4 KiB block from
+ * the slot's source PA before the reply goes out. Lets the host tell a broken
+ * read path from a stalled worker in a single command.
+ * Returns 1 on success (block landed, optionally synced), 0 on read failure,
+ * -1 on export_write failure. *synced reports whether log_sync succeeded. */
+int qud_dump_ufs_write_first(uint32_t slot_index, uint32_t *blocks_written,
+                             int *write_err, int *synced)
+{
+    struct qud_dump_slot *s;
+    size_t got;
+    int ok;
+    if (blocks_written) *blocks_written = 0;
+    if (write_err) *write_err = 0;
+    if (synced) *synced = 0;
+    if (slot_index >= QUD_DUMP_SLOTS) return -1;
+    s = &qud_dump_slots[slot_index];
+    if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == 0 || !s->len) return -1;
+
+    got = qud_diag_read_phys(s->pa, qud_dump_scratch, 4096u);
+    if (got != 4096u) {
+        if (write_err) *write_err = -1;   /* read path failed */
+        __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE);
+        return 0;
+    }
+    ok = native_ufs_export_write(s->rel, 1u, qud_dump_scratch);
+    if (!ok) {
+        if (write_err) *write_err = -2;   /* export_write failed */
+        __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE);
+        return -1;
+    }
+    s->done = 4096u;
+    s->rel = 1u;
+    if (blocks_written) *blocks_written = 1u;
+    /* Land it: without a sync (or FUA) a PSCI reset can leave NAND stale. */
+    if (&native_ufs_log_sync != 0) {
+        if (native_ufs_log_sync()) {
+            if (synced) *synced = 1;
+        } else {
+            if (write_err) *write_err = -3;   /* sync failed */
+        }
+    }
+    __atomic_store_n(&s->state, 2u, __ATOMIC_RELEASE);  /* running: worker finishes the rest */
+    return 1;
 }
 
 /* Worker tick: advance queued/running dumps by at most QUD_DUMP_TICKBYTES.

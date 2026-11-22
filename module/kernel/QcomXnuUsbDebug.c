@@ -1548,10 +1548,31 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
             slot >= 0 ? "OK" : "ERR");
         if (slot >= 0) {
+            /* T35-s3 Q3: write the first block synchronously so this reply is
+             * itself the verdict -- blocks_written=1 proves the read path and
+             * export_write both work; write_err names the failing step.
+             * The slot also carries its state here, so DUMLIST (which loses
+             * replies when the TX ring is busy) is no longer needed. */
+            uint32_t bw = 0; int we = 0, sy = 0;
+            (void)qud_dump_ufs_write_first((uint32_t)slot, &bw, &we, &sy);
             (void)sxnu_control_writer_text(&writer, " state=queued slot=");
             (void)sxnu_control_writer_decimal(&writer, (uint32_t)slot);
             (void)sxnu_control_writer_text(&writer, " est=");
             (void)sxnu_control_writer_decimal(&writer, (uint32_t)n);
+            (void)sxnu_control_writer_text(&writer, " blocks_written=");
+            (void)sxnu_control_writer_decimal(&writer, bw);
+            (void)sxnu_control_writer_text(&writer, " write_err=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)we);
+            (void)sxnu_control_writer_text(&writer, " synced=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)sy);
+            (void)sxnu_control_writer_text(&writer, " slot_state=");
+            {
+                uint64_t spa = 0; uint32_t slen = 0, sdone = 0; const char *stag = "";
+                uint32_t sst = qud_dump_ufs_slot((uint32_t)slot, &spa, &slen, &sdone, &stag);
+                (void)sxnu_control_writer_decimal(&writer, sst);
+                (void)sxnu_control_writer_text(&writer, " done=");
+                (void)sxnu_control_writer_decimal(&writer, sdone);
+            }
         } else {
             (void)sxnu_control_writer_text(&writer, " ");
             (void)sxnu_control_writer_text(&writer,
