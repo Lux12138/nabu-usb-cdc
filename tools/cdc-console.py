@@ -660,6 +660,13 @@ def main():
                     print("用法: readpa <hex物理地址> <hex长度>，如 readpa 0xae00000 40", flush=True)
             elif cmd == "readpanext":
                 do_verb("READPANEXT", arg=rest)
+            elif cmd == "uptime":
+                do_verb("UPTIME", arg=rest)
+            elif cmd == "rdblk":
+                if rest:
+                    do_verb("RDBLK", arg=rest)
+                else:
+                    print("用法: rdblk <name> <off> <len>，名字: mdss/mdp/intf1/intf2/gpucc/gcc/smmu/discc/dwc3", flush=True)
             elif cmd == "dumpufs":
                 do_verb("DUMPUFS", arg=rest)
             elif cmd == "dumplist":
@@ -748,6 +755,8 @@ HELP = """\
   bootargs           读内核命令行（PE_boot_args）
   dumpufs <pa> <len> <tag>  异步写 UFS 导出区（4KiB 对齐）
   dumplist           列出 dump slot 状态
+  uptime             读 ARM 虚拟计数器（统一时基）
+  rdblk <name> <off> <len>  按名字读 MMIO 块（免记绝对地址）
   version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）

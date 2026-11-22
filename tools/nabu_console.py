@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
-"""nabu 统一控制台 v2：单进程、单句柄，收日志 + 发 SXNU1 命令帧 + 被动链路判据。
+"""nabu 一体化串口控制台（单一脚本 / 单一句柄）。
 
-v1 bug（已修）：
-  - v1 每 10s 主动发 STATUS/PING 并推进 seq，超时又盲目 seq+=1，导致 seq 与
-    内核 last_seq 失步；重发 HELLO 时用了非零 seq → 内核按协议拒绝（HELLO
-    必须 session=0 seq=0）→ 控制通道彻底失效。
-  - v2 修复：HELLO 永远 seq=0/session=0；命令帧严格 seq 递进；**不主动发
-    判据帧**，改从命令 reply 与日志字节流被动提取判据，绝不干扰控制通道。
+一个进程同时完成：
+  1) 采集：reader 线程把所有 CDC 字节写到 <tag>-com.bin（完整日志，含早期）
+  2) 控制：命令文件 append 一行即发一条 SXNU1 帧（HELLO/READ/READPA/WRITEPA/
+     BOOTARGS/VERSION/DUMPUFS/DUMLIST/REBOOT...），回复写 <tag>-ctl.txt
+  3) 自动脚本：--script FILE 预置命令，open COM3 后立即紧凑发完（抓短窗口）
+  4) 武装复位：--arm-at SEC，设备 uptime 到 SEC 自动发 REBOOT（回 recovery）
+  5) 判据：被动记录字节增量/命令成败到 <tag>-events.jsonl（不主动发判据帧）
+
+不再需要 cdc-console.py / linkwatch.py / capture.py —— 全在这里。
 
 用法：
-  先起控制台（等待 COM3，一旦枚举立即 open 并开始落日志）：
-    python -u nabu_console.py --tag kb06 --out E:/nabu/logs --wait 300 --deadline 400
-  再刷机（另一个终端）。控制台会在 COM3 出现时自动 open。
-  发命令（append 一行到 cmd 文件，同句柄发出）：
-    echo hello >> E:/nabu/logs/kb06-cmd.txt
-    echo version >> E:/nabu/logs/kb06-cmd.txt
-  控制台在 COM3 消失（WDT 咬回）时自动结束。
-
-产出：
-  <tag>-com.bin    完整 CDC 字节流（含早期日志）
-  <tag>-ctl.txt    命令 TX/RX 与事件
-  <tag>-cmd.txt    命令输入（append）
-  <tag>-events.jsonl  被动判据（字节增量 / 命令回复成功失败）
+  # 标准一轮（先起，再刷机；COM3 出现即采集；到点自动复位）：
+  python -u nabu_console.py --tag R --arm-at 240 --deadline 400
+  # 抓短窗口（预置命令自动发）：
+  python -u nabu_console.py --tag R --script cmds.txt --arm-at 240 --deadline 400
+  # 设备已在系统态、显式端口：
+  python -u nabu_console.py --port COM3 --tag R --deadline 120
+  # 发命令（另一个终端，append 一行）：
+  echo hello >> E:/nabu/logs/R-cmd.txt
+  echo readpa 0xae01000 40 >> E:/nabu/logs/R-cmd.txt
 """
 from __future__ import annotations
-import argparse, binascii, json, os, queue, sys, threading, time
+import argparse, binascii, json, os, queue, re, sys, threading, time
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -36,6 +35,7 @@ except ImportError:
 
 CST = timezone(timedelta(hours=8))
 VID, PID = "1209", "316D"
+DEV_TIME_RE = re.compile(rb"^nabu: (?:spawn|exec)[^\n]*?\bt=(\d{6,})\b")
 
 
 def now_hms():
@@ -58,7 +58,7 @@ def find_port():
 
 
 class Session:
-    """单句柄：reader 线程落全部字节到 com.bin，SXNU1R 行进 reply 队列。"""
+    """单句柄：reader 线程落全部字节；SXNU1R 进 reply 队列；解析设备 uptime。"""
     def __init__(self, port, raw_path, log):
         self.s = serial.Serial(port, 115200, timeout=0.05, write_timeout=2.0)
         self.out = open(raw_path, "ab", buffering=0)
@@ -67,6 +67,8 @@ class Session:
         self.running = True
         self.alive = True
         self.total = 0
+        self.dev_time = None       # 最近设备 uptime（秒）
+        self.dev_time_at = 0.0
         self.log = log
         self.t = threading.Thread(target=self._reader, daemon=True)
         self.t.start()
@@ -76,17 +78,13 @@ class Session:
             try:
                 n = self.s.in_waiting
             except Exception as e:
-                self.log("READ ERR %s" % e)
-                self.alive = False
-                break
+                self.log("READ ERR %s" % e); self.alive = False; break
             if not n:
-                time.sleep(0.02)
-                continue
+                time.sleep(0.02); continue
             try:
                 chunk = self.s.read(n)
             except Exception:
-                self.alive = False
-                break
+                self.alive = False; break
             if not chunk:
                 continue
             self.out.write(chunk)
@@ -95,15 +93,23 @@ class Session:
             while b"\n" in self.partial:
                 line, self.partial = self.partial.split(b"\n", 1)
                 line = line.strip(b"\r")
+                m = DEV_TIME_RE.match(line)
+                if m:
+                    self.dev_time = int(m.group(1)) / 19200000.0
+                    self.dev_time_at = time.time()
                 if line.startswith(b"SXNU1R"):
                     self.replies.put(line.decode("utf-8", "replace"))
         self.alive = False
 
+    def uptime(self):
+        if self.dev_time is None:
+            return None
+        return self.dev_time + (time.time() - self.dev_time_at)
+
     def send(self, payload):
-        self.s.write(payload)
+        self.s.write(payload); self.s.flush()
 
     def wait_reply(self, verb, timeout):
-        """取匹配 verb 的 reply；顺带把不匹配的 SXNU1R 放回队列。"""
         deadline = time.time() + timeout
         held = []
         try:
@@ -112,7 +118,6 @@ class Session:
                     line = self.replies.get(timeout=max(0.01, deadline - time.time()))
                 except queue.Empty:
                     break
-                # SXNU1R <sess> <seq> <VERB> <status> ...
                 parts = line.split()
                 rverb = parts[3] if len(parts) > 3 else ""
                 if rverb == verb.upper():
@@ -132,7 +137,7 @@ class Session:
 
 
 class Control:
-    """SXNU1 状态机。HELLO 固定 seq=0/session=0；其后命令 seq 从 1 严格递进。"""
+    """SXNU1 状态机。HELLO 固定 seq=0/session=0；其后命令 seq 严格递进。"""
     def __init__(self):
         self.session = 0
         self.seq = 0
@@ -152,12 +157,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tag", default="console")
     ap.add_argument("--out", default=r"E:\nabu\logs")
-    ap.add_argument("--port", default=None, help="显式端口（跳过等待，设备已在系统态时用）")
+    ap.add_argument("--port", default=None, help="显式端口（跳过等待；设备已在系统态时用）")
     ap.add_argument("--wait", type=int, default=300, help="等 COM3 出现的最长秒数")
     ap.add_argument("--deadline", type=int, default=0, help="总运行时限，0=不限")
-    ap.add_argument("--cmd-timeout", type=float, default=10.0, help="每条命令等 reply 的超时")
-    ap.add_argument("--script", default=None,
-                    help="预置命令文件：open COM3 + HELLO 后立即紧凑发完所有命令（抓短窗口用）")
+    ap.add_argument("--cmd-timeout", type=float, default=10.0)
+    ap.add_argument("--script", default=None, help="预置命令文件：open 后立即紧凑发完")
+    ap.add_argument("--arm-at", type=float, default=0, help="设备 uptime 到该秒数自动发 REBOOT（0=不武装）")
+    ap.add_argument("--reboot-window", type=float, default=90, help="武装窗口秒数")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -180,7 +186,10 @@ def main():
         with open(evt_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(kw, ensure_ascii=False) + "\n")
 
-    def send_cmd(verb, arg):
+    sess = None
+    ctl = None
+
+    def send_cmd(verb, arg, timeout=None):
         """发一条 SXNU1 帧并等 reply，同步 seq/session。返回 reply 或 None。"""
         verb = verb.upper()
         if ctl.is_hello(verb):
@@ -193,7 +202,7 @@ def main():
         frame = ctl.build(verb, arg)
         log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
         sess.send(frame)
-        reply = sess.wait_reply(verb, args.cmd_timeout)
+        reply = sess.wait_reply(verb, timeout or args.cmd_timeout)
         if reply:
             log("RX %s" % reply)
             event(kind="cmd", verb=verb, ok=True, reply=reply)
@@ -207,11 +216,11 @@ def main():
                         except ValueError: pass
                 ctl.hello_done = True
         else:
-            log("! no reply within %.1fs for %s" % (args.cmd_timeout, verb))
+            log("! no reply within %.1fs for %s" % (timeout or args.cmd_timeout, verb))
             event(kind="cmd", verb=verb, ok=False)
         return reply
 
-    # 端口：显式直接用；否则等 COM3 出现（先起控制台→再刷机的场景）
+    # 端口：显式直接用；否则等 COM3 出现（先起控制台→再刷机）
     port = args.port
     if not port:
         log("waiting for CDC (VID=%s PID=%s), up to %ds ..." % (VID, PID, args.wait))
@@ -219,12 +228,10 @@ def main():
         while time.time() < deadline:
             port = find_port()
             if port:
-                log("found %s" % port)
-                break
+                log("found %s" % port); break
             time.sleep(2)
         if not port:
-            log("PORT ABSENT after %ds" % args.wait)
-            return 3
+            log("PORT ABSENT after %ds" % args.wait); return 3
     else:
         log("using explicit port %s" % port)
 
@@ -237,11 +244,16 @@ def main():
     t0 = time.time()
     last_total = 0
     last_idle_check = time.time()
+    last_arm_note = 0
+    arm_sent = False
+    if args.arm_at > 0:
+        log("[arm] 已武装：设备 uptime >= %.0fs 自动发 REBOOT（窗口 %ds）"
+            % (args.arm_at, args.reboot_window))
 
-    # 预置脚本模式：open 后立即发 HELLO + 脚本全部命令（紧凑，抓短窗口）
+    # 预置脚本：open 后立即 HELLO + 脚本全部命令（紧凑，抓短窗口）
     if args.script and os.path.exists(args.script):
         log("=== auto script: %s ===" % args.script)
-        send_cmd("HELLO", "")                      # 必须先建 session
+        send_cmd("HELLO", "")
         with open(args.script, encoding="utf-8") as f:
             for raw in f:
                 raw = raw.strip()
@@ -252,10 +264,11 @@ def main():
         log("=== auto script done ===")
 
     while sess.alive:
-        if args.deadline and time.time() - t0 > args.deadline:
-            log("deadline reached")
-            break
-        # --- 命令文件：每轮扫描一次 ---
+        el = time.time() - t0
+        if args.deadline and el > args.deadline:
+            log("deadline reached"); break
+
+        # --- 命令文件 ---
         try:
             size = os.path.getsize(cmd_path)
             if size > cmd_pos:
@@ -271,10 +284,28 @@ def main():
                     send_cmd(parts[0], parts[1] if len(parts) > 1 else "")
         except Exception as e:
             log("CMD ERR %s" % e)
-        # --- 被动判据：仅记录字节增量，绝不发帧 ---
+
+        # --- 武装复位（单一句柄内发 REBOOT）---
+        if args.arm_at > 0 and not arm_sent:
+            up = sess.uptime()
+            if up is None:
+                if el - last_arm_note > 20:
+                    last_arm_note = el
+                    log("[arm] 未读到设备 uptime（等 nabu: spawn/exec t=），暂不发")
+            elif up > args.arm_at + args.reboot_window:
+                log("[arm] 超过窗口 (%.1f > %.0f+%ds)，放弃" % (up, args.arm_at, args.reboot_window))
+                arm_sent = True
+            elif up >= args.arm_at:
+                log("[arm] 设备时间 %.1fs >= %.0fs，发 REBOOT" % (up, args.arm_at))
+                send_cmd("REBOOT", "", timeout=3.0)
+                arm_sent = True
+                log("[arm] REBOOT 已发，USB 将掉")
+
+        # --- 被动判据 ---
         if time.time() - last_idle_check >= 10:
             delta = sess.total - last_total
-            event(kind="bytes", total=sess.total, delta=delta, alive=sess.alive)
+            event(kind="bytes", total=sess.total, delta=delta, alive=sess.alive,
+                  uptime=sess.uptime())
             last_total = sess.total
             last_idle_check = time.time()
         time.sleep(0.2)

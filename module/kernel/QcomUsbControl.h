@@ -41,6 +41,8 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_VERSION,    /* VERSION -> build/xnu/soc identity            */
     SXNU_CONTROL_VERB_DUMPUFS,    /* DUMPUFS <hexpa> <hexlen> <tag> -> UFS         */
     SXNU_CONTROL_VERB_DUMLIST,    /* DUMLIST -> queued/done slots                  */
+    SXNU_CONTROL_VERB_UPTIME,     /* UPTIME -> mach ticks + 19.2MHz timebase      */
+    SXNU_CONTROL_VERB_RDBLK,      /* RDBLK <name> <off> <len> -> named MMIO block */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -166,6 +168,12 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
         text[3] == 'L' && text[4] == 'I' && text[5] == 'S' && text[6] == 'T')
         return SXNU_CONTROL_VERB_DUMLIST;
+    if (bytes == 6u && text[0] == 'U' && text[1] == 'P' && text[2] == 'T' &&
+        text[3] == 'I' && text[4] == 'M' && text[5] == 'E')
+        return SXNU_CONTROL_VERB_UPTIME;
+    if (bytes == 5u && text[0] == 'R' && text[1] == 'D' && text[2] == 'B' &&
+        text[3] == 'L' && text[4] == 'K')
+        return SXNU_CONTROL_VERB_RDBLK;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -191,6 +199,8 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_VERSION: return "VERSION";
     case SXNU_CONTROL_VERB_DUMPUFS: return "DUMPUFS";
     case SXNU_CONTROL_VERB_DUMLIST: return "DUMLIST";
+    case SXNU_CONTROL_VERB_UPTIME: return "UPTIME";
+    case SXNU_CONTROL_VERB_RDBLK: return "RDBLK";
     default: return "";
     }
 }

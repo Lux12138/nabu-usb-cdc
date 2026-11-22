@@ -1572,6 +1572,88 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_UPTIME: {
+        /* UPTIME -> the ARM virtual counter, so the host has one unambiguous
+         * timebase instead of the three t= clocks in the log. */
+        struct sxnu_control_writer writer;
+        uint64_t cnt = 0, frq = 0;
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " ticks=");
+        (void)sxnu_control_writer_decimal(&writer, cnt);
+        (void)sxnu_control_writer_text(&writer, " hz=");
+        (void)sxnu_control_writer_decimal(&writer, frq);
+        (void)sxnu_control_writer_text(&writer, " us=");
+        (void)sxnu_control_writer_decimal(&writer, frq ? (cnt * 1000000ull / frq) : 0);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_RDBLK: {
+        /* RDBLK <name> <off> <len>: read a named MMIO block so the host never
+         * has to remember absolute addresses. Names are matched here. */
+        static const struct { const char *name; uint64_t base; uint32_t size; } blocks[] = {
+            { "mdss",  UINT64_C(0x0ae00000), 0x100000 },
+            { "mdp",   UINT64_C(0x0ae01000), 0x1000   },
+            { "intf1", UINT64_C(0x0ae6b000), 0x1000   },
+            { "intf2", UINT64_C(0x0ae6c000), 0x1000   },
+            { "gpucc", UINT64_C(0x02c90000), 0x9000   },
+            { "gcc",   UINT64_C(0x01050000), 0x4000   },
+            { "smmu",  UINT64_C(0x01000000), 0x100000 },
+            { "discc", UINT64_C(0x0af00000), 0x1000   },
+            { "dwc3",  UINT64_C(0x0a600000), 0x10000  },
+        };
+        const uint8_t *tok[4]; size_t len[4];
+        uint64_t off = 0, n = 0;
+        unsigned guard = 0;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) != 3 ||
+            !control_args_hex(tok[1], len[1], &off) ||
+            !control_args_hex(tok[2], len[2], &n) || !n || n > QUD_DIAG_MAX_PHYS) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        {
+            uint64_t base = 0; uint32_t size = 0;
+            for (unsigned i = 0; i < sizeof(blocks)/sizeof(blocks[0]); i++) {
+                size_t k = 0;
+                while (k < len[0] && blocks[i].name[k] && blocks[i].name[k] == (char)tok[0][k]) k++;
+                if (k == len[0] && blocks[i].name[k] == 0) {
+                    base = blocks[i].base; size = blocks[i].size; break;
+                }
+            }
+            if (!base || off >= size || n > size - off) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "range");
+                break;
+            }
+            int opened = qud_diag_read_begin(base + off, (uint32_t)n, frame->seq, 1);
+            if (opened != 1) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                    opened == -2 ? "unmapped" : "args");
+                break;
+            }
+            {
+                struct sxnu_control_writer writer;
+                uint8_t chunk[QUD_DIAG_CHUNK];
+                uint32_t offset = 0, fno = 0;
+                size_t got = qud_diag_read_next(chunk, sizeof(chunk), &offset, &fno);
+                sxnu_control_writer_init(&writer, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+                (void)sxnu_control_writer_text(&writer, " state=ready len=");
+                (void)sxnu_control_writer_decimal(&writer, qud_diag_cursor_length());
+                (void)sxnu_control_writer_text(&writer, " crc32=");
+                (void)sxnu_control_writer_hex(&writer, qud_diag_cursor_crc(), 8);
+                (void)sxnu_control_writer_text(&writer, " offset=");
+                (void)sxnu_control_writer_decimal(&writer, offset);
+                (void)sxnu_control_writer_text(&writer, " data=");
+                for (size_t q = 0; q < got; q++)
+                    (void)sxnu_control_writer_hex(&writer, chunk[q], 2);
+                reply_bytes = sxnu_control_reply_finish(&writer);
+            }
+        }
+        (void)guard;
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host

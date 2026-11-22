@@ -119,6 +119,8 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_VERSION, "VERSION", 1);
     check_accept(SXNU_CONTROL_VERB_DUMPUFS, "DUMPUFS 0x1008000 0x1000 smmu", 1);
     check_accept(SXNU_CONTROL_VERB_DUMLIST, "DUMLIST", 1);
+    check_accept(SXNU_CONTROL_VERB_UPTIME, "UPTIME", 1);
+    check_accept(SXNU_CONTROL_VERB_RDBLK, "RDBLK mdp 0 40", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -147,6 +149,8 @@ main(void)
     check("VERSION", 1, SXNU_CONTROL_VERB_VERSION, "");
     check("DUMPUFS 0x1008000 0x1000 smmu", 1, SXNU_CONTROL_VERB_DUMPUFS, "0x1008000 0x1000 smmu");
     check("DUMLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
+    check("UPTIME", 1, SXNU_CONTROL_VERB_UPTIME, "");
+    check("RDBLK mdp 0 40", 1, SXNU_CONTROL_VERB_RDBLK, "mdp 0 40");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");
