@@ -9,7 +9,7 @@ SM8150-AC）的 XNU 17.7.11（iPadOS 21H461）上。串口既能读内核日志�
 
 ---
 
-# 当前状态（2026-11-22）
+# 当前状态（2026-11-22 晚）
 
 ## 现在能做什么
 
@@ -20,7 +20,10 @@ SM8150-AC）的 XNU 17.7.11（iPadOS 21H461）上。串口既能读内核日志�
 | 边采边控 | 同一进程、同一句柄同时收日志和发帧 —— **已验证同时有效** |
 | 无人值守 | stdin 关掉也能发命令（命令文件通道），一轮零人工 |
 | 每轮数据量 | 1–10 MB |
-| **读内核内存** | **`READ`/`READNEXT` 已打通**：读内核 Mach-O header 得 `cffaedfe`；坏地址 `ERR unmapped` 不崩（l807 实测）|
+| **读内核内存** | **`READ`/`READNEXT` 已打通**：读内核 Mach-O header 得 `cffaedfe`（l807 实测）|
+| **读物理地址/MMIO** | **`READPA`/`READPANEXT` 已打通**：MDSS `0xae01000`、GPUCC `0x2c90000` 寄存器块读出正确（l809 实测）|
+| **符号解析** | `sym`/`syms`/`var` 主机侧解析 kernel.macho（53k 符号），零刷机 |
+| **流式 dump** | `dump`/`dumppa` 自动分块 + CRC 校验落主机文件（≤64 MiB）|
 
 ## CDC 一直在输出，两条历史上的「黑洞」都是测量侧错误
 
@@ -87,7 +90,12 @@ python -I tools/cdc-console.py --self-test             # 不需要板子
 | `ping` | `rx/rxo/tx/poll` 快照 |
 | `screenshot` / `shotnext` | 抓帧写 UFS / 等下次 flip 再抓 |
 | **`read <hex地址> <hex长度>`** | **读内核虚拟地址**：返回 `state=ready len= crc32= offset= data=`，首块最多 128 B |
-| **`readnext [n]`** | 取上一次 READ 的下一块（默认 128 B），直到 `ERR done` |
+| **`readnext [n]`** | 取上一次 READ 的下一块（默认 192 B），直到 `ERR done` |
+| **`readpa <pa> <n>`** | **读物理地址**（寄存器/MMIO）：`readpa 0xae01000 40` |
+| **`readpanext [n]`** | 取 READPA 的下一块 |
+| **`sym <name>` / `syms <sub>`** | 解析/列出内核符号（需 `--kernel`）|
+| **`var <name> [n]`** | 解析符号并 READ n 字节 |
+| **`dump`/`dumppa`** | 流式 dump 到主机文件（自动分块 + CRC）|
 
 **复位**（PSCI `SYSTEM_RESET`；ABL 读 `misc=boot-recovery` 后进 Recovery）
 
@@ -167,6 +175,36 @@ status                            # 原有命令仍正常
 
 **真机验证（l807 / SM8150 / iPadOS 17.7.11）**：内核头 magic 正确、坏地址不崩、
 分块正确、`STATUS` 向后兼容；20 项主机测试全过。
+
+## 物理地址：`READPA` / `READPANEXT`（2026-11-22 晚）
+
+寄存器/页表/DDR 都是物理地址。`READPA` 用 `ml_io_map()` 建 MMIO 映射后读：
+
+```
+readpa 0xae01000 40       # MDSS MDP 寄存器（实测 OK）
+readpa 0x2c90000 40       # GPUCC PLL/clock（实测 OK）
+readpanext 80             # 续读下一块
+```
+
+**XNU 陷阱**：`phystokv()` 对 MMIO 地址会 panic `illegal PA`；`ml_io_unmap()`
+对 permanent device mapping 会 panic `vm_map_delete`（XNU 全树从不调用 unmap）。
+⇒ 映射保持永久 + 单窗口缓存复用；**无效物理地址会 fault，调用者须给有效基址**。
+
+## 符号与流式 dump
+
+`--kernel <path>` 加载 kernel.macho 的 LC_SYMTAB（53,172 个符号）：
+
+```
+python tools/cdc-console.py --tag r900 --kernel hold/l809/kernel.macho
+> sym gPhysBase              # -> 0xfffffff0071c9108
+> syms native_adreno         # 列出所有匹配符号
+> var native_adreno_backing_cache_stats 48   # 解析 + READ
+> dumppa 0xae01000 0x1000 mdss.bin          # 4 KiB 寄存器块落主机文件
+> dump 0xfffffff007004000 0x1000 hdr.bin    # 虚拟地址 dump
+```
+
+`dump` 自动用 READNEXT/READPANEXT 分块、校验整块 CRC，
+只有一致才写文件。≤64 MiB 走 CDC；更大范围需要内核侧 UFS dump（未实现）。
 
 ---
 
