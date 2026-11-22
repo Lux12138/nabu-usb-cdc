@@ -38,7 +38,7 @@ extern uintptr_t phystokv(uint64_t phys);
 
 /* One READ/READNEXT chunk: 128 bytes render as 256 hex characters, which fits
  * inside SXNU_CONTROL_REPLY_BYTES (512) together with the state/crc fields. */
-#define QUD_DIAG_CHUNK 128u
+#define QUD_DIAG_CHUNK 192u   /* 384 hex chars + header < 512-byte reply cap */
 /* Largest range a single READ may name; the host walks it with READNEXT. */
 #define QUD_DIAG_MAX_LEN (1u << 20)
 /* One physical mapping is at most one page of Io memory. */

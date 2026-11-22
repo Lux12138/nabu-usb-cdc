@@ -602,6 +602,57 @@ def main():
                         tail = do_verb("READ", arg=("0x%x %x" % (addr, nbytes)))
                         if tail:
                             print("var %s @0x%016x: %s" % (parts[0], addr, tail), flush=True)
+            elif cmd in ("dump", "dumppa"):
+                # Stream a range to a host file via READ/READNEXT (or the
+                # physical variants), CRC-verified against the kernel total.
+                parts = rest.split()
+                if len(parts) != 3:
+                    print("用法: dump <地址> <长度> <输出文件>   dumppa <物理地址> <长度> <输出文件>", flush=True)
+                else:
+                    phys = (cmd == "dumppa")
+                    verb = "READPA" if phys else "READ"
+                    nxt = "READPANEXT" if phys else "READNEXT"
+                    try:
+                        start_addr = int(parts[0], 0)
+                        total = int(parts[1], 0)
+                    except ValueError:
+                        print("! 地址/长度必须是整数（可 0x 前缀）", flush=True)
+                        continue
+                    outpath = parts[2]
+                    if total <= 0 or total > 64 * 1024 * 1024:
+                        print("! 长度须在 1..64MiB（更大请用内核侧 UFS dump）", flush=True)
+                        continue
+                    tail = do_verb(verb, arg=("0x%x %x" % (start_addr, total)))
+                    if not tail or "state=ready" not in tail:
+                        print("! dump 启动失败: %s" % (tail or "无回复"), flush=True)
+                        continue
+                    import binascii as _ba
+                    import zlib as _zlib
+                    kv = dict(x.split("=", 1) for x in tail.split() if "=" in x)
+                    want_crc = int(kv.get("crc32", "0"), 16)
+                    data = bytearray()
+                    first = kv.get("data", "")
+                    if first:
+                        data += _ba.unhexlify(first)
+                    chunks = 1
+                    while len(data) < total:
+                        more = do_verb(nxt, arg="80", timeout=20.0)
+                        if not more or "state=data" not in more:
+                            print("! dump 中断: %s" % (more or "无回复"), flush=True)
+                            break
+                        mk = dict(x.split("=", 1) for x in more.split() if "=" in x)
+                        data += _ba.unhexlify(mk.get("data", ""))
+                        chunks += 1
+                    if len(data) != total:
+                        print("! dump 长度不符: %d/%d" % (len(data), total), flush=True)
+                        continue
+                    got_crc = _zlib.crc32(bytes(data)) & 0xffffffff
+                    if want_crc and got_crc != want_crc:
+                        print("! CRC 不符 want=%08x got=%08x（文件不写）" % (want_crc, got_crc), flush=True)
+                        continue
+                    with open(outpath, "wb") as _f:
+                        _f.write(data)
+                    print("DUMP OK %s: %d B / %d chunks crc=%08x" % (outpath, len(data), chunks, got_crc), flush=True)
             elif cmd == "readpa":
                 if rest:
                     do_verb("READPA", arg=rest)
@@ -668,6 +719,8 @@ HELP = """\
   sym <name>         解析内核符号地址（需 --kernel）
   syms <子串>        列出匹配符号（需 --kernel）
   var <name> [n]     解析符号并 READ n 字节（默认 8）
+  dump <addr> <len> <file>   流式读虚拟地址并落主机文件（CRC 校验）
+  dumppa <pa> <len> <file>   流式读物理地址并落主机文件
   readpa <pa> <len>  读物理地址（寄存器/MMIO，如 readpa 0xae00000 40）
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
