@@ -47,6 +47,11 @@ import threading
 import time
 
 try:
+    import symtab as _symtab
+except ImportError:
+    _symtab = None
+
+try:
     import serial
     from serial.tools import list_ports
 except ImportError:  # pragma: no cover
@@ -326,6 +331,7 @@ def main():
     ap.add_argument("--no-echo", action="store_true", help="不把日志回显到终端")
     ap.add_argument("--drop", action="append", default=[],
                     help="启动就静音的行前缀，可重复，如 --drop NativeAdrenoBO")
+    ap.add_argument("--kernel", default="", help="kernel.macho for sym/var commands")
     ap.add_argument("--self-test", action="store_true", help="只跑内置自测，不碰串口")
     ap.add_argument("--arm-reboot", type=int, default=0, metavar="SEC",
                     help="武装：设备时间达到 SEC 秒后自动发 REBOOT（回 Recovery）。"
@@ -406,6 +412,24 @@ def main():
         v, tail = parsed
         log("RX %s %s" % (v, tail))
         return tail
+
+    _syms = None
+    if args.kernel and _symtab:
+        try:
+            _syms = _symtab.Symtab(args.kernel)
+            log("符号表已加载: %s (%d 个符号)" % (args.kernel, len(_syms.entries())))
+        except Exception as e:
+            log("! 符号表加载失败: %s" % e)
+    elif args.kernel and not _symtab:
+        log("! 找不到 symtab.py，sym/var 命令不可用")
+
+    def resolve_addr(name):
+        if not _syms:
+            return None, "no kernel (add --kernel <path>)"
+        hits = _syms.lookup(name)
+        if not hits:
+            return None, "symbol not found: %s" % name
+        return hits[0][1], None
 
     log("elapsed 0 s. 输入 help 看命令；日志正在落 %s" % raw_path)
 
@@ -543,6 +567,41 @@ def main():
                 print("muted=%d" % len(sess.muted), flush=True)
             elif cmd == "hello":
                 do_verb("HELLO")
+            elif cmd == "sym":
+                if not rest:
+                    print("用法: sym <符号名>，如 sym gPhysBase", flush=True)
+                else:
+                    addr, err = resolve_addr(rest)
+                    print(("0x%016x" % addr) if addr is not None else ("! " + err), flush=True)
+            elif cmd == "syms":
+                if not _syms:
+                    print("! 无符号表（加 --kernel）", flush=True)
+                elif not rest:
+                    print("用法: syms <子串>，如 syms native_adreno", flush=True)
+                else:
+                    hits = _syms.grep(rest)
+                    for name, value in hits[:40]:
+                        print("0x%016x  %s" % (value, name), flush=True)
+                    print("(%d 个匹配)" % len(hits), flush=True)
+            elif cmd == "var":
+                parts = rest.split()
+                if not parts:
+                    print("用法: var <符号名> [字节数，默认8]", flush=True)
+                else:
+                    addr, err = resolve_addr(parts[0])
+                    if addr is None:
+                        print("! " + err, flush=True)
+                    else:
+                        nbytes = 8
+                        if len(parts) > 1:
+                            try:
+                                nbytes = int(parts[1], 0)
+                            except ValueError:
+                                nbytes = 8
+                        nbytes = max(1, min(nbytes, 4096))
+                        tail = do_verb("READ", arg=("0x%x %x" % (addr, nbytes)))
+                        if tail:
+                            print("var %s @0x%016x: %s" % (parts[0], addr, tail), flush=True)
             elif cmd == "read":
                 if rest:
                     do_verb("READ", arg=rest)
@@ -599,6 +658,9 @@ HELP = """\
   hello             建立 session（HELLO 必须 session=0 seq=0）
   ping              rx / rxo / tx / poll 快照
   status            usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=
+  sym <name>         解析内核符号地址（需 --kernel）
+  syms <子串>        列出匹配符号（需 --kernel）
+  var <name> [n]     解析符号并 READ n 字节（默认 8）
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
   readnext [n]       取 READ 的下一块（默认 128 字节）
   screenshot         让内核抓一帧写 UFS
