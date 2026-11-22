@@ -1256,7 +1256,7 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
             break;
         }
-        opened = qud_diag_read_begin(va, (uint32_t)count, frame->seq);
+        opened = qud_diag_read_begin(va, (uint32_t)count, frame->seq, 0);
         if (opened != 1) {
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
                 opened == -2 ? "unmapped" : "args");
@@ -1269,6 +1269,79 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (void)sxnu_control_writer_decimal(&writer, qud_diag_cursor_length());
         (void)sxnu_control_writer_text(&writer, " crc32=");
         (void)sxnu_control_writer_hex(&writer, qud_diag_cursor_crc(), 8);
+        (void)sxnu_control_writer_text(&writer, " offset=");
+        (void)sxnu_control_writer_decimal(&writer, offset);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (size_t i = 0; i < got; ++i)
+            (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_READPA: {
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t pa = 0, count = 0;
+        struct sxnu_control_writer writer;
+        uint8_t chunk[QUD_DIAG_CHUNK];
+        uint32_t offset = 0, frame_no = 0;
+        size_t got;
+        int opened;
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) != 2 ||
+            !control_args_hex(tok[0], len[0], &pa) ||
+            !control_args_hex(tok[1], len[1], &count) ||
+            !count || count > QUD_DIAG_MAX_PHYS) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        opened = qud_diag_read_begin(pa, (uint32_t)count, frame->seq, 1);
+        if (opened != 1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                opened == -2 ? "unmapped" : "args");
+            break;
+        }
+        got = qud_diag_read_next(chunk, sizeof(chunk), &offset, &frame_no);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=ready len=");
+        (void)sxnu_control_writer_decimal(&writer, qud_diag_cursor_length());
+        (void)sxnu_control_writer_text(&writer, " crc32=");
+        (void)sxnu_control_writer_hex(&writer, qud_diag_cursor_crc(), 8);
+        (void)sxnu_control_writer_text(&writer, " offset=");
+        (void)sxnu_control_writer_decimal(&writer, offset);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (size_t i = 0; i < got; ++i)
+            (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_READPANEXT: {
+        const uint8_t *tok[4];
+        size_t len[4];
+        uint64_t want = QUD_DIAG_CHUNK;
+        struct sxnu_control_writer writer;
+        uint8_t chunk[QUD_DIAG_CHUNK];
+        uint32_t offset = 0, frame_no = 0;
+        size_t got;
+        if (!qud_diag_cursor_active() || !qud_diag_cursor_is_phys()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "noimage");
+            break;
+        }
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 4) == 1) {
+            if (!control_args_hex(tok[0], len[0], &want) ||
+                !want || want > QUD_DIAG_CHUNK) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        got = qud_diag_read_next(chunk, (size_t)want, &offset, &frame_no);
+        if (!got) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "done");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=data frame=");
+        (void)sxnu_control_writer_decimal(&writer, frame_no);
         (void)sxnu_control_writer_text(&writer, " offset=");
         (void)sxnu_control_writer_decimal(&writer, offset);
         (void)sxnu_control_writer_text(&writer, " data=");

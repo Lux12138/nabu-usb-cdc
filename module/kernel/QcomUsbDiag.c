@@ -41,6 +41,8 @@ extern uintptr_t phystokv(uint64_t phys);
 #define QUD_DIAG_CHUNK 128u
 /* Largest range a single READ may name; the host walks it with READNEXT. */
 #define QUD_DIAG_MAX_LEN (1u << 20)
+/* One physical mapping is at most one page of Io memory. */
+#define QUD_DIAG_MAX_PHYS (1u << 10)
 
 struct qud_diag_cursor {
     uint64_t va;        /* base address of the pending read          */
@@ -49,7 +51,8 @@ struct qud_diag_cursor {
     uint32_t frame;     /* command sequence that created the cursor  */
     uint32_t crc;       /* CRC32 over the whole range                */
     uint8_t  active;
-    uint8_t  reserved[3];
+    uint8_t  is_phys;
+    uint8_t  reserved[2];
 };
 
 static struct qud_diag_cursor qud_diag_cursor;
@@ -147,13 +150,51 @@ qud_diag_write(uint64_t va, const void *src, size_t len)
     return 1;
 }
 
+/* Read a physical range through a temporary device mapping. Returns the
+ * number of bytes copied (0 on failure). ml_io_map() takes a byte size,
+ * internally rounds to pages, and ml_io_unmap must get the same size. */
+/* One cached device window. The console reads a few register blocks repeatedly
+ * (MDSS, GPUCC, SMMU); reusing one permanent mapping avoids leaking a VM entry
+ * per command. Different windows evict the previous one -- the mapping stays
+ * valid in the kernel (XNU never unmaps IO space), we just stop tracking it. */
+static uint64_t phys_cache_base;
+static uint64_t phys_cache_span;
+static uintptr_t phys_cache_va;
+
+static size_t
+qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
+{
+    const uint64_t base = pa & ~UINT64_C(0xfff);
+    const uint64_t off = pa & UINT64_C(0xfff);
+    const uint64_t span = (off + len + 0xfffu) & ~UINT64_C(0xfff);
+    uintptr_t va;
+
+    if (phys_cache_va && base >= phys_cache_base &&
+        (base + span) <= (phys_cache_base + phys_cache_span)) {
+        va = phys_cache_va;
+    } else {
+        va = ml_io_map(base, span);
+        if (!va) return 0;
+        phys_cache_base = base;
+        phys_cache_span = span;
+        phys_cache_va = va;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    memcpy(dst, (const void *)(va + off), len);
+    __asm__ volatile("dsb sy" ::: "memory");
+    /* XNU never calls ml_io_unmap: device mappings from ml_io_map are
+       permanent (all XNU callers keep them). Unmapping panics vm_map_delete
+       on a permanent entry. */
+    return len;
+}
+
 /* ---- READ / READNEXT ---------------------------------------------------- */
 
 /* Starts a buffered read so the host can pull large ranges 128 bytes at a
  * time, mirroring the SHOTNEXT cursor the screenshot path uses. Returns 1 on
  * success, -2 when a page inside the range is unmapped, 0 on bad arguments. */
 static int
-qud_diag_read_begin(uint64_t va, uint32_t len, uint32_t frame)
+qud_diag_read_begin(uint64_t va, uint32_t len, uint32_t frame, int phys)
 {
     uint32_t crc = 0xffffffffu;
     uint8_t scratch[QUD_DIAG_CHUNK];
@@ -167,7 +208,8 @@ qud_diag_read_begin(uint64_t va, uint32_t len, uint32_t frame)
      * the CRC the host uses to verify the reassembled buffer. */
     while (at < len) {
         const uint32_t take = (len - at) < QUD_DIAG_CHUNK ? (len - at) : QUD_DIAG_CHUNK;
-        const size_t got = qud_diag_read(va + at, scratch, take);
+        const size_t got = phys ? qud_diag_read_phys(va + at, scratch, take)
+                                : qud_diag_read(va + at, scratch, take);
         if (got != take) {
             return -2;
         }
@@ -185,6 +227,7 @@ qud_diag_read_begin(uint64_t va, uint32_t len, uint32_t frame)
     qud_diag_cursor.frame = frame;
     qud_diag_cursor.crc = ~crc;
     qud_diag_cursor.active = 1;
+    qud_diag_cursor.is_phys = phys ? 1u : 0u;
     return 1;
 }
 
@@ -206,7 +249,9 @@ qud_diag_read_next(uint8_t *out, size_t capacity, uint32_t *offset, uint32_t *fr
     if (take > capacity) {
         take = (uint32_t)capacity;
     }
-    got = qud_diag_read(qud_diag_cursor.va + qud_diag_cursor.offset, out, take);
+    got = qud_diag_cursor.is_phys
+        ? qud_diag_read_phys(qud_diag_cursor.va + qud_diag_cursor.offset, out, take)
+        : qud_diag_read(qud_diag_cursor.va + qud_diag_cursor.offset, out, take);
     if (got != take) {
         qud_diag_cursor.active = 0;
         return 0;
@@ -236,3 +281,10 @@ qud_diag_cursor_length(void)
 }
 
 #endif /* QCOM_USB_DIAG_C */
+
+/* ==== NABU-PROBE-L808 BEGIN (temporary) ==== */
+static int qud_diag_cursor_is_phys(void)
+{
+    return qud_diag_cursor.is_phys;
+}
+/* ==== NABU-PROBE-L808 END ==== */

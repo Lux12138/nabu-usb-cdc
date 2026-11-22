@@ -112,6 +112,8 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_WRITE, "WRITE 0xfffffff007004000 41", 1);
     check_accept(SXNU_CONTROL_VERB_SYM, "SYM gPhysBase", 1);
     check_accept(SXNU_CONTROL_VERB_SYMS, "SYMS nabu_", 1);
+    check_accept(SXNU_CONTROL_VERB_READPA, "READPA 0xae00000 40", 1);
+    check_accept(SXNU_CONTROL_VERB_READPANEXT, "READPANEXT 80", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -132,6 +134,8 @@ main(void)
           "0xfffffff007004000 00000000");
     check("SYM gPhysBase", 1, SXNU_CONTROL_VERB_SYM, "gPhysBase");
     check("SYMS nabu_", 1, SXNU_CONTROL_VERB_SYMS, "nabu_");
+    check("READPA 0xae00000 40", 1, SXNU_CONTROL_VERB_READPA, "0xae00000 40");
+    check("READPANEXT 80", 1, SXNU_CONTROL_VERB_READPANEXT, "80");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

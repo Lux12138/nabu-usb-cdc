@@ -602,6 +602,13 @@ def main():
                         tail = do_verb("READ", arg=("0x%x %x" % (addr, nbytes)))
                         if tail:
                             print("var %s @0x%016x: %s" % (parts[0], addr, tail), flush=True)
+            elif cmd == "readpa":
+                if rest:
+                    do_verb("READPA", arg=rest)
+                else:
+                    print("用法: readpa <hex物理地址> <hex长度>，如 readpa 0xae00000 40", flush=True)
+            elif cmd == "readpanext":
+                do_verb("READPANEXT", arg=rest)
             elif cmd == "read":
                 if rest:
                     do_verb("READ", arg=rest)
@@ -661,6 +668,8 @@ HELP = """\
   sym <name>         解析内核符号地址（需 --kernel）
   syms <子串>        列出匹配符号（需 --kernel）
   var <name> [n]     解析符号并 READ n 字节（默认 8）
+  readpa <pa> <len>  读物理地址（寄存器/MMIO，如 readpa 0xae00000 40）
+  readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
   readnext [n]       取 READ 的下一块（默认 128 字节）
   screenshot         让内核抓一帧写 UFS

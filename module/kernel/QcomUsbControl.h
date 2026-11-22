@@ -34,6 +34,8 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_WRITE,      /* WRITE <hexva> <hexbytes> */
     SXNU_CONTROL_VERB_SYM,        /* SYM <text>               */
     SXNU_CONTROL_VERB_SYMS,       /* SYMS [prefix]            */
+    SXNU_CONTROL_VERB_READPA,     /* READPA <hexpa> <hexlen>  */
+    SXNU_CONTROL_VERB_READPANEXT, /* READPANEXT [<hexchars>]  */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -139,6 +141,11 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
         return SXNU_CONTROL_VERB_SYM;
     if (bytes == 4u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'M' &&
         text[3] == 'S') return SXNU_CONTROL_VERB_SYMS;
+    if (bytes == 6u && text[0] == 'R' && text[1] == 'E' && text[2] == 'A' &&
+        text[3] == 'D' && text[4] == 'P' && text[5] == 'A') return SXNU_CONTROL_VERB_READPA;
+    if (bytes == 10u && text[0] == 'R' && text[1] == 'E' && text[2] == 'A' &&
+        text[3] == 'D' && text[4] == 'P' && text[5] == 'A' && text[6] == 'N' &&
+        text[7] == 'E' && text[8] == 'X' && text[9] == 'T') return SXNU_CONTROL_VERB_READPANEXT;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -157,6 +164,8 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_WRITE: return "WRITE";
     case SXNU_CONTROL_VERB_SYM: return "SYM";
     case SXNU_CONTROL_VERB_SYMS: return "SYMS";
+    case SXNU_CONTROL_VERB_READPA: return "READPA";
+    case SXNU_CONTROL_VERB_READPANEXT: return "READPANEXT";
     default: return "";
     }
 }
