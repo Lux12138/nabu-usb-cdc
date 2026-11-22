@@ -2340,27 +2340,41 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
     accepted = backlog_write(bytes, count);
     /* Armed == the kernel is inside the debugger.
      *
-     * Do NOT call poll_owned() here: it is a real DWC3 MMIO pump and the
-     * controller no longer services it once the other cores are halted (that
-     * is what froze kprintf mid-word at "Using s"). But output still matters --
-     * "Using serial KDP.", the Options banner and "Connected to remote
-     * debugger." are the only evidence we get -- so push straight into the TX
-     * ring instead. dwc3_queue() is a memcpy into the mapped ring plus the
-     * doorbell write; it takes no USB lock and does no polling. */
-    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
-        if (native.status.phase == QCOM_USB_DEBUG_ACTIVE && dwc3_ready(native.core)) {
-            (void)dwc3_queue(native.core, bytes, count);
-        }
-        return accepted;
-    }
+     * kb-26: this used to bypass poll_owned() and only dwc3_queue() the bytes,
+     * on the theory that the controller stops answering once the other cores are
+     * halted. That theory was wrong, and the evidence was already on disk:
+     * kb-17u (commit 17f1830) has NO armed branch at all -- it polls
+     * unconditionally -- and its capture shows the whole debugger entry printing
+     * ("Using serial KDP." twice, "Waiting", the four Options lines, and even
+     * "Continuing..."). kb-22/24/25 then produced zero debugger output purely
+     * because this branch stopped pumping: dwc3_queue() is a memcpy into the TX
+     * ring plus a doorbell, and dwc3_poll() is the only thing that hands the ring
+     * to the endpoint. Nothing else runs in that context, so the bytes sat there.
+     *
+     * The earlier "Using s" truncation (kb-17t) was a different bug -- every RX
+     * byte was going into usb_serial_rx and wedging kprintf. The kdp_rx split
+     * fixed that one; it was never a reason to stop transmitting.
+     *
+     * So: pump exactly as the unarmed path does, but WITHOUT the 1 ms flush
+     * window below. In the debugger the other cores are halted, so the only
+     * work the pump may do is the single bounded dwc3_poll(1) inside
+     * poll_owned(): no retry loop, no delay_us. If the controller really has
+     * stopped, dwc3_poll() returns an error, poll_owned() flips the phase to
+     * IO_FAILED, and the next call short-circuits on the phase check above. */
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return accepted;
     if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
         (void)poll_owned();
         /* Explicit diagnostic mode uses a 1ms flush window for a ready host so
          * the last character remains observable if a later kernel path
          * stops servicing USB. One bounded core operation may extend it.
-         * No-host and normal mode remain nonblocking. */
-        if (usb_diag_enabled && native.status.phase == QCOM_USB_DEBUG_ACTIVE && dwc3_ready(native.core)) {
+         * No-host and normal mode remain nonblocking.
+         *
+         * kb-26: never in the debugger. The window spins up to 1 ms calling
+         * delay_us() with interrupts already off and the other cores halted;
+         * one poll per character is all the entry banner needs, and a stuck
+         * controller must not turn every character into a 1 ms stall. */
+        if (usb_diag_enabled && !__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) &&
+            native.status.phase == QCOM_USB_DEBUG_ACTIVE && dwc3_ready(native.core)) {
             uint64_t start = counter();
             unsigned int attempts = 128u;
             while (attempts-- && (dwc3_queued(native.core) || soc_usb_buffer_pending(&usb_log_buffer)) &&
@@ -2431,7 +2445,11 @@ qcom_usb_debug_serial_available(void)
 int
 qcom_usb_debug_kdp_push(uint8_t c)
 {
-    if (c == 0) return 0;
+    /* 0x00 is a perfectly ordinary byte in a KDP frame: kdp_hdr_t carries len
+     * little-endian, the session key, ip_src, ip_id, and the CONNECT greeting
+     * is nul-terminated -- a 71-byte CONNECT frame contains a dozen of them.
+     * Rejecting 0x00 here silently corrupted every frame we tried to stage
+     * (T38-c). Push unconditionally; the caller decides what to send. */
     kdp_rx_push(c);
     return 1;
 }
