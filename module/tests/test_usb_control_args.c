@@ -163,6 +163,12 @@ main(void)
     check("VERSION", 1, SXNU_CONTROL_VERB_VERSION, "");
     check("DUMPUFS 0x1008000 0x1000 smmu", 1, SXNU_CONTROL_VERB_DUMPUFS, "0x1008000 0x1000 smmu");
     check("DUMLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
+    /* kb-40: both spellings must resolve. The console upper-cases what the user
+     * types and sends it verbatim, and every other dump verb is DUMP*, so
+     * "dumplist" is the natural thing to try -- it used to parse to nothing,
+     * which produced no reply at all and left last_seq behind, poisoning every
+     * later command on the same session. */
+    check("DUMPLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
     check("UPTIME", 1, SXNU_CONTROL_VERB_UPTIME, "");
     check("RDBLK mdp 0 40", 1, SXNU_CONTROL_VERB_RDBLK, "mdp 0 40");
     check("PERFSTART bb8", 1, SXNU_CONTROL_VERB_PERFSTART, "bb8");

@@ -187,9 +187,26 @@ class Session:
         """Enqueue a frame. Never blocks on the device."""
         self.wq.put(payload)
 
-    def wait_reply(self, verb, timeout):
+    def wait_reply(self, verb, timeout, seq=None):
+        """Wait for the reply that belongs to `verb`, ideally by sequence number.
+
+        Matching on the verb name alone is wrong: the kernel echoes its own
+        canonical name from sxnu_control_verb_name(), which need not equal what
+        the host typed. Measured on kb-40: `dumplist` was parsed, handled,
+        committed (last_seq advanced to 6) and its reply did reach the capture as
+        "SXNU1R <session> 00000006 DUMLIST OK ...", but this function was waiting
+        for the literal string DUMPLIST and reported a timeout. The kernel side
+        was correct the whole time.
+
+        The reply carries session and seq, so prefer those: they cannot be
+        ambiguous across aliases. Fall back to the verb comparison only when the
+        caller did not supply a seq.
+        """
         deadline = time.time() + timeout
         held = []
+        want_seq = None
+        if seq is not None:
+            want_seq = "%08x" % (seq & 0xFFFFFFFF)
         try:
             while time.time() < deadline:
                 try:
@@ -197,9 +214,14 @@ class Session:
                 except queue.Empty:
                     break
                 parts = line.split()
-                rverb = parts[3] if len(parts) > 3 else ""
-                if rverb == verb.upper():
-                    return line
+                if want_seq is not None:
+                    rseq = parts[2] if len(parts) > 2 else ""
+                    if rseq == want_seq:
+                        return line
+                else:
+                    rverb = parts[3] if len(parts) > 3 else ""
+                    if rverb == verb.upper():
+                        return line
                 held.append(line)
         finally:
             for l in held:
@@ -326,10 +348,34 @@ def main():
             return None
         else:
             ctl.seq += 1
-        frame = ctl.build(verb, arg)
-        log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
-        sess.send(frame)
-        reply = sess.wait_reply(verb, timeout)
+
+        def attempt(seq_already_bumped):
+            if not seq_already_bumped:
+                ctl.seq += 1
+            frame = ctl.build(verb, arg)
+            log("TX %s %s (seq=%d)" % (verb, arg, ctl.seq))
+            this_seq = ctl.seq
+            sess.send(frame)
+            return sess.wait_reply(verb, timeout, seq=this_seq)
+
+        reply = attempt(True)
+        if not reply and not ctl.is_hello(verb):
+            # One silent failure poisons the whole session, so recover instead of
+            # just reporting the timeout.
+            #
+            # sxnu_control_commit() only advances state->last_seq when a request
+            # succeeds, while this side increments ctl.seq for every attempt. One
+            # rejected or lost frame therefore leaves the two permanently out of
+            # step and every later command is refused -- measured on kb-40: after
+            # VERSION (seq=10) got no reply, three further commands failed while
+            # the kernel kept answering HELLO, whose commit path ignores
+            # last_seq.
+            #
+            # HELLO re-syncs both session and seq from the kernel's own counter,
+            # so replay it and try the command once more.
+            log("! retrying %s after HELLO resync" % verb)
+            if send_cmd("HELLO", "", timeout) is not None:
+                reply = attempt(False)
         if reply:
             log("RX %s" % reply)
             event(kind="cmd", verb=verb, ok=True, reply=reply)

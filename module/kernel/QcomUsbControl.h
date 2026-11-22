@@ -181,6 +181,25 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
         text[3] == 'L' && text[4] == 'I' && text[5] == 'S' && text[6] == 'T')
         return SXNU_CONTROL_VERB_DUMLIST;
+    /* kb-40: accept DUMPLIST as well as DUMLIST.
+     *
+     * Every other dump verb is DUMP*, so "dumplist" is what people and scripts
+     * type; the console upper-cases whatever it is given and sends it verbatim,
+     * so an 8-character DUMPLIST reached this parser and matched nothing.
+     *
+     * The failure was silent and unrecoverable, which is what made it look like a
+     * hang: parse returns 0 -> control_service counts control_rejected and never
+     * calls control_handle_frame -> no reply, and state->last_seq does not
+     * advance. The console increments its own seq on every attempt, so the two
+     * drift apart by one per failure and every later command is refused too.
+     * Measured on kb-38: dumlist (7 chars) answered OK immediately, while
+     * dumplist (8 chars) timed out and left last_seq stuck at 22 (read live from
+     * 0xfffffff00c81e098) -- only HELLO recovered, because it does not consult
+     * last_seq. */
+    if (bytes == 8u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
+        text[3] == 'P' && text[4] == 'L' && text[5] == 'I' && text[6] == 'S' &&
+        text[7] == 'T')
+        return SXNU_CONTROL_VERB_DUMLIST;
     if (bytes == 6u && text[0] == 'U' && text[1] == 'P' && text[2] == 'T' &&
         text[3] == 'I' && text[4] == 'M' && text[5] == 'E')
         return SXNU_CONTROL_VERB_UPTIME;
@@ -452,7 +471,24 @@ sxnu_control_writer_text(struct sxnu_control_writer *writer, const char *text)
 {
     size_t bytes = 0;
     if (!text) return 0;
-    while (text[bytes]) bytes++;
+    /* kb-39: bound the scan. This runs inside control_handle_frame(), which holds
+     * the USB guard with interrupts masked, so an unterminated string here is not
+     * a cosmetic bug: the loop walks memory until it happens to hit a zero byte.
+     *
+     * Measured on hardware (kb-38): DUMPLIST stopped answering, and every verb
+     * after it timed out as well, while the kernel kept logging normally. The
+     * caller passes slot->tag, a uint8_t[16] documented as "NUL-padded" -- but a
+     * full 16-byte tag has no terminator, and writer_put() cannot help because it
+     * only sees the length after this loop has already run.
+     *
+     * A reply is capped at SXNU_CONTROL_REPLY_BYTES anyway, so a longer string
+     * could never be delivered; failing fast is strictly better than scanning the
+     * kernel image while holding the USB lock. */
+    while (bytes < writer->capacity && text[bytes]) bytes++;
+    if (bytes == writer->capacity) {
+        writer->failed = 1;
+        return 0;
+    }
     return sxnu_control_writer_put(writer, text, bytes);
 }
 

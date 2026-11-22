@@ -1689,8 +1689,19 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
         for (i = 0; i < 4u && !writer.failed; i++) {
             uint64_t pa = 0; uint32_t len = 0, done = 0; const char *tag = "";
+            /* kb-39: never hand slot->tag (a uint8_t[16] that a full tag leaves
+             * unterminated) to a %s-style writer. Copy it into a local buffer
+             * with a guaranteed NUL. Measured on kb-38: DUMPLIST stopped
+             * answering and every later verb timed out, while the kernel kept
+             * logging -- the writer was walking memory with the USB lock held. */
+            char tagbuf[17];
             uint32_t st = qud_dump_ufs_slot(i, &pa, &len, &done, &tag);
             if (st == 0) continue;
+            {
+                size_t n = 0;
+                while (n < 16u && tag && tag[n]) { tagbuf[n] = tag[n]; n++; }
+                tagbuf[n] = 0;
+            }
             (void)sxnu_control_writer_text(&writer, " slot=");
             (void)sxnu_control_writer_decimal(&writer, i);
             (void)sxnu_control_writer_text(&writer, " state=");
@@ -1700,7 +1711,7 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             (void)sxnu_control_writer_text(&writer, "/");
             (void)sxnu_control_writer_decimal(&writer, len);
             (void)sxnu_control_writer_text(&writer, " tag=");
-            (void)sxnu_control_writer_text(&writer, tag);
+            (void)sxnu_control_writer_text(&writer, tagbuf);
         }
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
