@@ -9,7 +9,7 @@ SM8150-AC）的 XNU 17.7.11（iPadOS 21H461）上。串口既能读内核日志�
 
 ---
 
-# 当前状态（2026-11-19）
+# 当前状态（2026-11-22）
 
 ## 现在能做什么
 
@@ -20,6 +20,7 @@ SM8150-AC）的 XNU 17.7.11（iPadOS 21H461）上。串口既能读内核日志�
 | 边采边控 | 同一进程、同一句柄同时收日志和发帧 —— **已验证同时有效** |
 | 无人值守 | stdin 关掉也能发命令（命令文件通道），一轮零人工 |
 | 每轮数据量 | 1–10 MB |
+| **读内核内存** | **`READ`/`READNEXT` 已打通**：读内核 Mach-O header 得 `cffaedfe`；坏地址 `ERR unmapped` 不崩（l807 实测）|
 
 ## CDC 一直在输出，两条历史上的「黑洞」都是测量侧错误
 
@@ -85,6 +86,8 @@ python -I tools/cdc-console.py --self-test             # 不需要板子
 | `status` | `usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=` |
 | `ping` | `rx/rxo/tx/poll` 快照 |
 | `screenshot` / `shotnext` | 抓帧写 UFS / 等下次 flip 再抓 |
+| **`read <hex地址> <hex长度>`** | **读内核虚拟地址**：返回 `state=ready len= crc32= offset= data=`，首块最多 128 B |
+| **`readnext [n]`** | 取上一次 READ 的下一块（默认 128 B），直到 `ERR done` |
 
 **复位**（PSCI `SYSTEM_RESET`；ABL 读 `misc=boot-recovery` 后进 Recovery）
 
@@ -134,6 +137,36 @@ TX REBOOT   →  RX OK state=queued     24 ms
 产出 `logs/<tag>-console.bin`（原始字节）+ `logs/<tag>-console.ctl.txt`（TX/RX 与事件）。
 `--wait N` 开机前先起；`--deadline N` 到点自退；`--drop PREFIX` 启动即静音；
 **默认不重连**（掉线就报掉线，不偷偷换句柄）；stdin 关掉时自动转「只采集 + 读命令文件」。
+
+---
+
+# 读内核内存：`READ` / `READNEXT`（2026-11-22）
+
+控制台可以读任意**内核虚拟地址**，不用再为每次诊断重新编译/刷机。
+
+```
+hello
+read 0xfffffff007004000 40        # 读内核头 → cffaedfe (MH_MAGIC_64)
+read 0xdeadbeef 40                # 坏地址 → ERR state=unmapped（不崩）
+read 0xfffffff007004000 180       # 384 B，首块 128 B + crc32
+readnext 80                       # 后续块，offset=128, frame=<seq>
+status                            # 原有命令仍正常
+```
+
+**安全性**：读路径用 `mmu_kvtop()`（ARM64 硬件 AT 地址翻译指令）：不取 pmap 锁、
+不会死锁；未映射地址由硬件报 fault，返回 0 → `ERR unmapped`，实测不 panic。
+**只支持内核态地址**（`0xffff...`）；用户态地址需 `copyin`，明确不支持。
+
+**回包**：`SXNU1R <session> <seq> READ OK state=ready len=N crc32=XXXXXXXX offset=O data=<hex> <crc>`。
+`data` 是 hex；一次最多 128 B 数据。`READNEXT` 用同一事务序号取后续块，
+主机按 `crc32` 校验整块重组结果。
+
+**`WRITE`**：同样实现但需要 boot-arg `qcom-usb-write=1` 才生效（默认拒绝，防止误改内存）。
+**`SYM`/`SYMS`**：内核符号表在模块里不可达，返回 `unsupported`；
+先从 kernelcache 离线查符号地址，再用 `READ` 读。
+
+**真机验证（l807 / SM8150 / iPadOS 17.7.11）**：内核头 magic 正确、坏地址不崩、
+分块正确、`STATUS` 向后兼容；20 项主机测试全过。
 
 ---
 
