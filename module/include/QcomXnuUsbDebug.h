@@ -124,6 +124,12 @@ uint8_t qcom_usb_debug_serial_getc(void);
 /* Queue one byte for the kernel debugger. kdp_getc() only tests for a
  * non-zero value, so this is how a bare 'c' reaches kdp_connection_wait(). */
 int qcom_usb_debug_kdp_push(uint8_t c);
+/* kb-28: raise/lower the KDP reply transmit gate. kdp_serial_send() brackets
+ * kdp_serialize_packet() with these so the pe_serial CDC backend forwards
+ * during reply framing only; outside that window it stays a no-op, which is
+ * what keeps kprintf from re-entering the USB write path. */
+void qcom_usb_debug_kdp_tx_mode(int on);
+int qcom_usb_debug_kdp_tx_active(void);
 void qcom_usb_debug_serial_poll(void);
 /* PSCI SYSTEM_RESET; does not return. Used by the control REBOOT path
  * because reboot_kernel() stalls in vfs_unmountall() on this port. */

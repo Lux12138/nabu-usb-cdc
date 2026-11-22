@@ -50,6 +50,29 @@ extern void Debugger(const char *message) __attribute__((weak_import));
  * long before the ring implementation further down. */
 static volatile uint32_t kdp_rx_armed;
 static uint32_t kdp_rx_used;
+/* kb-28 (T41-c #1): bytes dropped because the ring was full. Lives here for
+ * the same reason as the two above -- KDPPUSH and DEBUGGER report it and both
+ * are compiled before the ring implementation. */
+static uint32_t kdp_rx_overflow;
+/* kb-28 (T41-c): KDP reply transmit gate.
+ *
+ * The pe_serial CDC backend is receive-only on purpose: forwarding
+ * uart_putc() into qcom_usb_debug_putc() re-enters the USB write path from
+ * inside kprintf (interrupts off, kprintf_lock held) and boot died twice that
+ * way. But KDP replies travel exactly that path:
+ *
+ *   kdp_serial_send -> pal_serial_putc_nocr -> serial_putc -> uart_putc
+ *     -> uart_putc_device -> gPESF -> nabu_cdc_transmit_data -> (dropped)
+ *
+ * So a CONNECT reply, or any request/response payload, was thrown away. The
+ * console printed "Connected to remote debugger." and then the host saw
+ * nothing -- measured on kb-27, where the capture stops right there.
+ *
+ * This flag narrows the forwarding to exactly that case: kdp_serial_send()
+ * raises it around kdp_serialize_packet(), so only KDP framing bytes reach
+ * the transmit hook. kprintf never takes it, which keeps the re-entry hazard
+ * out of the boot path -- the original reason the hook was a no-op. */
+static volatile uint32_t kdp_tx_mode;
 
 #define NATIVE_CONTEXT_BYTES DWC3_CONTEXT_BYTES
 #define GCC_BYTES QUD_GCC_BYTES
@@ -1039,7 +1062,38 @@ static int poll_owned(void)
         native.status.core_result = ret;
         native.status.error = native.deadline_active && native.deadline_expired ? QCOM_USB_DEBUG_DEADLINE_EXPIRED :
                                                       QCOM_USB_DEBUG_CORE_POLL_FAILED;
-        native.status.phase = QCOM_USB_DEBUG_IO_FAILED;
+        /* kb-28 (T41-a / T41-b): do NOT latch the phase while the kernel is
+         * inside the debugger.
+         *
+         * phase = IO_FAILED is a one-way door: nothing in this file ever
+         * restores it (only stop/init paths set a different phase, and neither
+         * runs from the debugger). Every later qcom_usb_debug_write() then
+         * short-circuits on the phase check and only backlog_write()s, so all
+         * output is absorbed into the 4 MiB ring and never reaches the wire.
+         *
+         * That is the most likely explanation for the "random silence" T41-b
+         * found: the entry banner is the first dense burst after the trap, so
+         * the controller is most likely mid-transfer or mid-EP0 when the other
+         * cores get halted, and one transient dwc3_poll() error would kill the
+         * rest of the session's output. kb-17u/kb-17s/kb-17q stopped at
+         * "Options.....    Type"; the identical kb-17v rerun printed all four
+         * lines and "Continuing...".
+         *
+         * A transient error in this context is recoverable: the next
+         * dwc3_poll() rearms EP_OUT and retries the IN transfer. So record the
+         * error, skip the latch, and report failure to this one caller only.
+         * Outside the debugger the old behaviour stays -- a real controller
+         * fault must still stop the worker instead of polling a dead core. */
+        if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+            native.status.phase = QCOM_USB_DEBUG_IO_FAILED;
+        } else {
+            /* io_failed is just as one-way as phase, and it is the other half
+             * of this same test, so clear it too -- otherwise the guard above
+             * would never fire again: the very next call would take the
+             * `|| native.status.io_failed` branch and short-circuit. The
+             * counters keep the evidence for later inspection. */
+            native.status.io_failed = 0;
+        }
         return 0;
     }
     return 1;
@@ -2058,6 +2112,8 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             (void)sxnu_control_writer_decimal(&writer, queued);
             (void)sxnu_control_writer_text(&writer, " pending=");
             (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_used);
+            (void)sxnu_control_writer_text(&writer, " ovf=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_overflow);
             reply_bytes = sxnu_control_reply_finish(&writer);
         }
         /* Arm only now: the trap is next, so the byte storms that would have
@@ -2078,6 +2134,33 @@ debugger_done:
         const uint8_t *tok[2]; size_t len[2];
         struct sxnu_control_writer writer;
         unsigned queued = 0, rejected = 0;
+        /* kb-28 (T41-c #2): KDPPUSH with no argument resets the ring.
+         *
+         * A chunk lost mid-frame (reply timeout, ring full, host bug) leaves
+         * kdp_unserialize_packet() parked in DS_READING with a half frame in
+         * dsBuffer. The next frame's 0xFA is then mistaken for the CRC
+         * separator, so that whole frame is consumed too and only the one after
+         * it survives. The state machine does recover by itself, but one frame
+         * late -- and on this console a lost frame looks exactly like a hung
+         * kernel.
+         *
+         * There is no way to clear dsState from here (it is file-static in
+         * kdp_serial.c). But a lone 0xFB does it: in DS_READING it returns
+         * DS_WAITSTART whether or not dsHaveCRC was set (with CRC set the
+         * comparison simply fails and it still resets), and in DS_WAITSTART it
+         * is ignored. So one END byte is a safe, unconditional resync. */
+        if (!frame->arg_bytes) {
+            uint32_t before = kdp_rx_overflow;
+            (void)qcom_usb_debug_kdp_push(0xFB);
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " reset used=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_used);
+            (void)sxnu_control_writer_text(&writer, " ovf=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)(kdp_rx_overflow - before));
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
         if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
             (len[0] & 1u) || len[0] / 2u > QUD_DIAG_CHUNK) {
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
@@ -2098,7 +2181,9 @@ debugger_done:
         (void)sxnu_control_writer_text(&writer, " rejected=");
         (void)sxnu_control_writer_decimal(&writer, rejected);
         (void)sxnu_control_writer_text(&writer, " used=");
-        (void)sxnu_control_writer_decimal(&writer, (uint32_t)qcom_usb_debug_serial_pending());
+        (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_used);
+        (void)sxnu_control_writer_text(&writer, " ovf=");
+        (void)sxnu_control_writer_decimal(&writer, (uint32_t)kdp_rx_overflow);
         reply_bytes = sxnu_control_reply_finish(&writer);
     kdppush_done:
         break;
@@ -2297,17 +2382,26 @@ static uint32_t kdp_rx_head, kdp_rx_tail;
  * KDP ring only, so the keyboard gets -1 and stops consuming. The keyboard has
  * never been verified working on this board, KDP is the actual goal. */
 
-static void
+static int
 kdp_rx_push(uint8_t c)
 {
     uint64_t daif;
+    int stored = 0;
     __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
     if (kdp_rx_used < SERIAL_KDP_RX_BYTES) {
         kdp_rx[kdp_rx_head] = c;
         kdp_rx_head = (kdp_rx_head + 1u) % SERIAL_KDP_RX_BYTES;
         kdp_rx_used++;
+        stored = 1;
+    } else {
+        /* kb-28 (T41-c #1): a full ring used to drop the byte silently while
+         * qcom_usb_debug_kdp_push() still returned 1, so KDPPUSH reported
+         * "queued=<everything>" and the host had no way to notice the frame was
+         * short. Count it and report it. */
+        kdp_rx_overflow++;
     }
     __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+    return stored;
 }
 
 /* Forward declaration: the DEBUGGER verb queues bytes before trap entry. */
@@ -2441,7 +2535,12 @@ qcom_usb_debug_serial_available(void)
 
 /* kb-17u: queue one byte for the debugger. kdp_getc() only tests for a
  * non-zero value, so a single character is enough to deliver 'c' without
- * pretending that console traffic is console input. */
+ * pretending that console traffic is console input.
+ *
+ * kb-28 (T41-c #1): returns 0 when the byte did NOT make it into the ring.
+ * It used to return 1 unconditionally, so a full ring produced a KDPPUSH
+ * reply claiming "queued=24" for a chunk that had dropped bytes on the floor.
+ * The caller now counts real acceptances, and reports overflow separately. */
 int
 qcom_usb_debug_kdp_push(uint8_t c)
 {
@@ -2450,8 +2549,7 @@ qcom_usb_debug_kdp_push(uint8_t c)
      * is nul-terminated -- a 71-byte CONNECT frame contains a dozen of them.
      * Rejecting 0x00 here silently corrupted every frame we tried to stage
      * (T38-c). Push unconditionally; the caller decides what to send. */
-    kdp_rx_push(c);
-    return 1;
+    return kdp_rx_push(c);
 }
 
 unsigned int
@@ -2461,6 +2559,25 @@ qcom_usb_debug_serial_ready(void)
      * the 4 MiB CPU backlog.  Reporting "no room" would let uart_putc_device()
      * spin forever if the host stops draining the 16 KiB DWC3 ring. */
     return 1u;
+}
+
+/* kb-28 (T41-c): raise/lower the KDP reply transmit gate.
+ *
+ * Called from kdp_serial_send() in osfmk/kdp/kdp_udp.c, wrapped around
+ * kdp_serialize_packet(). While raised, the pe_serial CDC backend's
+ * transmit_data() forwards to qcom_usb_debug_putc(); the rest of the time it
+ * stays a no-op, which is what keeps kprintf from re-entering the USB write
+ * path. See the kdp_tx_mode comment for the full story. */
+void
+qcom_usb_debug_kdp_tx_mode(int on)
+{
+    __atomic_store_n(&kdp_tx_mode, on ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
+int
+qcom_usb_debug_kdp_tx_active(void)
+{
+    return __atomic_load_n(&kdp_tx_mode, __ATOMIC_ACQUIRE) != 0;
 }
 
 size_t
