@@ -127,6 +127,13 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_PERFCLEAR, "PERFCLEAR", 1);
     check_accept(SXNU_CONTROL_VERB_GPUFREQ, "GPUFREQ", 1);
     check_accept(SXNU_CONTROL_VERB_GPUHWCG, "GPUHWCG on", 1);
+    check_accept(SXNU_CONTROL_VERB_GPUPROFILE, "GPUPROFILE", 1);
+    check_accept(SXNU_CONTROL_VERB_GPUPROFILE, "GPUPROFILE status", 1);
+    check_accept(SXNU_CONTROL_VERB_GMUSTATE, "GMUSTATE", 1);
+    check_accept(SXNU_CONTROL_VERB_DISPREGS, "DISPREGS", 1);
+    check_accept(SXNU_CONTROL_VERB_FLIPNOW, "FLIPNOW", 1);
+    check_accept(SXNU_CONTROL_VERB_SMMUDUMP, "SMMUDUMP", 1);
+    check_accept(SXNU_CONTROL_VERB_DEBUGGER, "DEBUGGER", 1);
 
     /* Legacy verbs keep the argument-free form. */
     check("HELLO", 1, SXNU_CONTROL_VERB_HELLO, "");
@@ -163,6 +170,13 @@ main(void)
     check("PERFCLEAR", 1, SXNU_CONTROL_VERB_PERFCLEAR, "");
     check("GPUFREQ", 1, SXNU_CONTROL_VERB_GPUFREQ, "");
     check("GPUHWCG off", 1, SXNU_CONTROL_VERB_GPUHWCG, "off");
+    check("GPUPROFILE", 1, SXNU_CONTROL_VERB_GPUPROFILE, "");
+    check("GPUPROFILE status", 1, SXNU_CONTROL_VERB_GPUPROFILE, "status");
+    check("GMUSTATE", 1, SXNU_CONTROL_VERB_GMUSTATE, "");
+    check("DISPREGS", 1, SXNU_CONTROL_VERB_DISPREGS, "");
+    check("FLIPNOW", 1, SXNU_CONTROL_VERB_FLIPNOW, "");
+    check("SMMUDUMP", 1, SXNU_CONTROL_VERB_SMMUDUMP, "");
+    check("DEBUGGER", 1, SXNU_CONTROL_VERB_DEBUGGER, "");
 
     /* Unknown verbs stay inert. */
     check("BOGUS", 0, SXNU_CONTROL_VERB_INVALID, "");

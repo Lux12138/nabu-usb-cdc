@@ -23,6 +23,22 @@ extern uint32_t native_adreno_get_gpu_freq(uint32_t *requested_khz,
 extern uint32_t native_adreno_gpu_profile_start(uint32_t) __attribute__((weak_import));
 extern void native_adreno_gpu_profile_stop(void) __attribute__((weak_import));
 extern uint32_t native_adreno_gpu_profile_read(uint64_t *, uint32_t, uint32_t *, uint32_t *, uint32_t *) __attribute__((weak_import));
+
+/* kb-16: data symbols the drivers already export under their C names (verified
+ * with llvm-nm against the live kernel). A weak_import *data* symbol needs an
+ * address test (&sym == 0), which is what the handlers below do. */
+extern volatile uint32_t native_adreno_a6xx_stats[24] __attribute__((weak_import));
+extern volatile uint32_t native_legacy_transfer[8] __attribute__((weak_import));
+extern volatile uint32_t native_legacy_surfaces[14] __attribute__((weak_import));
+extern volatile uint32_t native_legacy_direct[17] __attribute__((weak_import));
+extern volatile uint32_t native_legacy_validation[6] __attribute__((weak_import));
+extern volatile uint32_t native_ufs_dpu_smmu[24] __attribute__((weak_import));
+extern volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
+
+/* kb-16a: XNU's debugger entry point. Debugger() takes the debugger trap and
+ * returns once the KDP session ends, so it is the supported way to bring KDP
+ * up on demand (panic() would not come back). */
+extern void Debugger(const char *message) __attribute__((weak_import));
 #include <kern/cpu_number.h>
 #include <pexpert/pexpert.h>
 
@@ -1821,6 +1837,225 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_GPUPROFILE: {
+        /* GPUPROFILE [1|0|status]: profile window control and state. No argument
+         * or "status" reports; "1" arms a 3000 ms window; "0" stops it. */
+        const uint8_t *tok[2]; size_t len[2];
+        unsigned argc = 0;
+        struct sxnu_control_writer writer;
+        uint32_t window_no = 0, jobs = 0, complete = 0;
+        if (&native_adreno_gpu_profile_read == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (frame->arg_bytes) {
+            argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+            if (argc == 1 && len[0] == 1u && tok[0][0] == '1') {
+                if (&native_adreno_gpu_profile_start == 0) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+                    break;
+                }
+                (void)native_adreno_gpu_profile_start(3000);
+                sxnu_control_writer_init(&writer, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+                (void)sxnu_control_writer_text(&writer, " state=armed ms=3000");
+                reply_bytes = sxnu_control_reply_finish(&writer);
+                break;
+            }
+            if (argc == 1 && len[0] == 1u && tok[0][0] == '0') {
+                if (&native_adreno_gpu_profile_stop == 0) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+                    break;
+                }
+                native_adreno_gpu_profile_stop();
+                sxnu_control_writer_init(&writer, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+                (void)sxnu_control_writer_text(&writer, " state=stopped");
+                reply_bytes = sxnu_control_reply_finish(&writer);
+                break;
+            }
+            if (!(argc == 1 && len[0] == 6u && tok[0][0] == 's' && tok[0][1] == 't' &&
+                  tok[0][2] == 'a' && tok[0][3] == 't' && tok[0][4] == 'u' && tok[0][5] == 's')) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        (void)native_adreno_gpu_profile_read(0, 0, &window_no, &jobs, &complete);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, complete ? " state=ready window=" : " state=void window=");
+        (void)sxnu_control_writer_decimal(&writer, window_no);
+        (void)sxnu_control_writer_text(&writer, " jobs=");
+        (void)sxnu_control_writer_decimal(&writer, jobs);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_GMUSTATE: {
+        /* GMUSTATE: the GPU service's own boot progression. native_adreno_a6xx_stats
+         * is written by NativeAdrenoService as bring-up advances, so this is a plain
+         * memory read -- the GPUCC MMIO that panicked in kb-13/14 is untouched. */
+        struct sxnu_control_writer writer;
+        if (&native_adreno_a6xx_stats[0] == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " step=");
+        (void)sxnu_control_writer_decimal(&writer, native_adreno_a6xx_stats[0]);
+        (void)sxnu_control_writer_text(&writer, " status=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[1], 8);
+        (void)sxnu_control_writer_text(&writer, " chip=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[10], 8);
+        (void)sxnu_control_writer_text(&writer, " fence=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[8], 8);
+        (void)sxnu_control_writer_text(&writer, " completed=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[9], 8);
+        (void)sxnu_control_writer_text(&writer, " cp=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[12], 8);
+        (void)sxnu_control_writer_text(&writer, " protect=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[13], 8);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_DISPREGS: {
+        /* DISPREGS: the display counters the heartbeat prints, read from the
+         * driver's exported arrays -- no MMIO, safe from any context. */
+        struct sxnu_control_writer writer;
+        if (&native_legacy_transfer[0] == 0 || &native_legacy_surfaces[0] == 0 ||
+            &native_legacy_direct[0] == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " name=mdp xfer=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[0]);
+        (void)sxnu_control_writer_text(&writer, " nswap=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_surfaces[1]);
+        (void)sxnu_control_writer_text(&writer, " nsurf=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_surfaces[0]);
+        (void)sxnu_control_writer_text(&writer, " sbytes=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_surfaces[2]);
+        (void)sxnu_control_writer_text(&writer, " nok=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[1]);
+        (void)sxnu_control_writer_text(&writer, " ncpy=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[5]);
+        (void)sxnu_control_writer_text(&writer, " nret=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[7]);
+        (void)sxnu_control_writer_text(&writer, " don=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_direct[12]);
+        (void)sxnu_control_writer_text(&writer, " skip=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_direct[10]);
+        (void)sxnu_control_writer_text(&writer, " amb=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_direct[11]);
+        (void)sxnu_control_writer_text(&writer, " lt=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_direct[13]);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_FLIPNOW: {
+        /* FLIPNOW: monotonic flip / transfer counters, so the host can tell a
+         * frozen composer from a slow one without reading the log ring. */
+        struct sxnu_control_writer writer;
+        if (&native_legacy_surfaces[0] == 0 || &native_legacy_transfer[0] == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " flips=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_surfaces[0]);
+        (void)sxnu_control_writer_text(&writer, " xfer=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[0]);
+        (void)sxnu_control_writer_text(&writer, " nval=");
+        (void)sxnu_control_writer_decimal(&writer,
+            (&native_legacy_validation[0] == 0) ? 0 : native_legacy_validation[0]);
+        (void)sxnu_control_writer_text(&writer, " nrej=");
+        (void)sxnu_control_writer_decimal(&writer,
+            (&native_legacy_validation[2] == 0) ? 0 : native_legacy_validation[2]);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_SMMUDUMP: {
+        /* SMMUDUMP: the display SMMU bank NativeUfs qualified at boot. Layout is
+         * fixed by NativeUfs.cpp dpuDisplayBankEnable(): [0] summary bitfield,
+         * [4] slot|bank<<16, [5] SMR, [6] S2CR, [7] CBAR, [9] SCTLR. */
+        struct sxnu_control_writer writer;
+        if (&native_ufs_dpu_smmu[0] == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (&native_ufs_dpu_state == 0 || native_ufs_dpu_state == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "notready");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_state, 8);
+        (void)sxnu_control_writer_text(&writer, " summary=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[0], 8);
+        (void)sxnu_control_writer_text(&writer, " idr0=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[2], 8);
+        (void)sxnu_control_writer_text(&writer, " idr1=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[3], 8);
+        (void)sxnu_control_writer_text(&writer, " smr=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[5], 8);
+        (void)sxnu_control_writer_text(&writer, " s2cr=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[6], 8);
+        (void)sxnu_control_writer_text(&writer, " cbar=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[7], 8);
+        (void)sxnu_control_writer_text(&writer, " sctlr=");
+        (void)sxnu_control_writer_hex(&writer, native_ufs_dpu_smmu[9], 8);
+        (void)sxnu_control_writer_text(&writer, " slot=");
+        (void)sxnu_control_writer_decimal(&writer, native_ufs_dpu_smmu[4] & 0xffffu);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_DEBUGGER: {
+        /* DEBUGGER [hexbytes]: enter the kernel debugger.
+         *
+         * The optional hex argument is queued into the KDP ring BEFORE the trap,
+         * because kdp_connection_wait() reads it through kdp_getc() on entry. A
+         * bare 'c' (0x63) there makes the debugger print "Continuing..." and
+         * return instead of waiting forever for a KDP packet.
+         *
+         * The reply is queued first; the trap then blocks this thread until the
+         * debugger session ends. */
+        const uint8_t *tok[2]; size_t len[2];
+        unsigned queued = 0;
+        if (&Debugger == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (frame->arg_bytes) {
+            unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+            if (argc != 1 || (len[0] & 1u) || len[0] / 2u > 32u) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+            for (size_t i = 0; i < len[0] / 2u; i++) {
+                uint64_t byte = 0;
+                if (!sxnu_control_parse_hex(tok[0] + i * 2u, 2u, &byte)) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                    goto debugger_done;
+                }
+                queued += (unsigned)qcom_usb_debug_kdp_push((uint8_t)byte);
+            }
+        }
+        {
+            struct sxnu_control_writer writer;
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " state=entering queued=");
+            (void)sxnu_control_writer_decimal(&writer, queued);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+        }
+        Debugger("qcom_usb_debug");
+debugger_done:
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host
@@ -2037,6 +2272,48 @@ static uint32_t usb_serial_rx_head, usb_serial_rx_tail, usb_serial_rx_used;
 static uint32_t usb_serial_rx_overflow;
 static volatile uint8_t usb_serial_rx_kdp;
 
+/* kb-17u: the debugger gets its own ring.
+ *
+ * usb_serial_rx keeps its original meaning (SXNU1 text plus 0xFA-framed
+ * runs). kdp_rx carries only the bytes the debugger may consume. Keeping
+ * them apart matters: receive_ready() must not go true just because console
+ * traffic is flowing -- that is exactly what hung kprintf last time. */
+#define SERIAL_KDP_RX_BYTES 64u
+static uint8_t kdp_rx[SERIAL_KDP_RX_BYTES];
+static uint32_t kdp_rx_head, kdp_rx_tail, kdp_rx_used;
+
+static void
+kdp_rx_push(uint8_t c)
+{
+    uint64_t daif;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (kdp_rx_used < SERIAL_KDP_RX_BYTES) {
+        kdp_rx[kdp_rx_head] = c;
+        kdp_rx_head = (kdp_rx_head + 1u) % SERIAL_KDP_RX_BYTES;
+        kdp_rx_used++;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+/* Forward declaration: the DEBUGGER verb queues bytes before trap entry. */
+int qcom_usb_debug_kdp_push(uint8_t c);
+
+static int
+kdp_rx_pop(uint8_t *c)
+{
+    uint64_t daif;
+    int ok = 0;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #3" : "=r"(daif) :: "memory");
+    if (kdp_rx_used != 0) {
+        *c = kdp_rx[kdp_rx_tail];
+        kdp_rx_tail = (kdp_rx_tail + 1u) % SERIAL_KDP_RX_BYTES;
+        kdp_rx_used--;
+        ok = 1;
+    }
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+    return ok;
+}
+
 static void
 serial_rx_push(uint8_t c)
 {
@@ -2074,6 +2351,17 @@ qcom_usb_debug_serial_available(void)
     return native.status.phase == QCOM_USB_DEBUG_ACTIVE;
 }
 
+/* kb-17u: queue one byte for the debugger. kdp_getc() only tests for a
+ * non-zero value, so a single character is enough to deliver 'c' without
+ * pretending that console traffic is console input. */
+int
+qcom_usb_debug_kdp_push(uint8_t c)
+{
+    if (c == 0) return 0;
+    kdp_rx_push(c);
+    return 1;
+}
+
 unsigned int
 qcom_usb_debug_serial_ready(void)
 {
@@ -2086,13 +2374,17 @@ qcom_usb_debug_serial_ready(void)
 size_t
 qcom_usb_debug_serial_pending(void)
 {
-    return usb_serial_rx_used;
+    /* kdp_rx only: console traffic must never make receive_ready() true.
+     * See the note above kdp_rx_push(). */
+    return kdp_rx_used;
 }
 
 uint8_t
 qcom_usb_debug_serial_getc(void)
 {
     uint8_t c = 0;
+    /* Debugger path first, then the console ring. */
+    if (kdp_rx_pop(&c)) return c;
     (void)serial_rx_pop(&c);
     return c;
 }

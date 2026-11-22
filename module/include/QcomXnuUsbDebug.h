@@ -121,6 +121,9 @@ int qcom_usb_debug_serial_available(void);
 unsigned int qcom_usb_debug_serial_ready(void);
 size_t qcom_usb_debug_serial_pending(void);
 uint8_t qcom_usb_debug_serial_getc(void);
+/* Queue one byte for the kernel debugger. kdp_getc() only tests for a
+ * non-zero value, so this is how a bare 'c' reaches kdp_connection_wait(). */
+int qcom_usb_debug_kdp_push(uint8_t c);
 void qcom_usb_debug_serial_poll(void);
 /* PSCI SYSTEM_RESET; does not return. Used by the control REBOOT path
  * because reboot_kernel() stalls in vfs_unmountall() on this port. */

@@ -49,6 +49,12 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_PERFCLEAR,  /* PERFCLEAR -> drop the last snapshot         */
     SXNU_CONTROL_VERB_GPUFREQ,    /* GPUFREQ -> current GPU clock / vote          */
     SXNU_CONTROL_VERB_GPUHWCG,    /* GPUHWCG <on|off> -> runtime clock gating     */
+    SXNU_CONTROL_VERB_GPUPROFILE,/* GPUPROFILE [status] -> profile window state  */
+    SXNU_CONTROL_VERB_GMUSTATE,  /* GMUSTATE -> GPU boot step / fence / chip     */
+    SXNU_CONTROL_VERB_DISPREGS,  /* DISPREGS -> display counters (driver arrays) */
+    SXNU_CONTROL_VERB_FLIPNOW,   /* FLIPNOW -> flips / transfers / surfaces      */
+    SXNU_CONTROL_VERB_SMMUDUMP,  /* SMMUDUMP -> display SMMU bank / CB state     */
+    SXNU_CONTROL_VERB_DEBUGGER,  /* DEBUGGER -> enter the kernel debugger (KDP)  */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -199,6 +205,25 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'G' && text[1] == 'P' && text[2] == 'U' &&
         text[3] == 'H' && text[4] == 'W' && text[5] == 'C' && text[6] == 'G')
         return SXNU_CONTROL_VERB_GPUHWCG;
+    if (bytes == 10u && text[0] == 'G' && text[1] == 'P' && text[2] == 'U' &&
+        text[3] == 'P' && text[4] == 'R' && text[5] == 'O' && text[6] == 'F' &&
+        text[7] == 'I' && text[8] == 'L' && text[9] == 'E')
+        return SXNU_CONTROL_VERB_GPUPROFILE;
+    if (bytes == 8u && text[0] == 'G' && text[1] == 'M' && text[2] == 'U' &&
+        text[3] == 'S' && text[4] == 'T' && text[5] == 'A' && text[6] == 'T' &&
+        text[7] == 'E') return SXNU_CONTROL_VERB_GMUSTATE;
+    if (bytes == 8u && text[0] == 'D' && text[1] == 'I' && text[2] == 'S' &&
+        text[3] == 'P' && text[4] == 'R' && text[5] == 'E' && text[6] == 'G' &&
+        text[7] == 'S') return SXNU_CONTROL_VERB_DISPREGS;
+    if (bytes == 7u && text[0] == 'F' && text[1] == 'L' && text[2] == 'I' &&
+        text[3] == 'P' && text[4] == 'N' && text[5] == 'O' && text[6] == 'W')
+        return SXNU_CONTROL_VERB_FLIPNOW;
+    if (bytes == 8u && text[0] == 'S' && text[1] == 'M' && text[2] == 'M' &&
+        text[3] == 'U' && text[4] == 'D' && text[5] == 'U' && text[6] == 'M' &&
+        text[7] == 'P') return SXNU_CONTROL_VERB_SMMUDUMP;
+    if (bytes == 8u && text[0] == 'D' && text[1] == 'E' && text[2] == 'B' &&
+        text[3] == 'U' && text[4] == 'G' && text[5] == 'G' && text[6] == 'E' &&
+        text[7] == 'R') return SXNU_CONTROL_VERB_DEBUGGER;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -232,6 +257,12 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_PERFCLEAR: return "PERFCLEAR";
     case SXNU_CONTROL_VERB_GPUFREQ: return "GPUFREQ";
     case SXNU_CONTROL_VERB_GPUHWCG: return "GPUHWCG";
+    case SXNU_CONTROL_VERB_GPUPROFILE: return "GPUPROFILE";
+    case SXNU_CONTROL_VERB_GMUSTATE: return "GMUSTATE";
+    case SXNU_CONTROL_VERB_DISPREGS: return "DISPREGS";
+    case SXNU_CONTROL_VERB_FLIPNOW: return "FLIPNOW";
+    case SXNU_CONTROL_VERB_SMMUDUMP: return "SMMUDUMP";
+    case SXNU_CONTROL_VERB_DEBUGGER: return "DEBUGGER";
     default: return "";
     }
 }

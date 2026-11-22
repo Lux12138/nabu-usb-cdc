@@ -113,7 +113,12 @@ def main():
                    '_mmu_kvtop', '_phystokv', '_ml_io_unmap',
                    '_native_ufs_export_write', '_native_ufs_export_blocks',
                    '_native_ufs_export_first', '_native_ufs_log_open', '_native_ufs_log_sync',
-                   '_native_adreno_gpu_profile_start', '_native_adreno_gpu_profile_stop', '_native_adreno_gpu_profile_read', '_native_adreno_set_hwcg', '_native_adreno_get_gpu_freq'}
+                   '_native_adreno_gpu_profile_start', '_native_adreno_gpu_profile_stop', '_native_adreno_gpu_profile_read', '_native_adreno_set_hwcg', '_native_adreno_get_gpu_freq',
+                   '_native_adreno_a6xx_stats',
+                   '_native_legacy_transfer', '_native_legacy_surfaces',
+                   '_native_legacy_direct', '_native_legacy_validation',
+                   '_native_ufs_dpu_smmu', '_native_ufs_dpu_state',
+                   '_Debugger'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in

@@ -675,6 +675,18 @@ def main():
                     print("用法: gpuhwcg <on|off>", flush=True)
             elif cmd == "perfclear":
                 do_verb("PERFCLEAR", arg=rest)
+            elif cmd == "gmustate":
+                do_verb("GMUSTATE", arg=rest)
+            elif cmd == "dispregs":
+                do_verb("DISPREGS", arg=rest)
+            elif cmd == "flipnow":
+                do_verb("FLIPNOW", arg=rest)
+            elif cmd == "debugger":
+                do_verb("DEBUGGER", arg=rest)
+            elif cmd == "smmudump":
+                do_verb("SMMUDUMP", arg=rest)
+            elif cmd == "gpuprofile":
+                do_verb("GPUPROFILE", arg=rest)
             elif cmd == "uptime":
                 do_verb("UPTIME", arg=rest)
             elif cmd == "rdblk":
@@ -778,6 +790,12 @@ HELP = """\
   perfclear         清除快照
   gpufreq           读 GPUCC PLL 寄存器
   gpuhwcg <on|off>  运行时开关 GPU 时钟门控
+  gpuprofile [1|0]  查询/开/停 GPU profile 窗口
+  gmustate          GPU 启动步进/状态/栅栏/chip id
+  dispregs          显示计数器（翻转/传输/接受/跳过）
+  flipnow           翻转计数（单调增，判断合成器是否卡死）
+  smmudump          显示 SMMU bank / SMR / S2CR / CBAR / SCTLR
+  debugger          进入内核调试器（触发 KDP，可返回）
   version            回报内核/SoC 身份
   readpanext [n]     取 READPA 的下一块
   read <addr> <len>  读内核虚拟地址（如 read 0xfffffff007004000 40）
