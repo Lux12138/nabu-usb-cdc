@@ -145,7 +145,47 @@ def connect_packet(key=0x1337C0DE, seq=0, reply_port=41140, exc_port=41145):
 
 
 def hostinfo_packet(key: int, seq: int) -> bytes:
-    return kdp_hdr(13, seq, 8, key)  # KDP_HOSTINFO
+    # KDP_HOSTINFO is request 2 (kdp_protocol.h enum: CONNECT=0, DISCONNECT=1,
+    # HOSTINFO=2). An earlier revision of this file said 13, which is
+    # KDP_EXCEPTION -- a notification, not a request. Nothing used the wrong
+    # value, but it would have been rejected had anything called it.
+    return kdp_hdr(2, seq, 8, key)
+
+
+def readmem64_packet(key: int, seq: int, addr: int, nbytes: int) -> bytes:
+    """KDP_READMEM64 (0x14): hdr(8) + address(8) + nbytes(4) = 20 B."""
+    return (kdp_hdr(0x14, seq, 20, key)
+            + addr.to_bytes(8, "little")
+            + nbytes.to_bytes(4, "little"))
+
+
+def writemem64_packet(key: int, seq: int, addr: int, data: bytes) -> bytes:
+    """KDP_WRITEMEM64 (0x15): hdr(8) + address(8) + nbytes(4) + data.
+
+    The reply is hdr(8) + error(4) = 12 bytes, with no data echoed back --
+    kdp.c:kdp_writemem64() sets rp->hdr.len = sizeof(*rp) and returns only
+    KDPERR_ACCESS(nbytes, cnt).
+    """
+    return (kdp_hdr(0x15, seq, 20 + len(data), key)
+            + addr.to_bytes(8, "little")
+            + len(data).to_bytes(4, "little")
+            + data)
+
+
+def disconnect_packet(key: int, seq: int) -> bytes:
+    """KDP_DISCONNECT (1): hdr only, 8 bytes."""
+    return kdp_hdr(1, seq, 8, key)
+
+
+def reboot_packet(key: int, seq: int) -> bytes:
+    """KDP_REBOOT: request **0x13**, not 13.
+
+    The dispatch table in kdp.c labels its entries in hexadecimal
+    (/*13 */ kdp_reboot), so decimal 13 is 0x0d and lands on kdp_unknown.
+    Measured on hardware (kb-35): 0x0d answered "kdp_unknown request d",
+    0x13 reset the board back to recovery.
+    """
+    return kdp_hdr(0x13, seq, 8, key)
 
 
 def main(argv):

@@ -546,6 +546,93 @@ def main():
                                       "..." if len(raw) > 16 else ""))
         return True
 
+    # ---- live KDP session helpers -------------------------------------------
+    # Once the kernel is in the debugger the SXNU1 control channel stops
+    # answering, so these build KDP packets and hand them to cmd_kdpraw. The
+    # kernel side is unchanged: kdp_writemem64() has always been there, it just
+    # had no way to be driven from this console.
+    kdp_live = {"seq": 1, "key": 0x1337C0DE}
+
+    def kdp_send_packet(pkt, label):
+        """Frame one KDP packet, write it, and report what went out."""
+        try:
+            import kdp_frame as kf
+        except ImportError:
+            log("! kdp_frame.py 不在 tools/ 下")
+            return False
+        fr = kf.serial_frame(kf.net_packet(pkt))
+        sess.send(fr)
+        log("kdplive TX %s req=0x%02x seq=%d len=%d frame=%d B"
+            % (label, pkt[0], pkt[1], int.from_bytes(pkt[2:4], "little"), len(fr)))
+        return True
+
+    def cmd_kdpwrite(args):
+        """kdpwrite <hexva> <hexbytes>  -- KDP_WRITEMEM64 while in the debugger.
+
+        Needs the kernel to be inside kdp_handler already (see `kdp enter`), and
+        the sequence number must match kdp's exception_seq exactly, which is why
+        kdp_live["seq"] is threaded through every packet.
+        """
+        w = args.split()
+        if len(w) != 2:
+            log("用法: kdpwrite <hexva> <hexbytes>")
+            return False
+        try:
+            import kdp_frame as kf
+        except ImportError:
+            log("! kdp_frame.py 不在 tools/ 下")
+            return False
+        try:
+            addr = int(w[0], 16)
+            data = bytes.fromhex(w[1])
+        except ValueError:
+            log("! kdpwrite: 非法 hex")
+            return False
+        if not data:
+            log("! kdpwrite: 空数据")
+            return False
+        pkt = kf.writemem64_packet(kdp_live["key"], kdp_live["seq"], addr, data)
+        ok = kdp_send_packet(pkt, "WRITEMEM64")
+        if ok:
+            kdp_live["seq"] = (kdp_live["seq"] + 1) & 0xFF
+        return ok
+
+    def cmd_kdpread(args):
+        """kdpread <hexva> <nbytes>  -- KDP_READMEM64 while in the debugger."""
+        w = args.split()
+        if len(w) != 2:
+            log("用法: kdpread <hexva> <nbytes>")
+            return False
+        try:
+            import kdp_frame as kf
+        except ImportError:
+            log("! kdp_frame.py 不在 tools/ 下")
+            return False
+        try:
+            addr = int(w[0], 16)
+            n = int(w[1], 0)
+        except ValueError:
+            log("! kdpread: 非法参数")
+            return False
+        if not (0 < n <= 1024):
+            log("! kdpread: nbytes 必须 1..1024")
+            return False
+        pkt = kf.readmem64_packet(kdp_live["key"], kdp_live["seq"], addr, n)
+        ok = kdp_send_packet(pkt, "READMEM64")
+        if ok:
+            kdp_live["seq"] = (kdp_live["seq"] + 1) & 0xFF
+        return ok
+
+    def cmd_kdpreboot():
+        """KDP_REBOOT (0x13) -- PSCI reset back to recovery, no power cycle."""
+        try:
+            import kdp_frame as kf
+        except ImportError:
+            log("! kdp_frame.py 不在 tools/ 下")
+            return False
+        return kdp_send_packet(kf.reboot_packet(kdp_live["key"], kdp_live["seq"]),
+                               "REBOOT")
+
     def cmd_kdppush(hexstr):
         """Queue raw bytes into the KDP ring, splitting to fit the 127 B line.
 
@@ -796,6 +883,12 @@ def main():
                 rest = parts[1] if len(parts) > 1 else ""
                 if verb == "KDPRAW":
                     cmd_kdpraw(rest)
+                elif verb == "KDPWRITE":
+                    cmd_kdpwrite(rest)
+                elif verb == "KDPREAD":
+                    cmd_kdpread(rest)
+                elif verb == "KDPREBOOT":
+                    cmd_kdpreboot()
                 elif verb == "KDPPUSH":
                     cmd_kdppush(rest)
                 elif verb == "KDP":
@@ -856,6 +949,12 @@ def main():
                     rest = parts[1] if len(parts) > 1 else ""
                     if verb == "KDPRAW":
                         cmd_kdpraw(rest)
+                    elif verb == "KDPWRITE":
+                        cmd_kdpwrite(rest)
+                    elif verb == "KDPREAD":
+                        cmd_kdpread(rest)
+                    elif verb == "KDPREBOOT":
+                        cmd_kdpreboot()
                     elif verb == "KDPPUSH":
                         cmd_kdppush(rest)
                     elif verb == "KDP":
