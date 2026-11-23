@@ -118,7 +118,8 @@ def main():
                    '_native_legacy_transfer', '_native_legacy_surfaces',
                    '_native_legacy_direct', '_native_legacy_validation',
                    '_native_ufs_dpu_smmu', '_native_ufs_dpu_state',
-                   '_Debugger'}
+                   '_Debugger',
+                   '_gPhysBase', '_real_phys_size', '_cpu_ttep'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in

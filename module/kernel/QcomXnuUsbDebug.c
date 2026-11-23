@@ -2220,6 +2220,117 @@ debugger_done:
     kdppush_done:
         break;
     }
+    case SXNU_CONTROL_VERB_PTDUMP: {
+        /* PTDUMP <hexva>: walk the stage-1 kernel page tables and report the
+         * translation. A read-only verb -- it never writes a descriptor, never
+         * takes the pmap lock and never maps anything, so it is safe to call at
+         * any time (see the safety note above qud_pt_walk()).
+         *
+         * The reply carries the same state=/crc32=/data= shape as READ so the
+         * host can compare a page-table-derived PA against a hardware
+         * translation: 'readpa <pa> 16' must return the same bytes as
+         * 'read <va> 16'. That cross-check is the acceptance criterion. */
+        const uint8_t *tok[2]; size_t len[2];
+        uint64_t va = 0;
+        struct qud_pt_result r;
+        struct sxnu_control_writer writer;
+        uint8_t probe[16];
+        size_t got = 0;
+        int walked;
+
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+            !control_args_hex(tok[0], len[0], &va)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        memset(&r, 0, sizeof(r));
+        walked = qud_pt_walk(va, &r);
+        if (walked < 0) {
+            /* Carry the diagnosis in the error reply: a bare "unmapped" cost a
+             * whole board round on kb-42/kb-43 because it did not say WHERE the
+             * walk gave up. stage= names the exact branch (see qud_pt_result),
+             * root=/ttbr1= say which base was used, entry_pa= says which table
+             * entry was being read. */
+            struct sxnu_control_writer w2;
+            sxnu_control_writer_init(&w2, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&w2, frame->session, frame->seq, frame->verb, "ERR");
+            (void)sxnu_control_writer_text(&w2, " state=geometry stage=");
+            (void)sxnu_control_writer_decimal(&w2, r.stage);
+            (void)sxnu_control_writer_text(&w2, " root=0x");
+            (void)sxnu_control_writer_hex(&w2, r.root, 16);
+            (void)sxnu_control_writer_text(&w2, " ttbr1=0x");
+            (void)sxnu_control_writer_hex(&w2, r.ttbr1_mrs & UINT64_C(0x0000ffffffffffff), 16);
+            reply_bytes = sxnu_control_reply_finish(&w2);
+            break;
+        }
+        if (walked == 0 || !r.valid) {
+            struct sxnu_control_writer w2;
+            sxnu_control_writer_init(&w2, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&w2, frame->session, frame->seq, frame->verb, "ERR");
+            (void)sxnu_control_writer_text(&w2, " state=unmapped stage=");
+            (void)sxnu_control_writer_decimal(&w2, r.stage);
+            (void)sxnu_control_writer_text(&w2, " level=");
+            (void)sxnu_control_writer_decimal(&w2, r.level);
+            (void)sxnu_control_writer_text(&w2, " root=0x");
+            (void)sxnu_control_writer_hex(&w2, r.root, 16);
+            (void)sxnu_control_writer_text(&w2, " ttbr1=0x");
+            (void)sxnu_control_writer_hex(&w2, r.ttbr1_mrs & UINT64_C(0x0000ffffffffffff), 16);
+            (void)sxnu_control_writer_text(&w2, " src=");
+            (void)sxnu_control_writer_decimal(&w2, r.source);
+            (void)sxnu_control_writer_text(&w2, " t1sz=");
+            (void)sxnu_control_writer_decimal(&w2, r.t1sz);
+            (void)sxnu_control_writer_text(&w2, " tg1=");
+            (void)sxnu_control_writer_decimal(&w2, r.tg1);
+            (void)sxnu_control_writer_text(&w2, " psh=");
+            (void)sxnu_control_writer_decimal(&w2, r.page_shift);
+            (void)sxnu_control_writer_text(&w2, " ea=0x");
+            (void)sxnu_control_writer_hex(&w2, r.last_entry_pa, 16);
+            for (unsigned l = 0; l <= r.level; l++) {
+                (void)sxnu_control_writer_text(&w2, " e");
+                (void)sxnu_control_writer_decimal(&w2, l);
+                (void)sxnu_control_writer_char(&w2, '=');
+                (void)sxnu_control_writer_hex(&w2, r.entry[l], 16);
+            }
+            reply_bytes = sxnu_control_reply_finish(&w2);
+            break;
+        }
+        /* Prove the translation by reading through it. A mismatch between the
+         * page-table PA and the hardware's own answer would show up here. */
+        got = qud_diag_read_phys(r.pa & ~UINT64_C(0xf), probe, sizeof(probe));
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " va=0x");
+        (void)sxnu_control_writer_hex(&writer, va, 16);
+        (void)sxnu_control_writer_text(&writer, " pa=0x");
+        (void)sxnu_control_writer_hex(&writer, r.pa, 16);
+        (void)sxnu_control_writer_text(&writer, " level=");
+        (void)sxnu_control_writer_decimal(&writer, r.level);
+        (void)sxnu_control_writer_text(&writer, " block=");
+        (void)sxnu_control_writer_decimal(&writer, r.block);
+        (void)sxnu_control_writer_text(&writer, " ttbr1=0x");
+        (void)sxnu_control_writer_hex(&writer, r.ttbr1_mrs & UINT64_C(0x0000ffffffffffff), 16);
+        (void)sxnu_control_writer_text(&writer, " root=0x");
+        (void)sxnu_control_writer_hex(&writer, r.root, 16);
+        (void)sxnu_control_writer_text(&writer, " src=");
+        (void)sxnu_control_writer_decimal(&writer, r.source);
+        (void)sxnu_control_writer_text(&writer, " t1sz=");
+        (void)sxnu_control_writer_decimal(&writer, r.t1sz);
+        (void)sxnu_control_writer_text(&writer, " tg1=");
+        (void)sxnu_control_writer_decimal(&writer, r.tg1);
+        (void)sxnu_control_writer_text(&writer, " psh=");
+        (void)sxnu_control_writer_decimal(&writer, r.page_shift);
+        for (unsigned l = 0; l <= r.level; l++) {
+            (void)sxnu_control_writer_text(&writer, " e");
+            (void)sxnu_control_writer_decimal(&writer, l);
+            (void)sxnu_control_writer_char(&writer, '=');
+            (void)sxnu_control_writer_hex(&writer, r.entry[l], 16);
+        }
+        (void)sxnu_control_writer_text(&writer, " probe=");
+        for (size_t i = 0; i < got; i++)
+            (void)sxnu_control_writer_hex(&writer, probe[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host

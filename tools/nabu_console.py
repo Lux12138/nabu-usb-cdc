@@ -521,6 +521,31 @@ def main():
             f.write(data)
         log("DUMP OK %s: %d B / %d chunks crc=%08x" % (outpath, len(data), chunks, got_crc))
 
+    def cmd_ptdump(arg):
+        """ptdump <va> [<va> ...]  -- walk stage-1 page tables for each VA.
+
+        The kernel answers with the translation it derived from TTBR1_EL1 plus a
+        16-byte probe read through that PA, so a single command proves the walk:
+        'ptdump <va>' then 'readpa <pa> 16' must return identical bytes. Accepts
+        a symbol name as well, because typing 0xfffffff007004000 by hand is how
+        you end up probing the wrong address. Every token is resolved
+        independently so one bad name does not abort the rest."""
+        for token in arg.split():
+            if token.lower().startswith("0x") or (token and token[0].isdigit()):
+                try:
+                    addr = int(token, 16)
+                except ValueError:
+                    log("! ptdump: 非法地址 %r" % token)
+                    continue
+            else:
+                addr, err = resolve_addr(token)
+                if addr is None:
+                    log("! ptdump: " + err)
+                    continue
+            reply = send_cmd("PTDUMP", "0x%x" % addr)
+            if reply:
+                log("PTDUMP %s -> %s" % (token, reply))
+
     def cmd_kdpraw(hexstr):
         """Write raw bytes straight to the serial port, bypassing SXNU1.
 
@@ -893,6 +918,8 @@ def main():
                     cmd_kdppush(rest)
                 elif verb == "KDP":
                     do_kdp(rest)
+                elif verb == "PTDUMP":
+                    cmd_ptdump(rest)
                 elif verb == "SYM":
                     cmd_sym(rest)
                 elif verb == "SYMS":
@@ -959,6 +986,8 @@ def main():
                         cmd_kdppush(rest)
                     elif verb == "KDP":
                         do_kdp(rest)
+                    elif verb == "PTDUMP":
+                        cmd_ptdump(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":

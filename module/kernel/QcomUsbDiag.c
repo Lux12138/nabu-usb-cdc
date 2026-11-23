@@ -36,6 +36,39 @@
 extern uint64_t mmu_kvtop(uint64_t va);
 extern uintptr_t phystokv(uint64_t phys);
 
+/* RAM bounds, defined in osfmk/arm64/arm_vm_init.c and exported so the linear
+ * map can be bounds-checked before phystokv() -- that function panics on an
+ * illegal PA ("illegal PA: 0x...; phys base 0x..., size ..."), which inside the
+ * USB worker would take the machine down. Page-table pages always live in RAM,
+ * so a bounds check turns a bad table pointer into an ERR reply instead. */
+extern unsigned long gPhysBase;
+extern unsigned long real_phys_size;
+
+/* The kernel's own copy of the TTBR1 base address.
+ *
+ * arm_vm_init.c:1962/2151/2162 is the whole story:
+ *
+ *     cpu_ttep = kvtophys((vm_offset_t)cpu_tte);          // PA of the L1 table
+ *     set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);  // -> TTBR1_EL1
+ *     cpu_tte  = (tt_entry_t *)(phystokv(cpu_ttep));      // VA of that table
+ *
+ * so cpu_ttep *is* the walk root, and reading it is what XNU itself does
+ * (pmap.c:7772 uses pmap->ttep, the same value).
+ *
+ * This variable exists because of a measured failure, not by preference: on
+ * kb-42 `mrs TTBR1_EL1` produced a value that failed the walk's first check, so
+ * every address -- including kernel text that READ reads happily -- came back
+ * "unmapped". The variable was verified live before being trusted: `var
+ * _cpu_ttep` = 0x00000000cae35000, and a manual walk started from that PA
+ * (readpa 0xcae35600 -> L1 descriptor 0x20000000cae36003 -> L2 entry at
+ * 0xcae361c0 = 0xcae3f003 -> L3 entry at 0xcae3fe48 = 0x0060000000c2fc9683 ->
+ * page 0xc2fc9108, whose contents equal `var _gPhysBase`) reproduces the
+ * translation byte for byte. So the table is right and the register read is
+ * what was wrong.
+ *
+ * The mrs value is still taken and reported so a mismatch stays visible. */
+extern uint64_t cpu_ttep;
+
 /* One READ/READNEXT chunk: 128 bytes render as 256 hex characters, which fits
  * inside SXNU_CONTROL_REPLY_BYTES (512) together with the state/crc fields. */
 #define QUD_DIAG_CHUNK 192u   /* 384 hex chars + header < 512-byte reply cap */
@@ -486,6 +519,263 @@ static uint32_t
 qud_diag_cursor_length(void)
 {
     return qud_diag_cursor.length;
+}
+
+/* ---- PTDUMP: stage-1 page-table walk ------------------------------------
+ *
+ * Everything below is derived from registers and from RAM-resident tables; no
+ * page-table geometry is hardcoded. The two inputs are TTBR1_EL1 (kernel VA
+ * space) and TCR_EL1 (T1SZ = VA width, TG1 = granule), both read with mrs.
+ *
+ * Why TTBR1 and not TTBR0: kernel virtual addresses live in the high half, and
+ * XNU programs the kernel's root table into TTBR1_EL1 (osfmk/arm/pmap/pmap.c:
+ *7772 uses set_mmu_ttb() for user pmaps, which writes TTBR0_EL1; the comment at
+ * :738 states the kernel pmap's root page table "is always the same as TTBR1".
+ * Measured on kb-40: get_mmu_ttb() reads TTBR0_EL1, so a walker built on it
+ * would descend the *user* table and report unmapped for every 0xfffffff0…
+ * address.
+ *
+ * Why it is safe from the USB worker: it takes no pmap lock and never calls
+ * pmap_vtophys(). It reads raw 8-byte entries out of RAM through phystokv(),
+ * which is the same technique pmap_find_pa_nofault() uses for kernel_pmap
+ * (:6701, via mmu_kvtop) and KDP relies on. A bad table pointer cannot fault:
+ * every PA is bounds-checked against [gPhysBase, gPhysBase+real_phys_size)
+ * first, because phystokv() panics on an out-of-range PA.
+ *
+ * Known limitation, deliberate: without the pmap lock a concurrent unmap can
+ * make the walk see a half-updated hierarchy. The worst case is a stale or
+ * "unmapped" answer, never a crash, so the verb stays safe to call at any time.
+ *
+ * Geometry measured out of the kb-40 kernel image (pmap_table_level_info_4k at
+ * 0xfffffff00700ae00, pmap_pt_attr_4k at 0xfffffff0071c7af0) and cross-checked
+ * against TCR_EL1 at runtime:
+ *   pta_root_level = 1   (T0SZ_BOOT 26 -> (26-16)/9 = 1: the L0 table is skipped)
+ *   pta_max_level  = 3   pta_page_shift = 12   L1 index_mask = 0x3fc0000000
+ * The truncated L1 index (8 bits, not 9) is __ARM64_PMAP_SUBPAGE_L1__ + 4K:
+ * one TTBR covers 2^38 = 256GB, which is exactly
+ * VM_MIN_KERNEL_ADDRESS = 0xffffffe000000000. Deriving the root index width
+ * from T1SZ reproduces that mask, so the truncation needs no special case. */
+
+struct qud_pt_geom {
+    unsigned shift[4];      /* bit position of each level's index */
+    unsigned width[4];      /* index bits at each level */
+    unsigned root;          /* first level present in the hierarchy */
+    unsigned last;          /* leaf level (3 for both granules here) */
+    unsigned page_shift;    /* 12 for 4K, 14 for 16K */
+    unsigned t1sz;          /* raw TCR_EL1 T1SZ, for reporting */
+    unsigned tg1;           /* raw TCR_EL1 TG1, for reporting */
+};
+
+/* Fill geom from TCR_EL1 using the same formulas pmap.c uses to build its own
+ * tables (pmap_pt_attr_4k/16k: .pta_root_level = (T0SZ - 16) / per_level).
+ *
+ * Verified against the kb-40 kernel image: with T0SZ_BOOT = 26 the formula
+ * yields root = 1, and the resulting masks (L1 = bits 30..37, L2 = 21..29,
+ * L3 = 12..20) are byte-identical to the index_mask fields read out of
+ * pmap_table_level_info_4k at 0xfffffff00700ae00:
+ *   L1 0x0000003fc0000000   L2 0x000000003fe00000   L3 0x00000000001ff000
+ * The truncated 8-bit L1 index is __ARM64_PMAP_SUBPAGE_L1__ with a 4K granule
+ * (one TTBR covers 2^38 = 256GB, exactly VM_MIN_KERNEL_ADDRESS). Deriving it
+ * from T1SZ reproduces that without a special case.
+ *
+ * Returns 1 on success, 0 for a granule this walker does not model. */
+static int
+qud_pt_geometry(struct qud_pt_geom *g)
+{
+    uint64_t tcr = 0;
+    unsigned t1sz, va_bits, tg1, n;
+
+    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr) : : "memory");
+    t1sz = (unsigned)((tcr >> 16) & 0x3fu);     /* TCR_T1SZ_SHIFT == 16 */
+    tg1 = (unsigned)((tcr >> 30) & 0x3u);       /* TCR_TG1_GRANULE_SHIFT == 30 */
+    if (t1sz < 16u || t1sz > 40u) return 0;
+    g->t1sz = t1sz;
+    g->tg1 = tg1;
+
+    /* TG1 encoding -- READ THIS BEFORE "FIXING" IT.
+     *
+     * XNU does NOT use the architectural AArch64 values here. osfmk/arm64/
+     * proc_reg.h:850-856 defines, for the TTBR1 region:
+     *
+     *     TCR_TG1_GRANULE_16KB = 1 << 30   (field value 1)
+     *     TCR_TG1_GRANULE_4KB  = 2 << 30   (field value 2)
+     *     TCR_TG1_GRANULE_64KB = 3 << 30   (field value 3)
+     *
+     * which is the *inverted* mapping relative to the ARM ARM's 00=4K, 01=16K,
+     * 10=64K. This cost a full board round on kb-44: the register reports TG1=2,
+     * so the architectural reading says 4K, and an earlier revision of this
+     * function decoded it as 16K. Every downstream number then went wrong in a
+     * way that looked like a page-table problem: page_shift became 14, the root
+     * mask cleared 14 bits (0xcae35000 -> 0xcae34000), shift[] became
+     * {47,36,25,14}, the L1 index came out as 3 instead of 192, and the walk
+     * read an empty entry and reported stage=5.
+     *
+     * Decoded per XNU's own table: TG1==2 -> 4KB granule. */
+    if (tg1 == 2u) {            /* TCR_TG1_GRANULE_4KB */
+        g->page_shift = 12u;
+        g->shift[0] = 39u; g->shift[1] = 30u; g->shift[2] = 21u; g->shift[3] = 12u;
+    } else if (tg1 == 1u) {     /* TCR_TG1_GRANULE_16KB */
+        g->page_shift = 14u;
+        g->shift[0] = 47u; g->shift[1] = 36u; g->shift[2] = 25u; g->shift[3] = 14u;
+    } else {
+        return 0;               /* 64KB (3) or reserved (0): not modelled */
+    }
+
+    g->last = 3u;
+
+    /* Root level: the lowest level whose table is still smaller than the VA
+     * width, i.e. the first level where shift[n] < va_bits. This reproduces
+     * both of XNU's attrs without a per-granule special case:
+     *
+     *   4K,  T1SZ 26 -> va_bits 38: shift[0]=39 is NOT < 38, shift[1]=30 is
+     *                   -> root = 1, width = 38-30 = 8 bits  (0x3fc0000000)
+     *   16K, T1SZ 25 -> va_bits 39: shift[0]=47 is NOT < 39, shift[1]=36 is
+     *                   -> root = 1, width = 39-36 = 3 bits  (0x7000000000)
+     *
+     * The naive (T1SZ-16)/per_level formula happens to give 1 for 4K but 0 for
+     * 16K, which would send the walk through an L0 table the kernel never
+     * builds -- checked against pmap_pt_attr_16k, which hardcodes
+     * PMAP_TT_L1_LEVEL. The shift comparison is the rule that actually holds. */
+    va_bits = 64u - t1sz;
+    g->root = g->last;
+    for (n = 0; n <= g->last; n++) {
+        if ((unsigned)g->shift[n] < va_bits) { g->root = n; break; }
+    }
+    if ((unsigned)g->shift[g->root] >= va_bits) return 0;
+
+    for (n = 0; n <= g->last; n++) {
+        if (n < g->root) {
+            g->width[n] = 0;
+        } else if (n == g->root) {
+            g->width[n] = va_bits - (unsigned)g->shift[n];
+        } else {
+            g->width[n] = (unsigned)(g->shift[n - 1] - g->shift[n]);
+        }
+        if (g->width[n] > 16u) return 0;
+    }
+    return 1;
+}
+
+struct qud_pt_result {
+    uint64_t entry[4];      /* raw descriptor at each level visited */
+    unsigned level;         /* level at which the walk stopped      */
+    uint64_t pa;            /* translation of the queried VA        */
+    uint64_t root;          /* PA the walk actually started from    */
+    uint64_t ttbr1_mrs;     /* what mrs TTBR1_EL1 said, for reporting */
+    uint64_t last_entry_pa; /* PA of the last entry read            */
+    unsigned t1sz;          /* copy of geom, for the reply           */
+    unsigned tg1;
+    unsigned page_shift;
+    uint8_t valid;
+    uint8_t block;          /* leaf was a block descriptor, not L3  */
+    uint8_t source;         /* 1 = cpu_ttep variable, 2 = mrs fallback */
+    uint8_t stage;          /* where a failure happened:
+                             * 0 none, 1 geometry, 2 root empty,
+                             * 3 bad width, 4 entry read failed,
+                             * 5 entry invalid, 6 leaf not valid */
+};
+
+/* Read one 8-byte table entry from a RAM physical address.
+ *
+ * Uses qud_diag_read_phys() -- the ml_io_map window -- rather than
+ * phystokv(). Reason, measured on kb-42/kb-43: the same table page is readable
+ * through the READPA verb (readpa 0xcae35600 returned the L1 descriptor
+ * 0x20000000cae36003, and the whole manual walk produced gPhysBase's value),
+ * so the data is reachable; but a walk built on phystokv() answered "unmapped"
+ * for every address including kernel text. phystokv() derives a V=P address
+ * from gVirtBase while the kernel's linear window is actually built from the
+ * slid physmap_base, so for a page that sits only in the slid window the
+ * derived address is not the mapped one. ml_io_map() asks the pmap for a fresh
+ * mapping instead of assuming an offset, and it is the path READPA already
+ * exercises on every round.
+ *
+ * The bounds check stays: ml_io_map() on an absurd PA is still a bad idea, and
+ * a table pointer is only ever inside RAM. */
+static int
+qud_pt_read_entry(uint64_t table_pa, unsigned index, uint64_t *out)
+{
+    uint64_t pa;
+
+    if (!real_phys_size) return 0;
+    pa = table_pa + (uint64_t)index * 8u;
+    if (pa < (uint64_t)gPhysBase) return 0;
+    if ((pa - (uint64_t)gPhysBase) + 8u > (uint64_t)real_phys_size) return 0;
+    if (qud_diag_read_phys(pa, out, 8) != 8) return 0;
+    return 1;
+}
+
+/* Walk the stage-1 kernel hierarchy for va.
+ * Returns 1 for a translation (r->valid=1, r->pa filled), 0 when the VA is
+ * unmapped, -1 for a geometry this walker does not model. */
+static int
+qud_pt_walk(uint64_t va, struct qud_pt_result *r)
+{
+    struct qud_pt_geom g;
+    uint64_t table_pa, entry = 0;
+    unsigned level;
+
+    if (!r) return 0;
+    if (!qud_pt_geometry(&g)) { r->stage = 1; return -1; }
+
+    /* Root table: prefer the kernel's own cpu_ttep (arm_vm_init.c:1962), fall
+     * back to `mrs TTBR1_EL1` only when the variable is unset. Measured on
+     * kb-42: cpu_ttep = 0x00000000cae35000 walked correctly by hand, while the
+     * register read failed the first check for every address including kernel
+     * text. Both values are reported so a disagreement is never silent. */
+    __asm__ volatile("mrs %0, ttbr1_el1" : "=r"(r->ttbr1_mrs) : : "memory");
+    if (cpu_ttep) {
+        table_pa = cpu_ttep;
+        r->source = 1;
+    } else {
+        table_pa = r->ttbr1_mrs;
+        r->source = 2;
+    }
+    table_pa &= UINT64_C(0x0000ffffffffffff);          /* TTBR_BADDR_MASK */
+    table_pa &= ~((UINT64_C(1) << g.page_shift) - 1u);
+    r->root = table_pa;
+    r->t1sz = g.t1sz;
+    r->tg1 = g.tg1;
+    r->page_shift = g.page_shift;
+    if (!table_pa) { r->stage = 2; return 0; }         /* TTBR1 disabled */
+
+    for (level = g.root; level <= g.last; level++) {
+        const unsigned width = g.width[level];
+        const unsigned shift = g.shift[level];
+        unsigned index;
+
+        if (!width) { r->stage = 3; return 0; }
+        index = (unsigned)((va >> shift) & ((UINT64_C(1) << width) - 1u));
+        r->last_entry_pa = table_pa + (uint64_t)index * 8u;
+        if (!qud_pt_read_entry(table_pa, index, &entry)) { r->stage = 4; return 0; }
+        r->entry[level] = entry;
+        r->level = level;
+
+        if (level == g.last) {
+            /* L3 leaf: ARM_PTE_TYPE_VALID == 3, both low bits set. */
+            if ((entry & 3u) != 3u) { r->stage = 6; return 0; }
+            r->valid = 1;
+            r->pa = (entry & UINT64_C(0x0000fffffffff000)) |
+                    (va & ((UINT64_C(1) << g.page_shift) - 1u));
+            return 1;
+        }
+        if (!(entry & 1u)) { r->stage = 5; return 0; } /* ARM_TTE_VALID   */
+        if (entry & 2u) {                             /* table: descend  */
+            table_pa = entry & UINT64_C(0x0000fffffffff000);
+            continue;
+        }
+        /* Block descriptor: a leaf one level early -- 1GB at L1 and 2MB at L2
+         * for 4K, 64GB at L1 and 32MB at L2 for 16K. The PA comes from the
+         * entry's bits above this level's shift, the offset from the VA. */
+        {
+            const uint64_t block_mask = ~((UINT64_C(1) << shift) - 1u);
+            r->valid = 1;
+            r->block = 1;
+            r->pa = (entry & block_mask & UINT64_C(0x0000fffffffff000)) |
+                    (va & ~block_mask);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 #endif /* QCOM_USB_DIAG_C */
