@@ -266,6 +266,38 @@ qud_write_pa_allowed(uint64_t pa, size_t len)
     return 0;
 }
 
+/* ---- READPA: which physical addresses may be read ------------------------
+ *
+ * This whitelist exists because reading a PA that does not exist on the SoC
+ * wedges the USB worker permanently -- measured on kb-46: `readpa 0x3c0fc000 32`
+ * never returned, the CDC port stayed open, HELLO stopped answering, and with
+ * nabu-wdt-off=1 the board had to be power-cycled. See the hazard note above
+ * qud_diag_read_phys(): ml_io_map() cannot serve as an existence test because
+ * its allocation is KMA_NOFAIL, so a bogus PA yields a valid VA pointing at
+ * nothing and the memcpy takes a synchronous external abort.
+ *
+ * Two kinds of address are safe, and both are listed:
+ *   - the MMIO windows WRITEPA already trusts (a register block that exists)
+ *   - the XNU RAM range, checked at runtime against gPhysBase/real_phys_size
+ *     rather than hardcoded, because the base moves with the physmap slide
+ *
+ * Everything else is refused without touching ml_io_map. That turns a mistyped
+ * address from a bricking event into an "ERR state=denied" reply. */
+static int
+qud_read_pa_allowed(uint64_t pa, size_t len)
+{
+    if (!len) return 0;
+
+    /* RAM first: it is the common case (page tables, kernel data). */
+    if (real_phys_size) {
+        const uint64_t base = (uint64_t)gPhysBase;
+        const uint64_t end = base + (uint64_t)real_phys_size;
+        if (pa >= base && pa <= end && (uint64_t)len <= end - pa) return 1;
+    }
+    /* Then the same MMIO blocks WRITEPA is allowed to touch. */
+    return qud_write_pa_allowed(pa, len);
+}
+
 /* Write len bytes to a physical MMIO address through the cached device window.
  * Returns 1 on success, 0 on bad args, -1 when writes are boot-arg disabled,
  * -2 when the PA is outside the MMIO whitelist, -3 on mapping failure.
@@ -346,11 +378,18 @@ int qud_dump_ufs_available(void)
 }
 
 /* Enqueue a dump. Returns slot index 0..N-1, or -1 full, -2 unsupported,
- * -3 bad args. Only the worker calls native_ufs_export_write(). */
+ * -3 bad args, -4 PA not readable.
+ *
+ * The source range goes through the same physical whitelist READPA uses: the
+ * worker reads it with qud_diag_read_phys(), and a nonexistent PA there wedges
+ * the USB worker permanently (see the hazard note above that function). A dump
+ * of a mistyped address must be refused at enqueue time, not five ticks into
+ * the job. */
 int qud_dump_ufs_enqueue(uint64_t pa, uint32_t len, const uint8_t *tag, uint32_t taglen)
 {
     if (!qud_dump_ufs_available()) return -2;
     if (!len || (len & 0xfffu) || native_ufs_export_blocks() < (len / 4096u)) return -3;
+    if (!qud_read_pa_allowed(pa, len)) return -4;
     for (uint32_t i = 0; i < QUD_DUMP_SLOTS; i++) {
         struct qud_dump_slot *s = &qud_dump_slots[i];
         if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 0) continue;

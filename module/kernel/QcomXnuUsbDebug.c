@@ -1405,6 +1405,15 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
             break;
         }
+        /* Refuse a PA that is neither RAM nor a known MMIO block before any
+         * mapping happens. Measured on kb-46: reading a nonexistent PA wedged
+         * the USB worker for good (ml_io_map's KMA_NOFAIL allocation returns a
+         * valid VA for a PA that maps to nothing, and the memcpy never
+         * returns). One mistyped address should not cost a power cycle. */
+        if (!qud_read_pa_allowed(pa, (size_t)count)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "denied");
+            break;
+        }
         opened = qud_diag_read_begin(pa, (uint32_t)count, frame->seq, 1);
         if (opened != 1) {
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
@@ -1677,7 +1686,8 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         } else {
             (void)sxnu_control_writer_text(&writer, " ");
             (void)sxnu_control_writer_text(&writer,
-                slot == -1 ? "state=busy" : slot == -2 ? "state=unsupported" : "state=args");
+                slot == -1 ? "state=busy" : slot == -2 ? "state=unsupported" :
+                slot == -4 ? "state=denied" : "state=args");
         }
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
