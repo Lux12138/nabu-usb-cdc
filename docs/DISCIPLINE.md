@@ -184,6 +184,43 @@ O=<tree>/build/sheng-ufs/NativeUfs.o
 `pre-l475/NativeUfs.cpp` 等）。**`grep -rn` 会全部命中，让人以为有多个源。**
 真正的源是**不带后缀的那一个**：`NativeUfs.cpp`。
 
+### 2.2e 【驱动第二例】GPU 驱动的真源是 `UniXNU-nabu`，不是 `l738-device`
+
+上一节说驱动真源是 `l738-device/drivers/`。**这对 `NativeUfs` 成立，对 `NabuAdreno` 不成立。**
+
+`scripts/build-nabu-adreno-step1.py` 的源解析：
+
+```python
+SRC = ROOT / 'drivers' / 'NabuAdreno'          # tree/drivers/NabuAdreno
+if not SRC.exists():
+    SRC = Path('/root/merge/UniXNU-nabu/drivers/NabuAdreno')   # ← 实际走这条
+```
+
+而 `tree/drivers/` 里**没有 `NabuAdreno` 这个符号链接**（`tree.py` 只链 `components.toml` 里
+列出的组件，GPU 驱动走 `build-nabu-adreno-step1.py` 的独立路径）。所以：
+
+| 驱动 | 真源 |
+|---|---|
+| `NativeUfs`（`component:ShengUfs`）| `/root/merge/l738-device/drivers/NativeUfs` |
+| **`NabuAdreno`（`build-nabu-adreno-step1`）** | **`/root/merge/UniXNU-nabu/drivers/NabuAdreno`** |
+| 其它 `component:*` | 看 `tree/drivers/<name>` 的符号链接目标 |
+
+**⚠️ `l738-device/drivers/NabuAdreno` 和 `UniXNU-nabu/drivers/NabuAdreno` 内容曾经完全相同，
+所以改错那份看起来"改成功了"，但构建完全看不到。**
+
+**判据（改 GPU 驱动前必跑）：**
+
+```bash
+# 看脚本里的 SRC 解析
+grep -n "SRC = \|Path('/root/merge" <tree>/scripts/build-nabu-adreno-step1.py | head
+# 看对象被写到哪
+find <tree>/build -name "NativeAdrenoService.o" -printf "%TY-%Tm-%Td %TH:%TM %p
+"
+# 两者一致才是真源
+```
+
+**⇒ 改完必须 `diff -q` 确认两份一致，或者直接改 `UniXNU-nabu` 那份。**
+
 ### 2.3 XNU 源的三份 `.cache/xnu-work`
 
 | 路径 | 是编译输入？ |
@@ -339,3 +376,59 @@ python E:/nabu/tools/kernel_edit_guard.py object <unit>.o.json
 6. 不要盲试，用现成控制台读状态
 7. 不要自己下需求单
 8. 改源，不改产物
+
+---
+
+## 9. 2026-11-23 18:25 追加：本轮新增的四条红线
+
+### 9.1 `wsl bash -lc` 会卡住
+
+现在 `-lc`（login shell）加载 profile 会挂。**一律用**：
+
+```bash
+MSYS_NO_PATHCONV=1 wsl.exe --exec bash /mnt/e/nabu/tmp/x.sh      # 脚本
+MSYS_NO_PATHCONV=1 wsl.exe --exec bash -c '...'                  # 单行（无变量展开风险时）
+```
+
+### 9.2 每次重链接，BSS/data 符号地址都会变
+
+实测：`_kdebug_enable` 从 `0xc185a18`（kb-64）→ `0xc189a18`（kb-65），
+因为加了代码后 `.data`/`.bss` 布局变化。
+
+**⇒ 换内核包之后，任何"按地址读变量"的操作都必须先用
+`llvm-nm <新kernel.macho>` 重新查地址。** 用旧地址会读到别的变量，得出错误结论
+（我曾因此误判 `trace_wrap` 失效）。
+
+代码里的 `&符号` 引用不受影响（链接器解析）；**只有主机侧手工拼地址的
+`READ`/`WRITEPA` 才有这个问题**。
+
+### 9.3 `llvm-strings | grep -x "str"` 查不到带前导空格的字符串
+
+控制台输出里很多字符串是 `" state=..."` 带前导空格，`grep -x` 要求整行精确匹配
+⇒ **查不到**，会误判"没编译进去"。
+
+```bash
+# 错
+llvm-strings K | grep -cx "hfi_q"        # 0
+# 对
+llvm-strings K | grep -c "hfi_q"         # 1
+```
+
+### 9.4 单句柄 CDC：换工具就是破坏性操作
+
+**一个 boot 周期只有一次 open 机会。** 我连续用 sxnu_ctl → PowerShell → 手工 python
+→ bridge 轮流开关，第 4 次就 `PermissionError(13)` 锁死，只能断电。
+
+**⇒ 一个 tag、一个工具、跑到底。要换就复位。**
+
+**正确姿势**：`route_a_bridge.py` 复用 `nabu_console.Session`（reader 线程分流日志），
+不要用 `sxnu_ctl`（同步读会被 1MB 日志洪流淹没）。
+
+---
+
+## 10. 一句话（更新）
+
+> **改之前先读构建记录的 `"file"` 字段；它是产物就去改生成器；
+> 改完核对对象比源码新、符号真在对象里。五步全过才上板。**
+> **上板只用一个工具；换工具前先复位。**
+> **换内核包后按地址读任何变量之前，先 `llvm-nm` 重查地址。**
