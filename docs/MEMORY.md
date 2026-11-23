@@ -634,7 +634,7 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 | **59** | **`QCOM USB LOSS contention=` 是真丢字节**，`dropped = overflow + contended`（`QcomUsbBuffer.h:73-77`）。**`STATUS rxo=0` 只代表控制环没溢出，不代表广播日志零丢失** |
 | **60** | **`native_ufs_block_reads` 不是块数**，是 `RootWindowRead.h:53` 的窗口 copy **迭代次数**（每次 while 迭代调一次 `ops.copy`）。**不能乘 4096 当字节数** |
 | **61** | **`native_ufs_read_ticks` 是全局累计值**，跨所有读者；**不能把某窗口的增量全算在单个进程头上**，只能作趋势证据 |
-| **62** | **在白名单里 ≠ 现在能读。** kb-72：`readpa 0x0105c000`（GCC，**白名单内**）照样卡死 worker，日志与 HELLO 同时停。全因是「时钟域此刻是否是开的」静态表无从得知。**已把 GCC 移出读白名单**（`QcomUsbDiag.c`，理由与当初撤 SMMU 一致）|
+| **62** | **在白名单里 ≠ 现在能读。** kb-72：`readpa 0x0105c000`（GCC，**白名单内**）照样卡死 worker，日志与 HELLO 同时停。全因是「时钟域此刻是否是开的」静态表无从得知。**GCC 已在 kb-73 移出、kb-75 临时放回做二分**——用前先看当前白名单状态 |
 | **63** | **CTL_FLUSH（`0xae02018`）是自清零寄存器。** 驱动每帧写 `0x3`（`NativeLegacyDisplay.cpp:535`），写前必须读到 `0`（`:506`）。**写完立刻 `READPA` 读回 `0` 是成功（已消费），不是失败。** 拿它做 WRITEPA 值变化验证最安全 |
 | **64** | **不要用 READPA 探测未知寄存器。** 正确方法是**从驱动源码里找驱动自己会写的寄存器**（如 `nabu_wdt_pet()` 写 WDT `+0x08`、`flip()` 写 `CTL_FLUSH`），用源码证据定目标。kb-72 的卡死就是"探测"方法本身的错，不是地址选得不巧 |
 | **65** | **两种失效模式要分清**：① `open` 成功但 OUT 死（IN 仍通，日志还在流）= 第二次 open 同一 boot；② IN/OUT 全死（日志停更）= worker 卡在 MMIO。判据分别是「HELLO 有无回复」和「`com.bin` 是否还在长」|
