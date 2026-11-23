@@ -1509,6 +1509,53 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (panic)("nabu: PANICTRIG requested by host");
         break;   /* not reached */
     }
+    case SXNU_CONTROL_VERB_STACKSHOT: {
+        /* STACKSHOT: capture every thread's stack into the kernel buffer.
+         *
+         * T48: the native panic-time stackshot is dead on arm64
+         * (panic_stackshot_to_disk_enabled() returns FALSE unconditionally and has
+         * no caller), but the *online* capture path is fully exported and used by
+         * bsd/kern/stackshot.c:613 -- kern_stack_snapshot_with_reason() fills
+         * kernel_stackshot_buf with STACKSHOT_SAVE_IN_KERNEL_BUFFER.
+         *
+         * That call refuses to overwrite an existing snapshot (KERN_MEMORY_PRESENT),
+         * so this verb reports state=present instead of clobbering. Retrieval is a
+         * separate step: kernel_stackshot_buf + kernel_stackshot_buf_size are
+         * exported, so the host can read them with READ/READPA, or a later verb can
+         * stage them into the UFS export region.
+         *
+         * NOT gated: this only reads kernel state and allocates one buffer; it does
+         * not write memory the kernel owns or touch hardware. */
+        struct sxnu_control_writer writer;
+        extern int kern_stack_snapshot_with_reason(char *reason);
+        extern void *kernel_stackshot_buf;
+        extern int kernel_stackshot_buf_size;
+        int rc;
+
+        if (&kern_stack_snapshot_with_reason == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        rc = kern_stack_snapshot_with_reason("nabu-console");
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+            rc == 0 ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, rc == 0 ? " state=captured rc=0" : " state=failed rc=");
+        if (rc != 0) {
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)rc);
+        }
+        /* Report where the snapshot landed either way -- on the "already present"
+         * error the old snapshot is still there and still worth reading. */
+        {
+            uint64_t buf = (uint64_t)(uintptr_t)kernel_stackshot_buf;
+            (void)sxnu_control_writer_text(&writer, " buf=0x");
+            (void)sxnu_control_writer_hex(&writer, buf, 16);
+            (void)sxnu_control_writer_text(&writer, " size=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)kernel_stackshot_buf_size);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_READUFS: {
         /* READUFS <hexrel> [<hexoffset>]: read the diagnostic log window back off
          * the medium. This is the read side of the landing path -- without it the

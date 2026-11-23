@@ -546,6 +546,26 @@ def main():
             if reply:
                 log("PTDUMP %s -> %s" % (token, reply))
 
+    def cmd_stackshot(arg):
+        """stackshot  -- capture every thread's stack into the kernel buffer.
+
+        Fills kernel_stackshot_buf (STACKSHOT_SAVE_IN_KERNEL_BUFFER) and reports
+        buf/size. The call refuses to overwrite an existing snapshot, so a second
+        run reports state=present with the old buffer still valid."""
+        reply = send_cmd("STACKSHOT", "", timeout=60.0)
+        if not reply:
+            log("! stackshot: 无回复（抓栈可能耗时，内核可能仍在跑）")
+            return
+        log("STACKSHOT -> %s" % reply)
+        kv = dict(x.split("=", 1) for x in reply.split() if "=" in x)
+        buf = kv.get("buf", "")
+        size = kv.get("size", "")
+        if buf and size and size != "0":
+            log("  快照在 0x%s，%s 字节。读回：dump 0x%s %s out.stackshot"
+                % (buf, size, buf, size))
+            log("  （或 res/UFS 导出；注意 %s 字节走 CDC 约需 %.0f 秒）"
+                % (size, int(size) / 62000.0 if size.isdigit() else 0))
+
     def cmd_panictrig(arg):
         """panictrig  -- panic on purpose, then read the panic tail after reboot.
 
@@ -1109,6 +1129,8 @@ def main():
                         cmd_readufs(rest)
                     elif verb == "PANICTRIG":
                         cmd_panictrig(rest)
+                    elif verb == "STACKSHOT":
+                        cmd_stackshot(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":
