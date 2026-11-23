@@ -1,531 +1,171 @@
-# nabu USB CDC bring-up (Xiaomi Pad 5 / SM8150)
+# nabu USB CDC 控制台
 
-把 Qualcomm DWC3 控制器做成一个 **USB CDC ACM 实时串口**，跑在移植到 Xiaomi Pad 5（nabu，
-SM8150-AC）的 XNU 17.7.11（iPadOS 21H461）上。串口既能读内核日志，也能反向发控制帧。
+Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
+主机看到一个 USB CDC 串口：实时读内核日志，同时反向发控制命令。
 
-> Bring-up log and code for a USB CDC ACM console on a DWC3 controller under XNU 17.7.11
-> on the Xiaomi Pad 5 (nabu, SM8150). The host sees a COM port, reads live kernel output,
-> and can send `SXNU1` control frames back down the same serial line.
+目标板：Xiaomi Pad 5 · SoC SM8150 · XNU 17.7.11 (iPadOS 21H461)
+代码仓库：[Lux12138/nabu-usb-cdc](https://github.com/Lux12138/nabu-usb-cdc)
 
 ---
 
-# 当前状态（2026-11-22 晚）
+## 现在的状态（2026-11-23）
 
-## 现在能做什么
+**48 个命令全部真机验证，panic 日志跨重启存活。**
 
-| 能力 | 实测 |
+| 指标 | 状态 |
 |---|---|
-| 读内核日志 | **连续到设备复位，无断流**。最长实测 l839-ctl 到设备时间 **593 s** |
-| 写控制帧 | `HELLO` **8 ms** 往返，`control=1` 下发 session（l839 实测，设备时间 ~576 s） |
-| 边采边控 | 同一进程、同一句柄同时收日志和发帧 —— **已验证同时有效** |
-| 无人值守 | stdin 关掉也能发命令（命令文件通道），一轮零人工 |
-| 每轮数据量 | 1–10 MB |
-| **读内核内存** | **`READ`/`READNEXT` 已打通**：读内核 Mach-O header 得 `cffaedfe`（l807 实测）|
-| **读物理地址/MMIO** | **`READPA`/`READPANEXT` 已打通**：MDSS `0xae01000`、GPUCC `0x2c90000` 寄存器块读出正确（l809 实测）|
-| **符号解析** | `sym`/`syms`/`var` 主机侧解析 kernel.macho（53k 符号），零刷机 |
-| **流式 dump** | `dump`/`dumppa` 自动分块 + CRC 校验落主机文件（≤64 MiB）|
+| 命令总数 | **48**，全部真机验证 |
+| 内核日志 | 开机到复位连续，无需第二串口 |
+| 读内存 | 内核虚拟地址 + 物理地址/MMIO，带白名单防护 |
+| 写内存 | `WRITEPA` 白名单内已验证 |
+| panic 日志 | **BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活** |
+| 链路 | CDC 约 42–57 s 枚举，命令往返正常 |
 
-## CDC 一直在输出，两条历史上的「黑洞」都是测量侧错误
-
-| 旧说法 | 真相 | 判据 |
-|---|---|---|
-| 「51–100 s 有 48.6 s 固定黑洞」 | **撤回**。那段是 GPU 收尾刷屏，**行不带 `t=`** | 区间内有 88–96 KB / 1,074–1,165 行，`NabuGPU step=0..7` + `checkpoint=ready` 全在，launchd 墙钟首尾只差 **0.02 s** |
-| 「335 s 之后三条通道全空」 | **撤回**。旧依据那三轮脚本只跑到 316.9 / 323.8 / 334.1 s | l837 到 399 s（335 s 后 291 条）、l839 到 570 s（852 条）、l839-ctl 到 593 s（64 条） |
-
-**最硬的一条证据**：l839-ctl 在设备时间 **575–593 s** 发 `HELLO`，8 ms 内收到回复，
-而**同一条流里的日志当时还在往外走** —— 收和发共用一个句柄、同时有效，
-已经越过所谓「截断线」240 秒。
-
-## 仍然存在的真实盲区（不是 CDC）
-
-| 通道 | 何时失效 | 状态 |
-|---|---|---|
-| **CDC（内核 printf）** | 到设备复位 | ✅ 连续，无黑洞 |
-| os_log 快照 | **286–293 s**（`diagAt1=300` 是固有限制） | ❌ 之后没有 |
-| NABULOG1 | 滚动窗口，约最后 2 s | ❌ 只有尾巴 |
-
-**⇒ 300 秒之后仍然看不到用户态在干什么。缺的是 os_log 与 NABULOG1，不是 CDC。**
-
-## 唯一的测量精度限制
-
-没有 `t=` 的行无法精确归属时间。l839 里最大的真实 `t=` 间隔是 48.7 s（44.9→93.6）
-和 26.5 s（17.1→43.7），但那两段**字节是完整的**，只是行不带时间戳。
-要钉死只能给这些行加 `t=`（改内核），不是测量方法能解决的。
-
-## 判「真的没数据」只用这三条
-
-1. 采集侧**累计字节数连续 N 秒一字不增**（`capture.log` 的 `[stats]` 或 `-console.ctl.txt`）
-2. `drop (SerialException), reopen` 有没有打出来
-3. 设备侧 `QCOM USB LOSS overflow=/contention=/transport=` 里 **`transport` 是否为 0**
-
-l837 实测：只有 435→440 s 一次真实掉线，498 s 重连成功，**全程 `transport=0`**。
-
-**不要用 `t=` 的时间差判「有没有数据」** —— `t=` 有三套互不相干的时钟源：
-`nabu: spawn/exec` 是设备 uptime；`nabu-display` 是另一套（0..811e6）；
-`NativeAdrenoProfile: S` 又是第三套（1.3e8..3.29e8，只覆盖 6.9–17.2 s）。
+**最新可用基线**：`baseline-kb59-ufsoffset` tag（kernel `9cc32cf0f07f693f`，boot-args 无危险 gate）。
+详细基线说明见 [`docs/BASELINE.md`](docs/BASELINE.md)。
 
 ---
 
-# 控制台：`tools/cdc-console.py`
+## 快速开始
 
-**一个进程、一个句柄，边落日志边发控制帧。**
-
-设备侧硬约束：**一个 boot 周期只能 open 一次 CDC** —— `close()` 后再 `open()` 要么阻塞
-约 120 s，要么直接 `ERROR_GEN_FAILURE(31)`，只有板子复位才能恢复。所以采集进程和控制
-进程不能分开。控制台把 reader 线程和命令循环放进同一个进程，共用同一个 `Serial`。
+### 1. 单元测试（可选）
 
 ```bash
-python -I tools/cdc-console.py --tag r900 --wait 600   # 开机前先起
-python -I tools/cdc-console.py --self-test             # 不需要板子
+cd module
+clang -std=c11 -D_GNU_SOURCE -Wall -Wextra -I. \
+  tests/test_usb_control_args.c -o /tmp/t && /tmp/t   # 应 ALL PASS
 ```
 
-进入后的命令（完整清单，与 `help` 输出一致）：
+### 2. 上板一次（先起控制台，再刷机）
 
-**控制帧**（SXNU1，同一个句柄发出去）
+```bash
+# 终端 1：控制台（务必在刷机前启动）
+cd tools
+python -u nabu_console.py --tag run1 --out /path/to/logs \
+  --wait 300 --deadline 900 --kernel /path/to/kernel.macho
 
-| 命令 | 作用 |
-|---|---|
-| `hello` | 建 session（HELLO 必须 session=0 seq=0）|
-| `status` | `usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=` |
-| `ping` | `rx/rxo/tx/poll` 快照 |
-| `screenshot` / `shotnext` | 抓帧写 UFS / 等下次 flip 再抓 |
-| **`read <hex地址> <hex长度>`** | **读内核虚拟地址**：返回 `state=ready len= crc32= offset= data=`，首块最多 128 B |
-| **`readnext [n]`** | 取上一次 READ 的下一块（默认 192 B），直到 `ERR done` |
-| **`readpa <pa> <n>`** | **读物理地址**（寄存器/MMIO）：`readpa 0xae01000 40` |
-| **`readpanext [n]`** | 取 READPA 的下一块 |
-| **`sym <name>` / `syms <sub>`** | 解析/列出内核符号（需 `--kernel`）|
-| **`var <name> [n]`** | 解析符号并 READ n 字节 |
-| **`dump`/`dumppa`** | 流式 dump 到主机文件（自动分块 + CRC）|
-
-**复位**（PSCI `SYSTEM_RESET`；ABL 读 `misc=boot-recovery` 后进 Recovery）
-
-| 命令 | 作用 |
-|---|---|
-| `reboot --confirm` | 让板子复位 |
-| `reboot-now` | 立刻复位（走武装通道，记 `[arm]` 日志）|
-| `reboot-at <秒>` | 重新武装：设备时间到 `<秒>` 时自动复位 |
-| `reboot-cancel` | 取消自动复位 |
-
-**本地操作**（不发帧）
-
-| 命令 | 作用 |
-|---|---|
-| `mark <文字>` | 主机时间锚点，同时写进原始日志 |
-| `mute / unmute <前缀>` | 只静音终端回显，**原始日志仍完整** |
-| `stats` | 本地统计：elapsed / bytes / lines / last_data_age / alive / **dev_uptime** / session / seq / txok / rej / arm |
-| `help` / `?` | 显示帮助 |
-| `quit` / `exit` / `q` | 退出（正常关闭句柄）|
-
-**命令行参数**
-
-| 参数 | 作用 |
-|---|---|
-| `--tag NAME` | 输出文件名前缀 |
-| `--port PORT` | 指定端口；默认按 `VID_1209:PID_316D` 自动匹配 |
-| `--wait N` | 等端口出现的最长秒数（默认 300）|
-| `--deadline N` | 最多跑 N 秒后自退（0=不限）|
-| `--arm-reboot SEC` | **武装自动复位**：设备时间到 SEC 秒时发 `REBOOT` |
-| `--reboot-window N` | 武装后只在 `SEC..SEC+N` 内尝试（默认 90 s），过期报 `[arm] 超过窗口` |
-| `--drop PREFIX` | 启动即静音某前缀，可重复 |
-| `--no-echo` | 不回显日志到终端 |
-| `--reconnect` | 掉线后尝试重开（**违反单句柄约束**，只在明确知道后果时用）|
-| `--self-test` | 跑内置自测，不碰串口 |
-
-**`REBOOT` 实测耗时**（2026-11-18，基线 `bd3814d6`）：
-
-```
-TX REBOOT   →  RX OK state=queued     24 ms
-            →  USB LOST                2.8 s
-            →  adb 看到 recovery      13.6 s
-                                合计约 17 s
+# 终端 2：刷机
+cd /path/to/build
+bash go_round_next.sh <包名>
 ```
 
-**这比等 WDT 咬合（300–600 s）快两个数量级，而且不依赖 `pet` 补丁是否正确。**
+控制台每 2 秒扫描端口，发现 COM3 后打开，日志写入 `<tag>-com.bin`，
+命令写入 `<tag>-cmd.txt`（**只追加，勿截断**）。
 
-产出 `logs/<tag>-console.bin`（原始字节）+ `logs/<tag>-console.ctl.txt`（TX/RX 与事件）。
-`--wait N` 开机前先起；`--deadline N` 到点自退；`--drop PREFIX` 启动即静音；
-**默认不重连**（掉线就报掉线，不偷偷换句柄）；stdin 关掉时自动转「只采集 + 读命令文件」。
+### 3. 发命令
 
----
-
-# 读内核内存：`READ` / `READNEXT`（2026-11-22）
-
-控制台可以读任意**内核虚拟地址**，不用再为每次诊断重新编译/刷机。
+向 `<tag>-cmd.txt` 追加一行即可：
 
 ```
 hello
-read 0xfffffff007004000 40        # 读内核头 → cffaedfe (MH_MAGIC_64)
-read 0xdeadbeef 40                # 坏地址 → ERR state=unmapped（不崩）
-read 0xfffffff007004000 180       # 384 B，首块 128 B + crc32
-readnext 80                       # 后续块，offset=128, frame=<seq>
-status                            # 原有命令仍正常
+ptdump _gPhysBase
+readpa 0x17c10008 16
+sysreg TCR_EL1
+readufs panic
 ```
 
-**安全性**：读路径用 `mmu_kvtop()`（ARM64 硬件 AT 地址翻译指令）：不取 pmap 锁、
-不会死锁；未映射地址由硬件报 fault，返回 0 → `ERR unmapped`，实测不 panic。
-**只支持内核态地址**（`0xffff...`）；用户态地址需 `copyin`，明确不支持。
-
-**回包**：`SXNU1R <session> <seq> READ OK state=ready len=N crc32=XXXXXXXX offset=O data=<hex> <crc>`。
-`data` 是 hex；一次最多 128 B 数据。`READNEXT` 用同一事务序号取后续块，
-主机按 `crc32` 校验整块重组结果。
-
-**`WRITE`**：同样实现但需要 boot-arg `qcom-usb-write=1` 才生效（默认拒绝，防止误改内存）。
-**`SYM`/`SYMS`**：内核符号表在模块里不可达，返回 `unsupported`；
-先从 kernelcache 离线查符号地址，再用 `READ` 读。
-
-**真机验证（l807 / SM8150 / iPadOS 17.7.11）**：内核头 magic 正确、坏地址不崩、
-分块正确、`STATUS` 向后兼容；20 项主机测试全过。
-
-## 物理地址：`READPA` / `READPANEXT`（2026-11-22 晚）
-
-寄存器/页表/DDR 都是物理地址。`READPA` 用 `ml_io_map()` 建 MMIO 映射后读：
-
-```
-readpa 0xae01000 40       # MDSS MDP 寄存器（实测 OK）
-readpa 0x2c90000 40       # GPUCC PLL/clock（实测 OK）
-readpanext 80             # 续读下一块
-```
-
-**XNU 陷阱**：`phystokv()` 对 MMIO 地址会 panic `illegal PA`；`ml_io_unmap()`
-对 permanent device mapping 会 panic `vm_map_delete`（XNU 全树从不调用 unmap）。
-⇒ 映射保持永久 + 单窗口缓存复用；**无效物理地址会 fault，调用者须给有效基址**。
-
-## 符号与流式 dump
-
-`--kernel <path>` 加载 kernel.macho 的 LC_SYMTAB（53,172 个符号）：
-
-```
-python tools/cdc-console.py --tag r900 --kernel hold/l809/kernel.macho
-> sym gPhysBase              # -> 0xfffffff0071c9108
-> syms native_adreno         # 列出所有匹配符号
-> var native_adreno_backing_cache_stats 48   # 解析 + READ
-> dumppa 0xae01000 0x1000 mdss.bin          # 4 KiB 寄存器块落主机文件
-> dump 0xfffffff007004000 0x1000 hdr.bin    # 虚拟地址 dump
-```
-
-`dump` 自动用 READNEXT/READPANEXT 分块、校验整块 CRC，
-只有一致才写文件。≤64 MiB 走 CDC；更大范围需要内核侧 UFS dump（未实现）。
+回复写入 `<tag>-ctl.txt`。`readufs panic` 读回 panic 槽头；
+`readufs 8166@4032` 读 panic 文本所在的块尾。
 
 ---
 
-# 控制帧协议 SXNU1
+## 命令一览（48 个）
 
-```
-请求   SXNU1  <session:16hex> <seq:8hex> <VERB> <crc32:8hex>\n
-回复   SXNU1R <session:16hex> <seq:8hex> <VERB> <status> [extras] <crc32:8hex>\n
-```
-
-- 行 ≤ **127 B**，帧（含 `\n`）≤ **128 B**
-- **CRC-32/IEEE** 覆盖「行首到 CRC 前那个空格之前」的所有字节
-- `HELLO` 必须 `session=0 && seq=0`；其它动作必须非零 session 且 `seq` **严格递进**
-- CRC 不符 / 跳号 / 重放只加 `control_rejected`，**不回帧**
-- 回帧带前置 `\n`，主机解析要跳过行首空行
-
-| 动词 | 作用 | 回复 extras |
-|---|---|---|
-| `HELLO` | 建立会话 | `session=… last_seq=… control=1` |
-| `PING` | 存活探针 | `rx= rxo= tx= poll=` |
-| `STATUS` | 完整状态 | `usb= er= rx= rxo= tx= bp= bo= poll= ev= gen= rej=` |
-| `REBOOT` | PSCI 复位 | `state=queued` |
-| `SCREENSHOT` / `SHOTNEXT` | 抓帧 / 等下次 flip 再抓 | — |
-
-`usb=3` = `QCOM_USB_DEBUG_ACTIVE`；`rej=0` = 没有一帧被拒。
-协议实现唯一权威是 [`module/kernel/QcomUsbControl.h`](module/kernel/QcomUsbControl.h)（385 行，纯逻辑，无 I/O）。
-完整端到端说明（含真机 TX/RX 原文）见 [docs/08-control-frames-end-to-end.md](docs/08-control-frames-end-to-end.md)。
-
-## 真机实测（2026-11-18 22:11–22:12，l839）
-
-```
-22:11:59.874 TX SXNU1 0000000000000000 00000000 HELLO e5b60eb1
-22:11:59.882 RX SXNU1R 1a0bba57bcab3195 00000000 HELLO OK session=1a0bba57bcab3195 last_seq=00000000 control=1
-
-22:12:06.791 TX SXNU1 1a0bba57bcab3195 00000001 STATUS 51292187
-22:12:16.797 ! no SXNU1R within 10s for STATUS
-
-22:12:21.699 TX SXNU1 1a0bba57bcab3195 00000002 PING a5f0eddc
-22:12:23.712 ! write failed: Write timeout
-
-22:12:27.304 USB LOST
-```
-
-**`HELLO` 8 ms 往返；7 秒后 `STATUS` 无回复；再 15 秒 `PING` 连写都超时。**
-当时板子正在画面抽搐、GPU 连续 7 帧 `complete=0`。
-⇒ **失效与「系统还能不能响应」有关，不是「boot 后多少秒」**。
-旧文「RX 在 `boot+70~90 s` 后关闭」是按时间点表述的，本次 592 秒发 `HELLO` 照样成功。
-
----
-
-# 三条必须知道的硬约束
-
-1. **一个 boot 周期只能打开一次 CDC**。`close()` 后再 `open()` 要么阻塞约 120 s，
-   要么 `ERROR_GEN_FAILURE(31)`。多步操作必须放进同一进程、同一句柄。
-2. **回帧带前置 `\n`**，解析要跳过行首空行。
-3. **端口号会变**（COM3 → COM4，还可能复用）。按 **`VID_1209:PID_316D`** 匹配，不写死 COMx。
-
----
-
-# 目录
-
-```
-module/    QcomXnuUsbDebug 的本地副本（上游 MIT；我们的改动见 docs/module-changes.patch）
-patches/   XNU 侧补丁（0005 console / 0006 worker / 0007 rebase + 诊断打印 /
-           0008 reboot-worker-and-wake）
-tools/     主机侧工具
-           sxnu_ctl.py      单次发一个动词
-           port-session.py  同句柄边采集边发帧
-           cdc-console.py   交互式控制台（单句柄 + 命令文件通道）
-           cdc-capture.py   纯采集
-           pipeline.py      整轮编排
-docs/      01 架构 / 02 轮次记录 / 03 踩坑 / 04 原始证据 / 05 构建 /
-           06 dyld cache / 07 控制通道与硬件狗定时停车 / 08 控制帧端到端
-```
-
----
-
-# 快速开始
-
-模块（AArch64 静态库，编译参数取自内核真实编译记录）：
-
-```sh
-python3 scripts/build.py --compile-record <pe_kprintf.o.json> \
-    --soc soc/Sm8150.h --output <tmp-dir>
-```
-
-内核侧按 `patches/0005 → 0006 → 0007` 应用，并在 defconfig 里加：
-
-```
-CONFIG_XNU_EXTRA_CFLAGS="... -DXNU_QCOM_USB_DEBUG=1 -I<module>/include"
-CONFIG_XNU_EXTRA_LD_ARCHIVES="<build>/libQcomXnuUsbDebug.a"
-```
-
-引导参数：`qcom-usb-debug=1 qcom-usb-prepare=1 qcom-usb-ctl=1`。
-
-首次 clone 后给脚本加执行位：`chmod +x tools/*.sh`。
-
-主机捕获（Windows，pyserial）：
-
-```powershell
-py -3 tools/cdc-capture.py --seconds 180 --raw com.bin --tsv com.tsv
-```
-
-详细步骤与验证命令见 [docs/05-build.md](docs/05-build.md)。
-
----
-
-# 两个关键发现
-
-1. **这块固件的 SMMU 不接受 `S2CR.TYPE=BYPASS`**：写入 `0x10003` 会读回 `0x20003`
-   （TYPE 被重编码为 FAULT）。正确做法是把 stream 指向固件预留的 bypass context bank：
-   `SCTLR=0 / CBAR.TYPE=S1_TRANS_S2_BYPASS / CBA2R.VA64=1`，S2CR 里写 **bank 号（TYPE=TRANSLATE）**。
-   同板 UFS 与 sheng 移植都是这么做的，证据见 [docs/01-architecture.md](docs/01-architecture.md)。
-2. **SM8150 上 S2CR/CBAR/SCTLR 的读回不保证等于写入值**，不能用"回读不符"判定失败；
-   验收要看真实 DMA/枚举（事件环、主机 COM）。
-
----
-
-# 三通道分工与覆盖
-
-| 通道 | 何时用 | 产出 |
-|---|---|---|
-| **DWC3 CDC** | 默认通道，每轮必用 | 内核 console 实时流，1–10 MB/轮，**连续到复位** |
-| **NABUDIAG 双槽** | 需要用户态 os_log | `seq=0`（220 s）+ `seq=1`（300 s），各约 30–38 MB，走 UFS 导出区 |
-| **UFS 窗口 / NABULOG1** | **仅当 USB 功能死亡** | 见 [`unixnu-nabu-autolog`](https://github.com/Lux12138/unixnu-nabu-autolog) |
-
-```
-0s        50s      100s              286s              593s+
-│          │         │                  │                 │
-│  CDC ███████████████████████████████████████████████████  内核 printf（无断流）
-│              os_log ████████████████████░░░░░░░░░░░░░░░░  用户态 tracev3（286 s 止）
-│                                        └ 之后只剩 CDC
-```
-
-| 时间窗 | CDC | os_log | 结果 |
-|---|---|---|---|
-| 0 – 50 s | ✅ | ❌ | 仅内核 |
-| 51 – 100 s | ✅ | ✅ | 双视角对齐 |
-| 100 – 286 s | ✅ | ✅ | **双视角对齐，最有价值的区间** |
-| 286 – 593 s+ | ✅ | ❌ | 仅内核 |
-
-## 判读时的实际用法
-
-1. **先看 CDC** 拿内核时间线 —— 从 0 s 到设备复位，中间无断流
-2. **需要用户态就去 os_log**（47–286 s），两者在 100–286 s 可对齐
-3. **286 s 之后只有 CDC**，不要用「CDC 里没看到」推「没发生」—— 原因是**行可能不带 `t=`**，不是通道断了
-4. 若 `l*-cdc-merged.bin` 为 0 字节（如 l749），说明 USB 功能死亡，
-   此时**只能**靠 UFS NABULOG1 窗口
-
----
-
-# 标准采集流程
-
-```text
-recovery  → arm misc（读回校验 boot-recovery）→ adb reboot bootloader
-fastboot  → fastboot flash cust payload.img → fastboot boot boot-merge-r3.img
-kernel    → 跑；pet=600 / arm-delay=0 由 WDT 自动回收
-recovery  → CDC watcher 已分段落盘 → 合并 → 拉 diag 双槽 → 拉 screen.bgrx
-判读      → 解码 os_log（macul unifiedlog_iterator）→ 结构化写入 logs/rounds/<tag>.json
-```
-
-关键细节：
-
-- **CDC watcher 会分段**：一轮可能产出 2–3 个 `cdc-*.bin`，必须**合并**再判读。
-  只读第一段会得到截断结论 —— l727 的「LaunchServicesMigrator 卡死」就是 `seq=0` 截断造成的误判，
-  实际它在 226.5 s 已完成。
-- **`screen.bgrx` 是判据，不是照片**：800×1280×4 = 4,096,016 B，比较 sha 与颜色直方图。
-- **os_log 时间轴要换算**：macul 导出的 `time` 是 19.2 MHz ticks，`真实秒 = ticks / 19200000`。
-
-## 判读纪律（血泪）
-
-1. **`ncpy == xfer` 才是「CPU 全帧拷贝」的证据**，不是 `ncpy > 0`。
-   `ncpy=0` 也不等于零拷贝 —— 现在看 `P4/PF`。
-2. **`PF/PX` 走 GPU7 标记流**，shipped kernel 的 `nabu_capture_append` 是空实现，**0 命中不能当失败判据**。
-3. **`Migration not necessary` / `finishedStartup` / `Dismissing overlay`** 三个词才是系统 UI 交还的证据。
-4. **不要用「设备离线」推「系统卡死」**：WDT 会咬合，设备本来就会离线回 TWRP。
-
----
-
-# 与 WDT 的关系
-
-```text
-pet=600（内核侧 petSeconds 同长补丁）+ nabu-wdt-arm-delay=0
-→ 咬点 380–410 s
-→ PON 0x80041 自动回 TWRP
-```
-
-`arm-delay` 必须为 0 与 `sheng-smp=1` 配对（`precheck.py` 会硬性拒绝 `sheng-smp=1 + arm>0`）。
-
-**注意**：`pet=600` 来自**内核常量**（`NativeUfs.cpp` 里 `petSeconds` 的默认值被改成 600），
-**不在 boot-args 里**。新编内核如果没打这个补丁，`NativeUfs: args` 行会是 `pet=300`。
-
----
-
-# 宿主机侧注意
-
-- Git Bash 下 `adb pull` 要加 `MSYS_NO_PATHCONV=1`，否则 `/tmp/...` 会被改写成 Windows 路径。
-- WSL 与 Windows 两套工具链分工固定：Windows Python 跑 `precheck.py`（硬编码 `E:/nabu/tmp`），
-  WSL 跑 `audit_bootability` / `fsck.fat` / `mcopy` / macul。
-- **判进程死活不要用 `tasklist | grep`** —— 中文编码会吞掉 `python.exe` 那一行，
-  看起来像进程没了。用 `powershell Get-CimInstance Win32_Process -Filter "name='python.exe'"`。
-
----
-
-# 已知限制
-
-- 链路是 Full Speed；未配置 USB3 SS PHY。
-- 没有 banner 行：初始化后的 backlog 从 `zones` 类早期文本开始。
-- `init=1` 之后 `PE_kputc` 切到 USB，userdata 窗口不再更新；判卡点以串口为准。
-- **panic 正文到不了串口**：`nabu_panic_restart()` 排在 `qcom_usb_debug_panic_drain()` 之前，
-  panic 只能从设备屏幕上拍照读回；修顺序前不要指望串口里有 backtrace。
-- **自动复位只来自 Mu 侧硬件狗**：同一停点上，`WDT.CFG mode=0` 实测 109 s 以上完全不回（要人工长按），
-  `mode=1` 时 boot+60 s 自动回来。内核侧的 `nabu-hang-reset` **一次都没有 fire 过**。
-  PON 也无法区分复位源（硬件狗与内核 PSCI 都是 `0x80041`），唯一可靠的判据是 **COM3 有没有出现**。
-- 捕获脚本以 `timeout` 结束时含义是"这一轮设备从未复位"，不是"脚本失败"。
-- **TX 会偶发停摆（约 1/3 轮次）**，固定停在 `IONVRAM sync` 之后、几十秒零新增字节。
-  但**日志静默 ≠ 系统停住**：同一轮里 `startRoot()` 仍在跑、`misc=boot-recovery` 仍被写。
-- **`kprintf` 不会进 CDC**：诊断输出必须走 `qcom_usb_debug_write()` 或直写环。
-- **`delay_us()` 拒绝 >10 ms**，并顺手把 `io_failed=1`（随后 phase 转 `IO_FAILED`、日志停发）。
-- **APSS 狗咬合 = 武装后约 32 s**（`BARK=BITE=2097152 ticks` 实测；换算出的 64 s 不成立，
-  寄存器语义未定），改 `NABU_WDT_BITE_MS` 无效；要更晚只能改"何时武装"。
-  它的驱动在 `boot.img` 的固件卷里，不在 payload。
-- **控制帧只在系统还能响应时可用**。同一句柄在画面抽搐前兆出现后数秒就会连 TX 都超时。
-  不是固定时间点。
-
----
-
-# 附录：历史记录（按时间倒序，含已撤回内容）
-
-## 2026-11-16：19 天后的实际用法
-
-量级已经换代：
-
-| 项 | 2026-10-27 记录 | 2026-11-16 实际 |
-|---|---|---|
-| 单轮捕获 | 10,806 B / 179 行 | **1–10 MB / 每轮** |
-| 能看到的层 | 内核 console、APFS 挂载、AMFI 正文 | **完整 os_log**（解码后单轮 20 万行级） |
-| 通道数 | 1 条（CDC） | **3 条**（CDC + NABUDIAG 双槽 + UFS 窗口） |
-| 复位 | 日志静止 ~30 s | `pet=600` + `arm-delay=0`，双诊断槽 220/300 s |
-
-当时的覆盖矩阵（**其中「洞」的判读有误，见本文开头**）：
-
-| 轮次 | CDC 覆盖 | CDC >10s 洞 | os_log 覆盖 |
-|---|---|---|---|
-| l739b | 7.9 – 269.2 s | 14 处 | — |
-| l750 | 7.6 – 316.9 s | 20 处 | — |
-| l769 | 7.3 – 323.8 s | 20 处 | 47.5 – 282.1 s（212,087 行）|
-| l770 | 7.4 – 326.2 s | 21 处 | — |
-| l771 | 7.2 – 334.1 s | 21 处 | 47.5 – 286.0 s（209,300 行）|
-| l730 | — | — | 38.5 – 292.8 s（218,847 行）|
-
-**注意上表 CDC 上限 269–334 s 是脚本窗口，不是设备输出上限。** 当时据此推出「335 s 后真空」，
-是把「脚本停了」读成「系统不输了」。采得更长的轮次见本文开头。
-
-### 当时的「洞 ①」原文（已撤回）
-
-> ~~l739b: 64.3 → 112.9 (缺 48.7s)~~ / ~~l750: 56.1 → 104.7 (缺 48.6s)~~ /
-> ~~l769: 51.2 → 99.8 (缺 48.6s)~~ / ~~l770: 51.7 → 101.9 (缺 50.2s)~~ /
-> ~~l771: 51.2 → 99.9 (缺 48.6s)~~
->
-> ~~成因是启动中段 USB re-enumeration……这段时间的 console 输出主机没收到，永久丢失。~~
->
-> **错在哪**：只看 `t=` 差值。那几段是 GPU 收尾刷屏，行不带 `t=`，
-> 区间内实际有 88–96 KB / 1,074–1,165 行，`NabuGPU step=0..7` 全在，launchd 墙钟首尾仅差 0.02 s。
-> 「`7.x → 141.x` 跳变是分段拼接顺序错乱」也是同一个错：`t=` 混了三套时钟源。
-
-### 当时的「洞 ②」原文（已撤回）
-
-> ~~CDC 在 334 s 前后断（USB 掉了或设备静默）~~
->
-> **这一条不成立**（见前）。但同节另外两条**仍然成立**：
-> - os_log 快照 `diagAt1=300` 触发，内容只到 286–293 s ✅
-> - NABULOG1 是滚动窗口，回 TWRP 后拉到的是最后 2 秒内的内容 ✅
-
-| 改进路径 | 当时状态 | 现在 |
-|---|---|---|
-| `diagAt1` 300 → 360 | ⚠️ 未验证；l724（500）/l725（400）已被证明会早死，300 是实测临界点 | 未变 |
-| CDC 撑到 400 s 以上 | 🟡 尚未做过 | ✅ **已达成**：l837 到 399 s、l839 到 570 s、l839-ctl 到 593 s，无断流 |
-
-## 2026-10-28：控制通道 + 硬件狗定时停车
-
-串口从「只读日志」推进到「双向控制 + 无人值守刷机」：
-
-| 能力 | 实测 |
+| 类别 | 命令 |
 |---|---|
-| 控制通道 | `HELLO` 返回非零 session；`STATUS OK usb=3 er=0 rej=0` |
-| 串口 REBOOT | 命令被接受后**同秒 USB 消失**，`boot+12~15 s` 落 recovery |
-| 硬件狗定时停车 | 内核在 `boot+~83` 武装 APSS WDT ⇒ **武装后约 32 s 咬合（boot+114，COM+86）** ⇒ `boot+129` 回 recovery |
-| 完整启动日志 | **146,128 B / 2,031 行**（与自动复位同一轮拿到） |
-| 无人值守一轮 | `reboot → TWRP → bootloader → 核 sha → flash cust → boot → 采集 → 验证`，**86 s / 轮，零人工** |
+| 基础 | `HELLO` `PING` `STATUS` `BOOTARGS` `VERSION` `UPTIME` `REBOOT` |
+| 内存读 | `READ` `READNEXT` `READPA` `READPANEXT` `RDBLK` `DUMP` `DUMPPA` |
+| 内存写 | `WRITEPA` `WRITE` |
+| UFS | `DUMPUFS` `DUMLIST` `READUFS` |
+| 调试 | `DEBUGGER` `KDPPUSH` `KDPREAD` `KDPWRITE` `KDPREBOOT` `KDPRAW` |
+| 页表 / panic | `PTDUMP` `PANICDUMP` `PANICTRIG` |
+| 系统信息 | `SYSCTL` `TASKDUMP` `THREADDUMP` `SYSREG` `SYSREGW` `SYM` `SYMS` |
+| 显示 | `SCREENSHOT` `SHOTNEXT` `VSYNCON` `FLIPNOW` `DISPREGS` `SMMUDUMP` |
+| GPU | `GPUPROFILE` `GPUFREQ` `GPUHWCG` `GMUSTATE` `PERFSTART` `PERFSTOP` `PERFREAD` `PERFCLEAR` |
+| 断点 | `BKPADD` `BKPDEL` `BKPLIST` |
 
-关键点：
-
-- `REBOOT` 不能走 `reboot_kernel()`：本移植在 `vfs_unmountall` 阶段卡死（`launchd` 已退出、
-  但 `halt_all_cpus` 永不执行），必须 arm 成功后**直接 PSCI `SYSTEM_RESET`**。
-- 当时认为「采集要 95 s 才够，但控制帧的 ~~RX 在 `boot+70~90 s` 后失效~~」
-  ⇒ 必须让内核/硬件自己定时复位。**「RX 70~90 s 失效」这条已按时间点表述失准**，
-  实际取决于系统是否还能响应（见本文开头）。
-- 内核侧四种定时写法（`delay_for_interval`、`assert_wait_deadline` 线程、worker 轮询、写路径轮询）
-  前三种都失败，最终落地为：**内核只决定"何时武装"，复位交给 APSS 硬件狗**
-  （武装后约 32 s 咬合，`BITE_MS` 改大无效）。
-  细节与判据见 [docs/07-control-channel-and-wdt-park.md](docs/07-control-channel-and-wdt-park.md)。
-
-主机侧工具：[`tools/port-session.py`](tools/port-session.py)（同一句柄既落日志又发帧）、
-[`tools/pipeline.py`](tools/pipeline.py)（整轮编排）。
-
-## 2026-10-27：首次枚举成功
-
-| 项 | 值 |
-|---|---|
-| 主机枚举 | `USB\VID_1209&PID_316D\QCOMXNUUSBDEBUG` → `COM3`，boot 后约 25–32 s |
-| 设备侧 | `init=1 phase=3 err=0`；`dr=0 ds=1 bank=0x37 le=3 lr=0x37`；`lt=8 tb=1`（DTR） |
-| 主机读取 | 单轮捕获 10,806 B / 179 行内核日志，含 APFS 挂载与 launchd/dyld 的 AMFI 拒绝正文 |
-| 复位 | 日志静止约 30 s 后复位，80 s 回到 recovery，PON `0x80041`。复位源是 **Mu 侧 APSS 硬件狗**，不是内核侧的狗（三档实测见 [docs/02](docs/02-bringup-log.md)） |
-| 链路速率 | Full Speed（`DSTS.CONNECTSPD=1`），USB2 线缆/接口即可 |
+`SYM`/`SYMS` 按设计回 `unsupported`（符号表在主机侧解析）。
+`PANICTRIG` 和 `SYSREGW` 是破坏性命令，各有 boot-arg 安全阀，默认关闭。
 
 ---
 
-# 许可与来源
+## panic 日志（方案 D）
 
-- `module/` 是 [xiaoleGun/QcomXnuUsbDebug](https://github.com/xiaoleGun/QcomXnuUsbDebug) 的副本
-  （基线 `83be578`，文件头 SPDX: MIT），我们对它的改动以 patch 形式列在 `docs/module-changes.patch`。
-- 其余代码与文档：MIT，见 [LICENSE](LICENSE)。
-- 所有内容仅用于自有设备的移植研究。
+内核已有 4 MiB BSS 环；本仓库把它接到 UFS 预留区：
+
+```
+内核输出 → nabu_log_ring (BSS) → 每 2 秒落盘 → UFS userdata 末尾
+```
+
+panic 时 `nabu_log_land_now()` 强制落盘到**专用槽**，与周期槽分离：
+
+| 槽 | 块偏移 | 内容 |
+|---|---|---|
+| 周期 | `rel 0` | `NABULOG1` 头（`is_panic=0`）|
+| 周期 | `rel 1..25` | 最近日志 |
+| panic | `rel 8190` | `NABULOG1` 头（`is_panic=1`）|
+| panic | `rel 8166..8189` | panic 时刻的日志尾部 |
+
+读回：
+
+```
+readufs header            # 周期槽头，is_panic 应为 0
+readufs panic             # panic 槽头，is_panic 应为 1
+readufs 8166@4032         # panic 文本（PANICSTR: ...）在最新尾部块的最后 64 字节
+```
+
+`NABULOG1` 头布局（小端）：magic(8) + version(4) + is_panic(4) +
+available(4) + dropped(4) + total_lo(4) + total_hi(4)。
+
+方案 A（外部保留区 `0x9b000000`）已作废：两轮真机证明该地址无后备物理页。
+
+---
+
+## 重要操作纪律
+
+1. **一个 tag 用到底**：`<tag>-cmd.txt` 只用 `>>` 追加，不截断。要重来就换 tag。
+2. **一个控制台、一个句柄**：不要同时开第二个串口工具。
+3. **先起控制台，再刷机**：否则早期日志全丢。
+4. **复位判据**：COM3 消失 **且** adb 出现 `f91fa664 recovery`；`adb devices` 空不算。
+5. **复位发 `reboot`**（走 PSCI，可靠）；**禁 `--arm-at` 自动复位**。
+6. **panic 后进 KDP 退不出来**：已知限制（已交反编译侧排查），只能断电。
+7. **写危险寄存器前先看原值**：像 `0xfffffff9...` 这种内核指针，写随机值会直接卡死内核。
+
+更完整的纪律见 [`docs/DISCIPLINE.md`](docs/DISCIPLINE.md)。
+
+---
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 命令 + KDP |
+| `tools/pipeline.py` | 日志分析流水线 |
+| `tools/symtab.py` | 主机侧符号表（53k 符号）|
+| `module/kernel/` | 控制协议与 verb 实现（C）|
+| `module/tests/` | 命令解析单元测试 |
+| `patches/` | 内核/驱动补丁 |
+| `docs/` | 详细文档、历史记录、备份说明 |
+
+---
+
+## 备份
+
+| 内容 | 位置 | 远端 |
+|---|---|---|
+| 源码 / 设备树活源 | `docs/backup/source/`（本仓库）| ✅ 已提交 |
+| 编译产物（7 基线，2.3 GB）| 本地 `hold/_baseline_archive/20261123/` | ❌ 太大，不上传；见 [`docs/BACKUP.md`](docs/BACKUP.md) |
+
+---
+
+## 背景
+
+- 项目起点：把 DWC3 USB 控制器做成 XNU 上的 CDC ACM 控制台，替代刷探针调试。
+- 早期历史（已撤回的判断、黑洞争议等）见 [`docs/README-history-20261122.md`](docs/README-history-20261122.md)。
+- 反编译侧协作记录见 `E:/nabu/state/SYNC-TO-RE-*.md`（本机文档）。
+
+## 许可
+
+见 [LICENSE](LICENSE)。`module/` 基于
+[xiaoleGun/QcomXnuUsbDebug](https://github.com/xiaoleGun/QcomXnuUsbDebug)（MIT），改动见 `docs/module-changes.patch`。
+部分分析参考 m1n1（GPL-2.0），仅吸收方法，未整文件拷贝。所有内容仅用于自有设备的移植研究。

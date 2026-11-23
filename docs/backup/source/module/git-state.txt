@@ -1,0 +1,14 @@
+36d7ca19fac6b43a5e364f5a5560488215bfb9d4
+---
+36d7ca1 readufs: add block-internal offset to reach PANICSTR
+7f80e1e panictrig + panic slot separation (generator v42)
+989925a readufs: read the diagnostic log window back off the medium
+714ab7e verbs: system-register access, sysctl, task/thread probes, vsync read, breakpoint list
+e68c19c readpa/writepa: remove SMMU from the write list too, and pin both lists
+---tags---
+backup-20261122-plan-implement
+backup-20261123-0415-secondcdc
+backup-kb07
+baseline-kb56-readufs
+baseline-kb59-ufsoffset
+---status---
