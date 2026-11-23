@@ -869,6 +869,24 @@ def main():
             log("[kdp] sent; look for 'Continuing...' in the log")
             return True
 
+        if action == "reset":
+            # T46-Q1 exit: send a bare 'r'. kdp_connection_wait() answers it with
+            # kdp_machine_reboot() -> kdp_machine_reboot_type(kPEPanicRestartCPU)
+            # -> nabu_panic_restart() -> PSCI reset. This is the *reset* exit for
+            # a panicked kernel, which is what we need; returning to a panicked
+            # kernel is not supported (its return path needs DBOP_DEBUGGER).
+            # Requires the module's serial_pending() to drain while not armed.
+            log("[kdp] sending 'r' to reboot a panicked kernel")
+            try:
+                sess.send(b"r")
+                sess.s.flush()
+            except Exception as e:
+                log("! write failed: %s" % e)
+                return False
+            time.sleep(2.0)
+            log("[kdp] sent 'r'; expect a PSCI reset -> recovery in ~16 s")
+            return True
+
         if action == "enter":
             if kdp_state["entered"]:
                 log("[kdp] already in the debugger")

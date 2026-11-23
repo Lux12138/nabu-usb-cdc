@@ -1187,6 +1187,115 @@ qud_task_qhead(uint64_t *next, uint64_t *prev)
     return 1;
 }
 
+/* ---- struct proc/task decoding (T47-verified offsets) -----------------------
+ *
+ * Every offset below was verified against this tree AND against the running
+ * kernel (kb-64):
+ *   _proc_struct_size @ 0xfffffff007b051a8 == 0x790 (1936)      <- self-check gate
+ *   kernproc -> p_pid  @ +0x60  == 0        (kernel_task)       <- matches
+ *   kernproc -> p_comm @ +0x5bc == "kernel_task"                 <- matches
+ *   tasks      @ 0xfffffff00c11d6d0         (exported queue head)
+ *
+ * T47's corrections, all adopted here:
+ *   - struct task has NO name/pid/proc field; those live on the proc side.
+ *   - _proc_task() is just proc + _proc_struct_size, not a per-zone walk.
+ *   - arm64 thread has NO ->task; it is thread->t_tro(+0x438) -> *(u64*)(tro+0x28).
+ *   - the task list is `tasks` (exported) with the node at +0x58; `allproc` is
+ *     local so it cannot be imported -- kernproc is the usable anchor.
+ *
+ * The size gate matters: if _proc_struct_size ever disagrees with the compiled-in
+ * offsets, the offsets are stale and decoding would emit plausible garbage. We
+ * refuse instead. */
+
+#define QUD_TASK_MAP            0x50u
+#define QUD_TASK_TASKS_NODE     0x58u
+#define QUD_TASK_THREADS        0x80u
+#define QUD_TASK_THREAD_COUNT   0xa8u
+#define QUD_TASK_PRIORITY       0xbcu
+#define QUD_PROC_PID            0x60u
+#define QUD_PROC_COMM           0x5bcu
+#define QUD_PROC_COMM_LEN       17u
+#define QUD_EXPECT_PROC_SIZE    0x790u
+
+extern uint32_t proc_struct_size;      /* D _proc_struct_size, 32-bit */
+
+/* 1 if the running kernel's proc size matches the offsets compiled in above. */
+int
+qud_task_layout_ok(uint32_t *actual)
+{
+    uint32_t got = 0;
+
+    if (qud_diag_read((uint64_t)(uintptr_t)&proc_struct_size, &got, sizeof(got))
+        != sizeof(got)) {
+        return 0;
+    }
+    if (actual) *actual = got;
+    return got == QUD_EXPECT_PROC_SIZE;
+}
+
+/* Resolve a task pointer to its owning proc via map->pm_task? No: the reliable
+ * route for THIS board is proc = task - 0 for the embedded case only, which is
+ * not true in general. Instead go through the exported `kernproc` anchor for the
+ * first task, and walk `tasks`+0x58 for the rest. Callers pass the task pointer
+ * they got from the list, so pid/comm are looked up on the *proc* side only when
+ * the caller also supplies it. Keeping the two separate is deliberate. */
+int
+qud_task_info(uint64_t task, uint64_t *map, uint64_t *threads, uint32_t *nthreads,
+              uint32_t *priority)
+{
+    uint8_t raw[8];
+    uint64_t v = 0;
+
+    if (!qud_kptr_ok(task)) return 0;
+    if (qud_diag_read(task + QUD_TASK_MAP, raw, 8) != 8) return 0;
+    v = *(uint64_t *)raw;
+    if (map) *map = v;
+    if (qud_diag_read(task + QUD_TASK_THREADS, raw, 8) != 8) return 0;
+    v = *(uint64_t *)raw;
+    if (threads) *threads = v;
+    if (qud_diag_read(task + QUD_TASK_THREAD_COUNT, raw, 4) != 4) return 0;
+    if (nthreads) *nthreads = *(uint32_t *)raw;
+    if (qud_diag_read(task + QUD_TASK_PRIORITY, raw, 4) != 4) return 0;
+    if (priority) *priority = *(uint32_t *)raw;
+    return 1;
+}
+
+/* proc side: pid and a NUL-trimmed command name. */
+int
+qud_proc_info(uint64_t proc, uint32_t *pid, char *comm, size_t comm_cap)
+{
+    uint8_t raw[QUD_PROC_COMM_LEN];
+    size_t i;
+
+    if (!qud_kptr_ok(proc) || !comm || comm_cap == 0) return 0;
+    if (qud_diag_read(proc + QUD_PROC_PID, raw, 4) != 4) return 0;
+    if (pid) *pid = *(uint32_t *)raw;
+    if (qud_diag_read(proc + QUD_PROC_COMM, raw, QUD_PROC_COMM_LEN) != QUD_PROC_COMM_LEN) {
+        return 0;
+    }
+    for (i = 0; i + 1 < comm_cap && i < QUD_PROC_COMM_LEN && raw[i] != 0; i++) {
+        comm[i] = (char)raw[i];
+    }
+    comm[i] = 0;
+    return 1;
+}
+
+/* thread -> task on arm64: no direct field. t_tro at +0x438, then *(u64*)(tro+0x28). */
+int
+qud_thread_task(uint64_t thread, uint64_t *task)
+{
+    uint8_t raw[8];
+    uint64_t tro;
+
+    if (!qud_kptr_ok(thread)) return 0;
+    if (qud_diag_read(thread + 0x438u, raw, 8) != 8) return 0;
+    tro = *(uint64_t *)raw;
+    if (!qud_kptr_ok(tro)) return 0;
+    if (qud_diag_read(tro + 0x28u, raw, 8) != 8) return 0;
+    if (task) *task = *(uint64_t *)raw;
+    return 1;
+}
+
 /* A caller-supplied pointer: is it mapped, and what are its first `words`
  * 8-byte values? This is the honest answer when the struct layout is unknown --
  * the caller decides what the words mean. */

@@ -122,7 +122,7 @@ def main():
                    '_Debugger',
                    '_gPhysBase', '_real_phys_size', '_cpu_ttep',
                    '_gPanicBase', '_gPanicSize',
-                   '_sysctlbyname', '_tasks', '_kernproc',
+                   '_sysctlbyname', '_tasks', '_kernproc', '_proc_struct_size',
                    '_panic'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))

@@ -2693,6 +2693,8 @@ debugger_done:
                     reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unmapped");
                     break;
                 }
+                uint32_t layout_actual = 0;
+                const int layout_ok = qud_task_layout_ok(&layout_actual);
                 sxnu_control_writer_init(&writer, reply, sizeof(reply));
                 (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
                 (void)sxnu_control_writer_text(&writer, " ptr=0x");
@@ -2702,6 +2704,32 @@ debugger_done:
                     (void)sxnu_control_writer_decimal(&writer, i);
                     (void)sxnu_control_writer_char(&writer, '=');
                     (void)sxnu_control_writer_hex(&writer, words[i], 16);
+                }
+                /* T47: decode task fields, but only when the running kernel's
+                 * _proc_struct_size matches the offsets we compiled in. A stale
+                 * layout would emit plausible garbage rather than failing, so the
+                 * gate is the whole point. */
+                if (layout_ok) {
+                    uint64_t tmap = 0, tthreads = 0;
+                    uint32_t nthreads = 0, prio = 0;
+                    (void)sxnu_control_writer_text(&writer, " layout=ok");
+                    if (qud_task_info(want, &tmap, &tthreads, &nthreads, &prio)) {
+                        (void)sxnu_control_writer_text(&writer, " task_map=0x");
+                        (void)sxnu_control_writer_hex(&writer, tmap, 16);
+                        (void)sxnu_control_writer_text(&writer, " threads=0x");
+                        (void)sxnu_control_writer_hex(&writer, tthreads, 16);
+                        (void)sxnu_control_writer_text(&writer, " nthreads=");
+                        (void)sxnu_control_writer_decimal(&writer, nthreads);
+                        (void)sxnu_control_writer_text(&writer, " prio=");
+                        (void)sxnu_control_writer_decimal(&writer, prio);
+                        (void)sxnu_control_writer_text(&writer, " task_ok=1");
+                    } else {
+                        (void)sxnu_control_writer_text(&writer, " task_ok=0");
+                    }
+                } else {
+                    (void)sxnu_control_writer_text(&writer, " layout=stale actual=");
+                    (void)sxnu_control_writer_hex(&writer, layout_actual, 8);
+                    (void)sxnu_control_writer_text(&writer, " want=0x790");
                 }
                 reply_bytes = sxnu_control_reply_finish(&writer);
             }
@@ -2753,6 +2781,17 @@ debugger_done:
         (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
         (void)sxnu_control_writer_text(&writer, " ptr=0x");
         (void)sxnu_control_writer_hex(&writer, want, 16);
+        /* T47: arm64 has no thread->task field. Go t_tro(+0x438) -> *(u64*)(tro+0x28). */
+        {
+            uint64_t owner = 0;
+            if (qud_thread_task(want, &owner)) {
+                (void)sxnu_control_writer_text(&writer, " owner_task=0x");
+                (void)sxnu_control_writer_hex(&writer, owner, 16);
+                (void)sxnu_control_writer_text(&writer, " thread_ok=1");
+            } else {
+                (void)sxnu_control_writer_text(&writer, " thread_ok=0");
+            }
+        }
         for (unsigned i = 0; i < 8u; i++) {
             (void)sxnu_control_writer_text(&writer, " w");
             (void)sxnu_control_writer_decimal(&writer, i);
@@ -3376,7 +3415,21 @@ qcom_usb_debug_serial_pending(void)
      *
      * serial_rx_drain() takes usb_busy with a non-blocking exchange, so a
      * concurrent worker or a re-entrant call simply leaves the ring to the
-     * next poll; it can never deadlock from here. */
+     * next poll; it can never deadlock from here.
+     *
+     * T46-Q1 (kb-61, kb-62): two attempts to let a panicked kernel read 'r' out
+     * of this predicate both failed and were reverted.
+     *   kb-61 opened the not-armed path, but serial_rx_drain() needs usb_busy and
+     *         a panic usually starts from inside that lock (the panic print goes
+     *         through qcom_usb_debug_write), so acquire() fails and the ring is
+     *         never read.
+     *   kb-62 added a lock-free dwc3_read() instead, and the board went silent at
+     *         once -- not even the panic() text came out. Reading the controller
+     *         without the worker's state is not safe just because the worker is
+     *         stopped; it left the TRB ring inconsistent and killed TX too.
+     * Constraint recorded here so nobody repeats it: this predicate must not
+     * touch DWC3 outside the worker's lock. A reset exit from a panic needs a
+     * change in osfmk/kern/debug.c (reset before kdp_connection_wait), not here. */
     if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
     if (kdp_rx_used == 0) serial_rx_drain();
     return kdp_rx_used;
@@ -3468,7 +3521,6 @@ qcom_usb_debug_serial_poll(void)
 {
     serial_rx_drain();
 }
-
 void qcom_usb_debug_poll(void)
 {
     serial_rx_drain();
