@@ -473,6 +473,204 @@ def main():
         if reply:
             log("var %s @0x%016x: %s" % (parts[0], addr, reply))
 
+    # READ's reply is capped at SXNU_CONTROL_REPLY_BYTES (512) and the frame
+    # overhead leaves ~192 bytes of data, so anything larger has to be read in
+    # chunks. Arrays here run to 320 bytes; silently truncating them made the
+    # first batch report "read failed" while the board had answered fine.
+    READ_CHUNK = 192
+
+    def read_bytes(addr, nbytes):
+        """Read nbytes from a kernel VA in <=READ_CHUNK pieces; None on failure."""
+        out = bytearray()
+        while len(out) < nbytes:
+            want = min(READ_CHUNK, nbytes - len(out))
+            reply = send_cmd("READ", "0x%x %x" % (addr + len(out), want))
+            if not reply or "state=ready" not in reply:
+                return None
+            kv = dict(x.split("=", 1) for x in reply.split() if "=" in x)
+            raw = kv.get("data")
+            if not raw:
+                return None
+            piece = binascii.unhexlify(raw)
+            if not piece:
+                return None
+            out += piece
+            if len(piece) < want:
+                break
+        return bytes(out) if len(out) >= nbytes else None
+
+    def read_words(addr, nwords):
+        d = read_bytes(addr, nwords * 4)
+        if d is None:
+            return None
+        return [int.from_bytes(d[i:i + 4], "little") for i in range(0, len(d) - 3, 4)]
+
+    def read_qwords(addr, n):
+        d = read_bytes(addr, n * 8)
+        if d is None:
+            return None
+        return [int.from_bytes(d[i:i + 8], "little") for i in range(0, len(d) - 7, 8)]
+
+    def sym_addr(name):
+        a, err = resolve_addr(name)
+        if a is None:
+            log("! 符号 %s 解析失败: %s" % (name, err))
+        return a
+
+    # ---- 方案第 3 组：内存管理（全部读现有数组，零内核改动）----
+    # 槽位语义来自驱动源码，见 docs/MEMORY-STATS.md。
+    def cmd_vmstat(arg):
+        a = sym_addr("_native_adreno_vm_phase_us")
+        if a is None:
+            return
+        rows = read_qwords(a, 16)
+        if not rows or len(rows) < 16:
+            log("! vmstat 读取失败")
+            return
+        names = ["calls", "metadata_us", "cache_us", "tables_us",
+                 "index_us", None, "max_us", "bytes"]
+        for r in (0, 1):
+            ph = rows[r * 8:(r + 1) * 8]
+            extra = "release_us" if r else "preflight_us"
+            parts = []
+            for i in range(8):
+                parts.append("%s=%d" % (names[i] or extra, ph[i]))
+            log("VMSTAT %s %s" % ("unmap" if r else "map", " ".join(parts)))
+
+    def cmd_memstat(arg):
+        a = sym_addr("_native_adreno_backing_cache_stats")
+        if a is None:
+            return
+        v = read_qwords(a, 12)
+        if not v or len(v) < 12:
+            log("! memstat 读取失败")
+            return
+        log("MEMSTAT backing_cache %s" % " ".join("s%d=%d" % (i, v[i]) for i in range(12)))
+
+    def cmd_poolstat(arg):
+        a = sym_addr("_native_adreno_pool_stats")
+        if a is None:
+            return
+        v = read_words(a, 8)
+        if not v or len(v) < 8:
+            log("! poolstat 读取失败")
+            return
+        log("POOLSTAT pool_mib=%d pool_bos=%d fallback_bos=%d used_mib=%d "
+            "peak_mib=%d scattered_bos=%d scattered_spans=%d imported_spans=%d"
+            % tuple(v[:8]))
+
+    def cmd_memstage(arg):
+        a = sym_addr("_native_adreno_memory_stage_stats")
+        if a is None:
+            return
+        rows = read_qwords(a, 40)
+        if not rows or len(rows) < 40:
+            log("! memstage 读取失败")
+            return
+        stages = ["allocation", "prepare", "spans", "zero", "initial_clean",
+                  "set_wc", "reassert_wc", "restore_attributes", "complete",
+                  "descriptor_release"]
+        printed = 0
+        for i, nm in enumerate(stages):
+            r = rows[i * 4:(i + 1) * 4]
+            if any(r):
+                log("MEMSTAGE %-18s a=%d b=%d c=%d d=%d" % (nm, r[0], r[1], r[2], r[3]))
+                printed += 1
+        if not printed:
+            # All zero: say so instead of printing nothing. Silence is
+            # indistinguishable from a broken verb.
+            log("MEMSTAGE all ten stages are zero (array still at its initial "
+                "value on this boot)")
+
+    def cmd_aliasstat(arg):
+        a = sym_addr("_nabu_alias_stats")
+        if a is None:
+            return
+        v = read_qwords(a, 6)
+        if not v or len(v) < 6:
+            log("! aliasstat 读取失败")
+            return
+        log("ALIASSTAT builds=%d max_hits=%d sum_hits=%d s3=%d s4=%d s5=%d" % tuple(v[:6]))
+
+    def cmd_ib(arg):
+        """IB [n] -- dump the ring's last 4 submitted IB headers (n=4 by default)."""
+        cnt_a = sym_addr("_native_adreno_ib_log_count")
+        arr_a = sym_addr("_native_adreno_ib_log")
+        if cnt_a is None or arr_a is None:
+            return
+        cnt = read_words(cnt_a, 1)
+        if not cnt:
+            log("! ib 读取失败（count）")
+            return
+        total = cnt[0]
+        log("IB count=%d slots=%d" % (total, min(4, total)))
+        n = 4
+        if arg.strip():
+            try:
+                n = max(1, min(4, int(arg.strip(), 0)))
+            except ValueError:
+                pass
+        for i in range(n):
+            v = read_words(arr_a + i * (4 + 28) * 4, 32)
+            if not v or len(v) < 32:
+                log("! ib slot %d 读取失败" % i)
+                return
+            if not any(v):
+                continue
+            log("IB slot=%d fence=%d iova=%08x%08x bytes=%d" %
+                (i, v[0], v[2], v[1], v[3]))
+            log("   head %s" % " ".join("%08x" % x for x in v[4:20]))
+            log("   more %s" % " ".join("%08x" % x for x in v[20:32]))
+
+    # ---- 方案第 4/7 组：其余可零改动读取的数组 ----
+    def cmd_methods(arg):
+        """METHODS -- the 20 gpu method slots (calls/failures/status/total_us)."""
+        a = sym_addr("_native_adreno_method_stats")
+        if a is None:
+            return
+        v = read_words(a, 80)
+        if not v or len(v) < 80:
+            log("! methods 读取失败")
+            return
+        printed = 0
+        for m in range(20):
+            r = v[m * 4:(m + 1) * 4]
+            if r[0]:
+                log("METHOD %2d calls=%d failures=%d status=%08x total_us=%d"
+                    % (m, r[0], r[1], r[2], r[3]))
+                printed += 1
+        if not printed:
+            log("METHODS all 20 slots are zero on this boot")
+
+    def cmd_clients(arg):
+        """CLIENTS -- the 5 client slots."""
+        a = sym_addr("_native_adreno_client_stats")
+        if a is None:
+            return
+        v = read_words(a, 30)
+        if not v or len(v) < 30:
+            log("! clients 读取失败")
+            return
+        printed = 0
+        for i in range(5):
+            r = v[i * 6:(i + 1) * 6]
+            if any(r):
+                log("CLIENT slot=%d %s" % (i, " ".join("s%d=%d" % (j, r[j]) for j in range(6))))
+                printed += 1
+        if not printed:
+            log("CLIENTS all 5 slots are zero on this boot")
+
+    def cmd_waitouter(arg):
+        """WAITOUTER -- the four external-method wait counters."""
+        a = sym_addr("_native_adreno_wait_outer")
+        if a is None:
+            return
+        v = read_qwords(a, 4)
+        if not v or len(v) < 4:
+            log("! waitouter 读取失败")
+            return
+        log("WAITOUTER s0=%d s1=%d s2=%d s3=%d" % tuple(v[:4]))
+
     def cmd_dump(arg):
         """dump <addr> <len> <file> | dumppa <pa> <len> <file>"""
         parts = arg.split()
@@ -1061,6 +1259,30 @@ def main():
                     cmd_syms(rest)
                 elif verb == "VAR":
                     cmd_var(rest)
+                elif verb == "VMSTAT":
+                    cmd_vmstat(rest)
+                elif verb == "MEMSTAT":
+                    cmd_memstat(rest)
+                elif verb == "POOLSTAT":
+                    cmd_poolstat(rest)
+                elif verb == "MEMSTAGE":
+                    cmd_memstage(rest)
+                elif verb == "ALIASSTAT":
+                    cmd_aliasstat(rest)
+                elif verb == "IB":
+                    cmd_ib(rest)
+                elif verb == "METHODS":
+                    cmd_methods(rest)
+                elif verb == "CLIENTS":
+                    cmd_clients(rest)
+                elif verb == "WAITOUTER":
+                    cmd_waitouter(rest)
+                elif verb == "METHODS":
+                    cmd_methods(rest)
+                elif verb == "CLIENTS":
+                    cmd_clients(rest)
+                elif verb == "WAITOUTER":
+                    cmd_waitouter(rest)
                 elif verb in ("DUMP", "DUMPPA"):
                     cmd_dump(raw)
                 elif verb == "STATS":
@@ -1139,6 +1361,30 @@ def main():
                         cmd_syms(rest)
                     elif verb == "VAR":
                         cmd_var(rest)
+                    elif verb == "VMSTAT":
+                        cmd_vmstat(rest)
+                    elif verb == "MEMSTAT":
+                        cmd_memstat(rest)
+                    elif verb == "POOLSTAT":
+                        cmd_poolstat(rest)
+                    elif verb == "MEMSTAGE":
+                        cmd_memstage(rest)
+                    elif verb == "ALIASSTAT":
+                        cmd_aliasstat(rest)
+                    elif verb == "IB":
+                        cmd_ib(rest)
+                    elif verb == "METHODS":
+                        cmd_methods(rest)
+                    elif verb == "CLIENTS":
+                        cmd_clients(rest)
+                    elif verb == "WAITOUTER":
+                        cmd_waitouter(rest)
+                    elif verb == "METHODS":
+                        cmd_methods(rest)
+                    elif verb == "CLIENTS":
+                        cmd_clients(rest)
+                    elif verb == "WAITOUTER":
+                        cmd_waitouter(rest)
                     elif verb in ("DUMP", "DUMPPA"):
                         cmd_dump(raw)
                     elif verb == "STATS":
