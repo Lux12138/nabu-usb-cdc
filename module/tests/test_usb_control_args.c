@@ -119,6 +119,7 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_VERSION, "VERSION", 1);
     check_accept(SXNU_CONTROL_VERB_DUMPUFS, "DUMPUFS 0x1008000 0x1000 smmu", 1);
     check_accept(SXNU_CONTROL_VERB_READUFS, "READUFS 0 1", 1);
+    check_accept(SXNU_CONTROL_VERB_PANICTRIG, "PANICTRIG PANIC-NOW", 1);
     check_accept(SXNU_CONTROL_VERB_READUFS, "READUFS 0x10", 1);
     check_accept(SXNU_CONTROL_VERB_DUMLIST, "DUMLIST", 1);
     check_accept(SXNU_CONTROL_VERB_UPTIME, "UPTIME", 1);
@@ -178,6 +179,7 @@ main(void)
     check("VERSION", 1, SXNU_CONTROL_VERB_VERSION, "");
     check("DUMPUFS 0x1008000 0x1000 smmu", 1, SXNU_CONTROL_VERB_DUMPUFS, "0x1008000 0x1000 smmu");
     check("READUFS 0x10 1", 1, SXNU_CONTROL_VERB_READUFS, "0x10 1");
+    check("PANICTRIG PANIC-NOW", 1, SXNU_CONTROL_VERB_PANICTRIG, "PANIC-NOW");
     check("READUFS 0x10", 1, SXNU_CONTROL_VERB_READUFS, "0x10");
     check("DUMLIST", 1, SXNU_CONTROL_VERB_DUMLIST, "");
     /* kb-40: both spellings must resolve. The console upper-cases what the user

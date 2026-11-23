@@ -546,6 +546,22 @@ def main():
             if reply:
                 log("PTDUMP %s -> %s" % (token, reply))
 
+    def cmd_panictrig(arg):
+        """panictrig  -- panic on purpose, then read the panic tail after reboot.
+
+        Requires BOTH the nabu-panic-trig=1 boot-arg and the literal key
+        PANIC-NOW, so it cannot fire from a typo. The kernel answers OK first and
+        then panics; expect the CDC link to die and the board to come back in
+        recovery."""
+        if arg.strip() != "PANIC-NOW":
+            log("用法: panictrig   (会立即让内核 panic，且必须先在 boot-args 加 nabu-panic-trig=1)")
+            log("     安全阀：必须原样带 PANIC-NOW，否则内核回 ERR state=args")
+            return
+        log(">>> 即将触发 panic：内核会立即死，CDC 会掉。这是预期行为。")
+        reply = send_cmd("PANICTRIG", "PANIC-NOW", timeout=15.0)
+        log("PANICTRIG -> %s" % (reply or "无回复（内核可能在回复前就死了，也是预期）"))
+        log(">>> 现在等设备回 recovery，然后启动新内核，用 readufs 8166..8190 读 panic 槽")
+
     def cmd_readufs(arg):
         """readufs <relblock> [<relblock> ...]  -- read the diagnostic log window.
 
@@ -558,11 +574,17 @@ def main():
             log("用法: readufs <relblock> [<relblock> ...]   (块偏移，0 = 日志窗开头)")
             return
         for w in words:
-            try:
-                rel = int(w, 0)
-            except ValueError:
-                log("! readufs: 非法偏移 %r" % w)
-                continue
+            # Named offsets, so nobody has to remember the slot numbers.
+            named = {"panic": 8190, "panicheader": 8190,
+                     "panictail": 8166, "header": 0, "tail": 1}
+            if w.lower() in named:
+                rel = named[w.lower()]
+            else:
+                try:
+                    rel = int(w, 0)
+                except ValueError:
+                    log("! readufs: 非法偏移 %r（可用 header/tail/panic/panictail）" % w)
+                    continue
             reply = send_cmd("READUFS", "0x%x 1" % rel, timeout=30.0)
             if not reply:
                 log("! readufs %d: 无回复" % rel)
@@ -1059,6 +1081,8 @@ def main():
                         cmd_panicdump(rest)
                     elif verb == "READUFS":
                         cmd_readufs(rest)
+                    elif verb == "PANICTRIG":
+                        cmd_panictrig(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":

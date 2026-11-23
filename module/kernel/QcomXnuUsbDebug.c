@@ -45,6 +45,18 @@ extern void Debugger(const char *message) __attribute__((weak_import));
 /* Arbitrary kernel memory access for the diagnostics verbs; QcomUsbDiag.c. */
 #include "QcomUsbDiag.c"
 
+/* The real panic(), deliberately NOT the osfmk/kern/debug.h macro: that header
+ * is kernel-private and its panic() appends the call site, which would put
+ * __FILE__/__LINE__ in the message instead of the marker PANICTRIG wants.
+ * _panic is on the build.py import allow-list. */
+/* panic is already a macro in the kernel headers this file pulls in, so the
+ * declaration has to escape it with parentheses. Same for the call site. */
+extern void (panic)(const char *format, ...) __attribute__((noreturn));
+
+/* Defined far below (the KDP reply gate), but PANICTRIG needs it before the call
+ * to make sure the panic message can still leave. */
+void qcom_usb_debug_kdp_tx_mode(int on);
+
 /* kb-17u KDP ring state. Declared up here because qcom_usb_debug_write()
  * (which runs from kprintf) and the DEBUGGER verb both consult them
  * long before the ring implementation further down. */
@@ -1449,6 +1461,53 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
+    }
+    case SXNU_CONTROL_VERB_PANICTRIG: {
+        /* PANICTRIG <key>: panic on purpose, to test that the landing path's
+         * is_panic=1 tail survives a reboot. This is the only verb that is
+         * allowed to take the kernel down, so it is behind a boot-arg gate AND
+         * requires a literal key -- two independent ways to not fire by accident.
+         *
+         * the panic is noreturn, so the reply is written to the wire before
+         * the call. Everything the host needs to correlate is in that reply.
+         *
+         * osfmk/kern/debug.h is kernel-private and its panic() is a macro, so the
+         * real symbol is declared locally and the import is
+         * allow-listed as _panic. */
+        static const char want[] = "PANIC-NOW";
+        unsigned gated = 0;
+        int key_ok = 0;
+        (void)PE_parse_boot_argn("nabu-panic-trig", &gated, sizeof(gated));
+        if (frame->arg_bytes == sizeof(want) - 1u) {
+            const uint8_t *tok[1]; size_t len[1];
+            if (control_args_split(frame->args, frame->arg_bytes, tok, len, 1) == 1 &&
+                len[0] == sizeof(want) - 1u) {
+                unsigned i;
+                key_ok = 1;
+                for (i = 0; i + 1u < sizeof(want); i++) {
+                    if (tok[0][i] != (uint8_t)want[i]) { key_ok = 0; break; }
+                }
+            }
+        }
+        if (!gated || !key_ok) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                !gated ? "gated" : "args");
+            break;
+        }
+        {
+            struct sxnu_control_writer w2;
+            sxnu_control_writer_init(&w2, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&w2, frame->session, frame->seq,
+                                           frame->verb, "OK");
+            (void)sxnu_control_writer_text(&w2, " state=panicking");
+            reply_bytes = sxnu_control_reply_finish(&w2);
+        }
+        /* Send the reply first: panic does not return, so anything queued
+         * afterwards never leaves. qcom_usb_debug_write drains synchronously. */
+        (void)qcom_usb_debug_write(reply, reply_bytes);
+        qcom_usb_debug_kdp_tx_mode(1);
+        (panic)("nabu: PANICTRIG requested by host");
+        break;   /* not reached */
     }
     case SXNU_CONTROL_VERB_READUFS: {
         /* READUFS <hexrel> [<hexblocks>]: read the diagnostic log window back off
