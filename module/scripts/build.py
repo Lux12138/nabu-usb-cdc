@@ -120,7 +120,8 @@ def main():
                    '_native_ufs_dpu_smmu', '_native_ufs_dpu_state',
                    '_Debugger',
                    '_gPhysBase', '_real_phys_size', '_cpu_ttep',
-                   '_gPanicBase', '_gPanicSize'}
+                   '_gPanicBase', '_gPanicSize',
+                   '_sysctlbyname', '_tasks', '_kernproc'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in

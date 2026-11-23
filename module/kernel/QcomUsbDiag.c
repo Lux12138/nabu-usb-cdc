@@ -1061,6 +1061,406 @@ qud_panic_header(struct qud_panic_summary *out)
     return 1;
 }
 
+/* ---- SYSCTL -------------------------------------------------------------
+ *
+ * sysctlbyname() is exported (nm type S), so the console can ask the kernel the
+ * same questions a user-space tool would. Read only: a stray sysctl write can
+ * change scheduler or VM behaviour mid-boot, so the write side is not exposed.
+ *
+ * oldlenp is in/out -- pass the buffer size in, get the real length back -- and
+ * the kernel answers ENOMEM (12) with the required size filled in when the
+ * buffer is too small, which is what makes the two-step probe below work. */
+extern int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                        void *newp, size_t newlen) __attribute__((weak_import));
+
+/* Read a sysctl into out.
+ *   >= 0  bytes produced
+ *   -1    sysctlbyname not exported in this kernel
+ *   -2    name not found or other error
+ *   -3    the value does not fit in cap (the real size is written to *needed) */
+int
+qud_sysctl_read(const char *name, void *out, size_t cap, size_t *needed)
+{
+    size_t len = cap;
+    int rc;
+
+    if (needed) *needed = 0;
+    if (!name || !*name || !out || !cap) return -2;
+    if (&sysctlbyname == 0) return -1;
+
+    rc = sysctlbyname(name, out, &len, NULL, 0);
+    if (needed) *needed = len;
+    if (rc == 0) return (int)len;
+    if (len > cap) return -3;
+    return -2;
+}
+
+/* ---- TASKDUMP / THREADDUMP ---------------------------------------------
+ *
+ * Design note, because this is the one place where the obvious approach was
+ * deliberately rejected.
+ *
+ * The obvious approach is to walk the exported `tasks` queue and decode each
+ * struct task. It does not work reliably here:
+ *
+ *   - allproc is not exported (nm type s), so the process side is out.
+ *   - `tasks` IS exported, but its chain entries are `&task->tasks`, so
+ *     recovering the struct base needs offsetof(struct task, tasks) -- and
+ *     struct task is full of #if DEVELOPMENT / MACH_ASSERT /
+ *     CONFIG_SCHED_MULTIQ fields, so that offset cannot be mirrored from the
+ *     headers without reproducing the whole build configuration.
+ *   - _proc_task() does not read a fixed p_task offset either: it computes
+ *     global_base + 0x1a8 + proc_off, i.e. the field lives behind a per-zone
+ *     layout. Hardcoding anything from that would be a guess.
+ *
+ * A wrong offset here does not fail cleanly -- it reports plausible garbage, and
+ * in the worst case the walk dereferences a wild pointer. Three bricks already
+ * taught what guessing costs.
+ *
+ * So these verbs report what is true without decoding: the exported anchors, the
+ * raw queue words, and whether a caller-supplied pointer is mapped. A caller who
+ * wants a field can PTDUMP the address, confirm the translation, then READ the
+ * offset it cares about -- with the walk itself staying inside the validated
+ * read path. Nothing here dereferences a pointer it has not bounds-checked. */
+
+/* `tasks` is a queue_head_t ({next, prev}); the type is not in this module's
+ * header set, so it is declared through its address instead -- the two words are
+ * read explicitly below. */
+extern char tasks;                   /* osfmk/kern/task.c, exported (nm type S) */
+extern void *kernproc;               /* bsd/kern/kern_proc.c, exported as _kernproc */
+
+/* Is this a kernel pointer safe to dereference? Only alignment and "the page
+ * translates" are checked -- that is enough to stop a garbage word from being
+ * followed, and it costs nothing on the happy path. */
+static int
+qud_kptr_ok(uint64_t p)
+{
+    if (!p) return 0;
+    if (p & 3u) return 0;                          /* pointers are at least 4-aligned */
+    return mmu_kvtop(p & ~UINT64_C(0xfff)) != 0;
+}
+
+/* The queue head's two words. Returns 1 when the head itself is readable. */
+int
+qud_task_qhead(uint64_t *next, uint64_t *prev)
+{
+    const uint64_t head = (uint64_t)(uintptr_t)&tasks;
+    uint64_t words[2] = { 0, 0 };
+
+    if (!qud_kptr_ok(head)) return 0;
+    if (qud_diag_read(head, words, sizeof(words)) != sizeof(words)) return 0;
+    if (next) *next = words[0];
+    if (prev) *prev = words[1];
+    return 1;
+}
+
+/* A caller-supplied pointer: is it mapped, and what are its first `words`
+ * 8-byte values? This is the honest answer when the struct layout is unknown --
+ * the caller decides what the words mean. */
+int
+qud_ptr_probe(uint64_t va, uint64_t *words, unsigned count)
+{
+    if (!words || !count || count > 8u) return 0;
+    if (!qud_kptr_ok(va)) return 0;
+    if (qud_diag_read(va, words, (size_t)count * sizeof(uint64_t))
+        != (size_t)count * sizeof(uint64_t)) return 0;
+    return 1;
+}
+
+/* ---- BKP*: software breakpoint table ------------------------------------
+ *
+ * Pure module state: a list of kernel virtual addresses the operator wants to
+ * remember, with an optional 32-bit word to compare. Nothing is written to the
+ * kernel, no hardware breakpoint registers are programmed, and no exception
+ * handler is installed -- those need CPU debug registers per core, which this
+ * module has no business touching from a USB worker.
+ *
+ * What it is good for: pairing with PTDUMP. Register an address, let PTDUMP walk
+ * it, then dump the word -- a poor man's watchpoint that survives the rebuild
+ * cycle because the addresses live in the console, not in the kernel. */
+#define QUD_BKP_MAX 8u
+
+struct qud_bkp_entry {
+    uint64_t va;
+    uint32_t kind;      /* caller-defined tag; 0 = unset */
+    uint32_t used;
+};
+
+static struct qud_bkp_entry qud_bkp_table[QUD_BKP_MAX];
+
+/* Returns slot index, -1 full, -2 bad address, -3 duplicate. */
+int
+qud_bkp_add(uint64_t va, uint32_t kind)
+{
+    if (!qud_kptr_ok(va)) return -2;
+    for (unsigned i = 0; i < QUD_BKP_MAX; i++)
+        if (qud_bkp_table[i].used && qud_bkp_table[i].va == va) return -3;
+    for (unsigned i = 0; i < QUD_BKP_MAX; i++) {
+        if (!qud_bkp_table[i].used) {
+            qud_bkp_table[i].va = va;
+            qud_bkp_table[i].kind = kind;
+            qud_bkp_table[i].used = 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Returns 1 when removed, 0 when the address was not registered. */
+int
+qud_bkp_del(uint64_t va)
+{
+    for (unsigned i = 0; i < QUD_BKP_MAX; i++) {
+        if (qud_bkp_table[i].used && qud_bkp_table[i].va == va) {
+            qud_bkp_table[i].used = 0;
+            qud_bkp_table[i].va = 0;
+            qud_bkp_table[i].kind = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Snapshot for BKPLIST. Returns how many slots are in use. */
+int
+qud_bkp_list(struct qud_bkp_entry *out, unsigned max)
+{
+    unsigned n = 0;
+    if (!out) return 0;
+    for (unsigned i = 0; i < QUD_BKP_MAX && n < max; i++)
+        if (qud_bkp_table[i].used) out[n++] = qud_bkp_table[i];
+    return (int)n;
+}
+
+/* ---- SYSREG / SYSREGW: system register access ----------------------------
+ *
+ * This is the console's only blank spot that mattered: everything else reads
+ * memory, page tables or MMIO, but nothing could read a system register, and
+ * TCR/TTBR/SCTLR are exactly what PTDUMP needs to be cross-checked against.
+ * (PTDUMP currently derives its geometry from TCR_EL1 on its own; being able to
+ * read TCR_EL1 independently is what turns that from "the code computes this"
+ * into "here is the register".)
+ *
+ * Why a table of 44 instead of all 2137 names: MRS/MSR take the register
+ * encoding as an *immediate*, so a runtime-computed encoding cannot be used --
+ * the instruction has to exist at compile time. The m1n1 approach encodes the
+ * instruction word and executes it, which needs a writable-executable page; this
+ * module maps device memory through ml_io_map, not code pages, and creating an
+ * RX mapping from a USB worker is not something to do on a running kernel.
+ *
+ * So the table covers the registers that matter for bring-up -- identity, the
+ * translation regime, fault status, EL0 thread pointers, the debug registers --
+ * and anything else answers "unsupported" together with the encoding it would
+ * need, so extending the table is a copy-paste rather than an investigation.
+ *
+ * Encodings come from m1n1's proxyclient/m1n1/arm_regs.json (the ARM standard
+ * name table), field order (op0, op1, CRn, CRm, op2). Only _EL1/_EL0 registers
+ * are listed: an EL2/EL3 register would trap at EL1, and a trap here is a panic.
+ *
+ * Writes are gated behind nabu-sysreg-write=1 for the same reason WRITEPA is
+ * gated: SCTLR_EL1 and TCR_EL1 are one store away from an unrecoverable machine.
+ * Reads need no gate -- MRS has no side effects. */
+struct qud_sysreg {
+    const char *name;
+    uint8_t op0, op1, crn, crm, op2;
+    uint8_t readable, writable;
+};
+
+static const struct qud_sysreg qud_sysregs[] = {
+    { "MIDR_EL1",        3,0, 0,0,0,  1,0 },
+    { "MPIDR_EL1",       3,0, 0,0,5,  1,0 },
+    { "REVIDR_EL1",      3,0, 0,0,6,  1,0 },
+    { "CTR_EL0",         3,3, 0,0,1,  1,0 },
+    { "DCZID_EL0",       3,3, 0,0,7,  1,0 },
+    { "ID_AA64PFR0_EL1", 3,0, 0,4,0,  1,0 },
+    { "ID_AA64PFR1_EL1", 3,0, 0,4,1,  1,0 },
+    { "ID_AA64ISAR0_EL1",3,0, 0,6,0,  1,0 },
+    { "ID_AA64ISAR1_EL1",3,0, 0,6,1,  1,0 },
+    { "ID_AA64MMFR0_EL1",3,0, 0,7,0,  1,0 },
+    { "ID_AA64MMFR1_EL1",3,0, 0,7,1,  1,0 },
+    { "ID_AA64MMFR2_EL1",3,0, 0,7,2,  1,0 },
+    { "ID_AA64DFR0_EL1", 3,0, 0,5,0,  1,0 },
+    { "ID_AA64DFR1_EL1", 3,0, 0,5,1,  1,0 },
+    { "SCTLR_EL1",       3,0, 1,0,0,  1,1 },
+    { "TCR_EL1",         3,0, 2,0,2,  1,1 },
+    { "TTBR0_EL1",       3,0, 2,0,0,  1,1 },
+    { "TTBR1_EL1",       3,0, 2,0,1,  1,1 },
+    { "MAIR_EL1",        3,0,10,2,0,  1,1 },
+    { "VBAR_EL1",        3,0,12,0,0,  1,1 },
+    { "ESR_EL1",         3,0, 5,2,0,  1,1 },
+    { "FAR_EL1",         3,0, 6,0,0,  1,1 },
+    { "ELR_EL1",         3,0, 4,0,1,  1,1 },
+    { "SPSR_EL1",        3,0, 4,0,0,  1,1 },
+    { "SP_EL0",          3,0, 4,1,0,  1,1 },
+    { "SP_EL1",          3,4, 4,1,0,  1,1 },
+    { "TPIDR_EL0",       3,3,13,0,2,  1,1 },
+    { "TPIDR_EL1",       3,0,13,0,4,  1,1 },
+    { "TPIDRRO_EL0",     3,3,13,0,3,  1,1 },
+    { "CNTKCTL_EL1",     3,0,14,1,0,  1,1 },
+    { "CPACR_EL1",       3,0, 1,0,2,  1,1 },
+    { "CONTEXTIDR_EL1",  3,0,13,0,1,  1,1 },
+    { "PAR_EL1",         3,0, 7,4,0,  1,1 },
+    { "MDSCR_EL1",       2,0, 0,2,2,  1,1 },
+    { "OSLAR_EL1",       2,0, 1,0,4,  0,1 },
+    { "OSDLR_EL1",       2,0, 1,3,4,  1,1 },
+    { "DBGBVR0_EL1",     2,0, 0,0,4,  1,1 },
+    { "DBGBCR0_EL1",     2,0, 0,0,5,  1,1 },
+    { "DBGWVR0_EL1",     2,0, 0,0,6,  1,1 },
+    { "DBGWCR0_EL1",     2,0, 0,0,7,  1,1 },
+    { "PMCR_EL0",        3,3, 9,12,0, 1,1 },
+    { "PMCCNTR_EL0",     3,3, 9,13,0, 1,1 },
+    { "PMUSERENR_EL0",   3,3, 9,14,0, 1,1 },
+};
+
+static int qud_sysreg_write_enabled = -1;
+
+static int
+qud_sysreg_writes_allowed(void)
+{
+    if (qud_sysreg_write_enabled < 0) {
+        int v = 0;
+        PE_parse_boot_argn("nabu-sysreg-write", &v, sizeof(v));
+        qud_sysreg_write_enabled = v ? 1 : 0;
+    }
+    return qud_sysreg_write_enabled;
+}
+
+/* Compare a token against a table name. Returns 1 on exact match. */
+static int
+qud_name_eq(const uint8_t *tok, size_t len, const char *name)
+{
+    size_t i = 0;
+    while (i < len && name[i] && (char)tok[i] == name[i]) i++;
+    return i == len && name[i] == 0;
+}
+
+/* Find a table entry by name. Returns NULL when unknown. */
+static const struct qud_sysreg *
+qud_sysreg_find(const uint8_t *tok, size_t len)
+{
+    for (unsigned i = 0; i < sizeof(qud_sysregs)/sizeof(qud_sysregs[0]); i++)
+        if (qud_name_eq(tok, len, qud_sysregs[i].name)) return &qud_sysregs[i];
+    return NULL;
+}
+
+/* The read side. Every case below is a compile-time constant encoding, which is
+ * what MRS needs. Keep this list in the same order as the table above. */
+#define QUD_MRS(r)  __asm__ volatile("mrs %0, " #r : "=r"(v))
+#define QUD_MSR(r)  __asm__ volatile("msr " #r ", %0" :: "r"(value) : "memory")
+
+int
+qud_sysreg_read(const uint8_t *tok, size_t len, uint64_t *out)
+{
+    uint64_t v = 0;
+
+    if (!out) return 0;
+    if (qud_name_eq(tok, len, "MIDR_EL1"))         { QUD_MRS(midr_el1); }
+    else if (qud_name_eq(tok, len, "MPIDR_EL1"))   { QUD_MRS(mpidr_el1); }
+    else if (qud_name_eq(tok, len, "REVIDR_EL1"))  { QUD_MRS(revidr_el1); }
+    else if (qud_name_eq(tok, len, "CTR_EL0"))     { QUD_MRS(ctr_el0); }
+    else if (qud_name_eq(tok, len, "DCZID_EL0"))   { QUD_MRS(dczid_el0); }
+    else if (qud_name_eq(tok, len, "ID_AA64PFR0_EL1"))  { QUD_MRS(id_aa64pfr0_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64PFR1_EL1"))  { QUD_MRS(id_aa64pfr1_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64ISAR0_EL1")) { QUD_MRS(id_aa64isar0_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64ISAR1_EL1")) { QUD_MRS(id_aa64isar1_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64MMFR0_EL1")) { QUD_MRS(id_aa64mmfr0_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64MMFR1_EL1")) { QUD_MRS(id_aa64mmfr1_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64MMFR2_EL1")) { QUD_MRS(id_aa64mmfr2_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64DFR0_EL1"))  { QUD_MRS(id_aa64dfr0_el1); }
+    else if (qud_name_eq(tok, len, "ID_AA64DFR1_EL1"))  { QUD_MRS(id_aa64dfr1_el1); }
+    else if (qud_name_eq(tok, len, "SCTLR_EL1"))   { QUD_MRS(sctlr_el1); }
+    else if (qud_name_eq(tok, len, "TCR_EL1"))     { QUD_MRS(tcr_el1); }
+    else if (qud_name_eq(tok, len, "TTBR0_EL1"))   { QUD_MRS(ttbr0_el1); }
+    else if (qud_name_eq(tok, len, "TTBR1_EL1"))   { QUD_MRS(ttbr1_el1); }
+    else if (qud_name_eq(tok, len, "MAIR_EL1"))    { QUD_MRS(mair_el1); }
+    else if (qud_name_eq(tok, len, "VBAR_EL1"))    { QUD_MRS(vbar_el1); }
+    else if (qud_name_eq(tok, len, "ESR_EL1"))     { QUD_MRS(esr_el1); }
+    else if (qud_name_eq(tok, len, "FAR_EL1"))     { QUD_MRS(far_el1); }
+    else if (qud_name_eq(tok, len, "ELR_EL1"))     { QUD_MRS(elr_el1); }
+    else if (qud_name_eq(tok, len, "SPSR_EL1"))    { QUD_MRS(spsr_el1); }
+    else if (qud_name_eq(tok, len, "SP_EL0"))      { QUD_MRS(sp_el0); }
+    else if (qud_name_eq(tok, len, "TPIDR_EL0"))   { QUD_MRS(tpidr_el0); }
+    else if (qud_name_eq(tok, len, "TPIDR_EL1"))   { QUD_MRS(tpidr_el1); }
+    else if (qud_name_eq(tok, len, "TPIDRRO_EL0")) { QUD_MRS(tpidrro_el0); }
+    else if (qud_name_eq(tok, len, "CNTKCTL_EL1")) { QUD_MRS(cntkctl_el1); }
+    else if (qud_name_eq(tok, len, "CPACR_EL1"))   { QUD_MRS(cpacr_el1); }
+    else if (qud_name_eq(tok, len, "CONTEXTIDR_EL1")) { QUD_MRS(contextidr_el1); }
+    else if (qud_name_eq(tok, len, "PAR_EL1"))     { QUD_MRS(par_el1); }
+    else if (qud_name_eq(tok, len, "MDSCR_EL1"))   { QUD_MRS(mdscr_el1); }
+    else if (qud_name_eq(tok, len, "OSDLR_EL1"))   { QUD_MRS(osdlr_el1); }
+    else if (qud_name_eq(tok, len, "DBGBVR0_EL1")) { QUD_MRS(dbgbvr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGBCR0_EL1")) { QUD_MRS(dbgbcr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGWVR0_EL1")) { QUD_MRS(dbgwvr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGWCR0_EL1")) { QUD_MRS(dbgwcr0_el1); }
+    else if (qud_name_eq(tok, len, "PMCR_EL0"))    { QUD_MRS(pmcr_el0); }
+    else if (qud_name_eq(tok, len, "PMCCNTR_EL0")) { QUD_MRS(pmccntr_el0); }
+    else if (qud_name_eq(tok, len, "PMUSERENR_EL0")) { QUD_MRS(pmuserenr_el0); }
+    else return 0;                     /* unknown or not readable */
+    *out = v;
+    return 1;
+}
+
+/* The write side. Returns 1 written, 0 unknown/not-writable, -1 gated.
+ *
+ * Reads are safe by construction; writes are not, so the boot-arg gate is
+ * checked before anything else. The dangerous ones (SCTLR/TCR/TTBR) are marked
+ * writable in the table only because a bring-up console eventually needs them --
+ * the gate is what keeps that from happening by accident. */
+int
+qud_sysreg_write(const uint8_t *tok, size_t len, uint64_t value)
+{
+    const struct qud_sysreg *e = qud_sysreg_find(tok, len);
+
+    if (!e || !e->writable) return 0;
+    if (!qud_sysreg_writes_allowed()) return -1;
+    if (qud_name_eq(tok, len, "SCTLR_EL1"))   { QUD_MSR(sctlr_el1); }
+    else if (qud_name_eq(tok, len, "TCR_EL1")){ QUD_MSR(tcr_el1); }
+    else if (qud_name_eq(tok, len, "TTBR0_EL1")) { QUD_MSR(ttbr0_el1); }
+    else if (qud_name_eq(tok, len, "TTBR1_EL1")) { QUD_MSR(ttbr1_el1); }
+    else if (qud_name_eq(tok, len, "MAIR_EL1"))  { QUD_MSR(mair_el1); }
+    else if (qud_name_eq(tok, len, "VBAR_EL1"))  { QUD_MSR(vbar_el1); }
+    else if (qud_name_eq(tok, len, "ESR_EL1"))   { QUD_MSR(esr_el1); }
+    else if (qud_name_eq(tok, len, "FAR_EL1"))   { QUD_MSR(far_el1); }
+    else if (qud_name_eq(tok, len, "ELR_EL1"))   { QUD_MSR(elr_el1); }
+    else if (qud_name_eq(tok, len, "SPSR_EL1"))  { QUD_MSR(spsr_el1); }
+    else if (qud_name_eq(tok, len, "SP_EL0"))    { QUD_MSR(sp_el0); }
+    else if (qud_name_eq(tok, len, "TPIDR_EL0")) { QUD_MSR(tpidr_el0); }
+    else if (qud_name_eq(tok, len, "TPIDR_EL1")) { QUD_MSR(tpidr_el1); }
+    else if (qud_name_eq(tok, len, "CNTKCTL_EL1")) { QUD_MSR(cntkctl_el1); }
+    else if (qud_name_eq(tok, len, "CPACR_EL1")) { QUD_MSR(cpacr_el1); }
+    else if (qud_name_eq(tok, len, "CONTEXTIDR_EL1")) { QUD_MSR(contextidr_el1); }
+    else if (qud_name_eq(tok, len, "PAR_EL1"))   { QUD_MSR(par_el1); }
+    else if (qud_name_eq(tok, len, "MDSCR_EL1")) { QUD_MSR(mdscr_el1); }
+    else if (qud_name_eq(tok, len, "OSLAR_EL1")) { QUD_MSR(oslar_el1); }
+    else if (qud_name_eq(tok, len, "OSDLR_EL1")) { QUD_MSR(osdlr_el1); }
+    else if (qud_name_eq(tok, len, "DBGBVR0_EL1")) { QUD_MSR(dbgbvr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGBCR0_EL1")) { QUD_MSR(dbgbcr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGWVR0_EL1")) { QUD_MSR(dbgwvr0_el1); }
+    else if (qud_name_eq(tok, len, "DBGWCR0_EL1")) { QUD_MSR(dbgwcr0_el1); }
+    else if (qud_name_eq(tok, len, "PMCR_EL0"))  { QUD_MSR(pmcr_el0); }
+    else if (qud_name_eq(tok, len, "PMCCNTR_EL0")) { QUD_MSR(pmccntr_el0); }
+    else if (qud_name_eq(tok, len, "PMUSERENR_EL0")) { QUD_MSR(pmuserenr_el0); }
+    else return 0;
+    return 1;
+}
+
+/* Encoding of a name we do not support, so the caller can extend the table
+ * without going back to arm_regs.json. Returns 1 when the name is known to the
+ * table but has no instruction hooked up. */
+int
+qud_sysreg_encoding(const uint8_t *tok, size_t len, unsigned *op0, unsigned *op1,
+                    unsigned *crn, unsigned *crm, unsigned *op2)
+{
+    const struct qud_sysreg *e = qud_sysreg_find(tok, len);
+    if (!e) return 0;
+    if (op0) *op0 = e->op0;
+    if (op1) *op1 = e->op1;
+    if (crn) *crn = e->crn;
+    if (crm) *crm = e->crm;
+    if (op2) *op2 = e->op2;
+    return 1;
+}
+
 #endif /* QCOM_USB_DIAG_C */
 
 /* ==== NABU-PROBE-L808 BEGIN (temporary) ==== */

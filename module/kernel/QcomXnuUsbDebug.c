@@ -2476,6 +2476,372 @@ debugger_done:
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_SYSCTL: {
+        /* SYSCTL <name> [<maxbytes>]: ask the kernel a sysctl question.
+         *
+         * Read only. The name is taken verbatim from the frame and handed to
+         * sysctlbyname(), which looks it up in the kernel's own table -- so this
+         * is not an arbitrary-memory read and cannot be used as one. The reply
+         * carries the value as hex words, because sysctl types vary (int, quad,
+         * string, struct) and guessing a type here would be wrong more often
+         * than right; the caller knows what it asked for. */
+        const uint8_t *tok[2]; size_t len[2];
+        uint64_t cap_req = 64;
+        unsigned argc;
+        char namebuf[64];
+        uint8_t value[192];
+        size_t needed = 0;
+        int got;
+        struct sxnu_control_writer writer;
+
+        argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+        if (argc < 1 || !len[0] || len[0] >= sizeof(namebuf)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        for (size_t i = 0; i < len[0]; i++) namebuf[i] = (char)tok[0][i];
+        namebuf[len[0]] = 0;
+        if (argc == 2 && (!control_args_hex(tok[1], len[1], &cap_req) ||
+                          !cap_req || cap_req > sizeof(value))) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+
+        got = qud_sysctl_read(namebuf, value, (size_t)cap_req, &needed);
+        if (got == -1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (got == -3) {
+            /* Report the size so the caller can ask again with a bigger cap. */
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " name=");
+            (void)sxnu_control_writer_text(&writer, namebuf);
+            (void)sxnu_control_writer_text(&writer, " needed=");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)needed);
+            (void)sxnu_control_writer_text(&writer, " state=toobig");
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+        if (got < 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "notfound");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " name=");
+        (void)sxnu_control_writer_text(&writer, namebuf);
+        (void)sxnu_control_writer_text(&writer, " len=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)got);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (int i = 0; i < got; i++)
+            (void)sxnu_control_writer_hex(&writer, value[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TASKDUMP: {
+        /* TASKDUMP [<hextask>]
+         *
+         * With no argument: report the exported anchors (`tasks` queue head and
+         * kernproc) plus whether the queue is currently empty, and hint at what
+         * to do next. With an argument: probe that caller-supplied pointer and
+         * report its first 8 words raw.
+         *
+         * This verb does NOT decode struct task. See the design note in
+         * QcomUsbDiag.c: the chain offset sits behind per-zone layout and
+         * conditional compilation, and a wrong offset would report plausible
+         * garbage rather than failing. Probing a pointer the caller already
+         * trusts is honest; guessing a layout is not. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t want = 0;
+        unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+
+        if (argc >= 1) {
+            if (!control_args_hex(tok[0], len[0], &want)) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+            {
+                uint64_t words[8];
+                if (!qud_ptr_probe(want, words, 8)) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unmapped");
+                    break;
+                }
+                sxnu_control_writer_init(&writer, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+                (void)sxnu_control_writer_text(&writer, " ptr=0x");
+                (void)sxnu_control_writer_hex(&writer, want, 16);
+                for (unsigned i = 0; i < 8u; i++) {
+                    (void)sxnu_control_writer_text(&writer, " w");
+                    (void)sxnu_control_writer_decimal(&writer, i);
+                    (void)sxnu_control_writer_char(&writer, '=');
+                    (void)sxnu_control_writer_hex(&writer, words[i], 16);
+                }
+                reply_bytes = sxnu_control_reply_finish(&writer);
+            }
+            break;
+        }
+
+        {
+            uint64_t qn = 0, qp = 0;
+            const int head_ok = qud_task_qhead(&qn, &qp);
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " tasks_head=0x");
+            (void)sxnu_control_writer_hex(&writer, (uint64_t)(uintptr_t)&tasks, 16);
+            (void)sxnu_control_writer_text(&writer, " kernproc=0x");
+            (void)sxnu_control_writer_hex(&writer, (uint64_t)(uintptr_t)kernproc, 16);
+            if (head_ok) {
+                (void)sxnu_control_writer_text(&writer, " next=0x");
+                (void)sxnu_control_writer_hex(&writer, qn, 16);
+                (void)sxnu_control_writer_text(&writer, " prev=0x");
+                (void)sxnu_control_writer_hex(&writer, qp, 16);
+                (void)sxnu_control_writer_text(&writer,
+                    (qn == (uint64_t)(uintptr_t)&tasks) ? " state=empty" : " state=nonempty");
+            } else {
+                (void)sxnu_control_writer_text(&writer, " state=unreadable");
+            }
+            (void)sxnu_control_writer_text(&writer, " hint=give-a-pointer");
+            reply_bytes = sxnu_control_reply_finish(&writer);
+        }
+        break;
+    }
+    case SXNU_CONTROL_VERB_THREADDUMP: {
+        /* THREADDUMP <hexptr>: probe a thread (or any) pointer, raw words.
+         * Same reasoning as TASKDUMP: report, do not decode. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t want = 0;
+        uint64_t words[8];
+
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+            !control_args_hex(tok[0], len[0], &want)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (!qud_ptr_probe(want, words, 8)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unmapped");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " ptr=0x");
+        (void)sxnu_control_writer_hex(&writer, want, 16);
+        for (unsigned i = 0; i < 8u; i++) {
+            (void)sxnu_control_writer_text(&writer, " w");
+            (void)sxnu_control_writer_decimal(&writer, i);
+            (void)sxnu_control_writer_char(&writer, '=');
+            (void)sxnu_control_writer_hex(&writer, words[i], 16);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_VSYNCON: {
+        /* VSYNCON [<hz>]
+         *
+         * Read-only in this build. Writing display timing registers from a USB
+         * worker is the single most dangerous thing this console could do --
+         * wrong values desynchronise the panel, and unlike a wedge there is no
+         * recovery short of a reflash. The read side reports the vsync-relevant
+         * words the display driver already publishes, through the same exported
+         * arrays DISPREGS uses, so no new MMIO is touched.
+         *
+         * A write path exists in the protocol (an argument) but is refused with
+         * state=gated; enabling it needs a boot-arg plus a board round that
+         * proves the panel survives. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+
+        if (argc >= 1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "gated");
+            break;
+        }
+        if (&native_legacy_transfer[0] == 0 || &native_legacy_surfaces[0] == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=readonly flips=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[0]);
+        (void)sxnu_control_writer_text(&writer, " xfer=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_transfer[1]);
+        (void)sxnu_control_writer_text(&writer, " surfaces=");
+        (void)sxnu_control_writer_decimal(&writer, native_legacy_surfaces[0]);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_BKPADD: {
+        /* BKPADD <hexva> [<hexkind>]: remember a kernel address.
+         * Pure module state -- no breakpoint register, no memory write. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t va = 0, kind = 0;
+        unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+        int slot;
+
+        if (argc < 1 || !control_args_hex(tok[0], len[0], &va) ||
+            (argc >= 2 && !control_args_hex(tok[1], len[1], &kind))) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        slot = qud_bkp_add(va, (uint32_t)kind);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+                                       slot >= 0 ? "OK" : "ERR");
+        if (slot >= 0) {
+            (void)sxnu_control_writer_text(&writer, " slot=");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)slot);
+            (void)sxnu_control_writer_text(&writer, " va=0x");
+            (void)sxnu_control_writer_hex(&writer, va, 16);
+        } else {
+            (void)sxnu_control_writer_text(&writer,
+                slot == -1 ? " state=full" :
+                slot == -3 ? " state=duplicate" : " state=unmapped");
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_BKPDEL: {
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t va = 0;
+        int removed;
+
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+            !control_args_hex(tok[0], len[0], &va)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        removed = qud_bkp_del(va);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+                                       removed ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, " va=0x");
+        (void)sxnu_control_writer_hex(&writer, va, 16);
+        (void)sxnu_control_writer_text(&writer, removed ? " state=removed" : " state=absent");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_BKPLIST: {
+        struct qud_bkp_entry list[8];
+        struct sxnu_control_writer writer;
+        int n = qud_bkp_list(list, 8);
+
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " n=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)n);
+        for (int i = 0; i < n; i++) {
+            (void)sxnu_control_writer_text(&writer, " [");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)i);
+            (void)sxnu_control_writer_text(&writer, "]=0x");
+            (void)sxnu_control_writer_hex(&writer, list[i].va, 16);
+            (void)sxnu_control_writer_char(&writer, ':');
+            (void)sxnu_control_writer_hex(&writer, list[i].kind, 8);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_SYSREG: {
+        /* SYSREG <NAME>: read a system register.
+         *
+         * This is what makes PTDUMP checkable rather than merely self-consistent:
+         * PTDUMP derives its page-table geometry from TCR_EL1 itself, so until
+         * now "the geometry is right" rested on the code agreeing with itself.
+         * `sysreg TCR_EL1` prints the register, and `sysreg TTBR1_EL1` prints the
+         * base PTDUMP claims to start from.
+         *
+         * Reads have no side effects, so no gate. Names are matched against the
+         * table in QcomUsbDiag.c; an unknown name reports the encoding it would
+         * need so extending the table is a copy-paste. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t value = 0;
+
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 1 ||
+            !len[0] || len[0] > 24u) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (!qud_sysreg_read(tok[0], len[0], &value)) {
+            /* Unknown, or known but not readable at EL1. Say which, and hand
+             * back the encoding when we know it. */
+            unsigned o0 = 0, o1 = 0, cn = 0, cm = 0, op = 0;
+            const int known = qud_sysreg_encoding(tok[0], len[0], &o0, &o1, &cn, &cm, &op);
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "ERR");
+            (void)sxnu_control_writer_text(&writer, " state=");
+            (void)sxnu_control_writer_text(&writer, known ? "notreadable" : "unknown");
+            if (known) {
+                (void)sxnu_control_writer_text(&writer, " enc=");
+                (void)sxnu_control_writer_decimal(&writer, o0);
+                (void)sxnu_control_writer_char(&writer, '/');
+                (void)sxnu_control_writer_decimal(&writer, o1);
+                (void)sxnu_control_writer_char(&writer, '/');
+                (void)sxnu_control_writer_decimal(&writer, cn);
+                (void)sxnu_control_writer_char(&writer, '/');
+                (void)sxnu_control_writer_decimal(&writer, cm);
+                (void)sxnu_control_writer_char(&writer, '/');
+                (void)sxnu_control_writer_decimal(&writer, op);
+            }
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " name=");
+        for (size_t i = 0; i < len[0]; i++) (void)sxnu_control_writer_char(&writer, (char)tok[0][i]);
+        (void)sxnu_control_writer_text(&writer, " value=0x");
+        (void)sxnu_control_writer_hex(&writer, value, 16);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_SYSREGW: {
+        /* SYSREGW <NAME> <hexvalue>: write a system register.
+         *
+         * Gated behind nabu-sysreg-write=1, and the gate is checked before the
+         * value is even parsed. SCTLR_EL1 and TCR_EL1 are one store away from a
+         * machine that cannot be recovered without a reflash, and unlike a wedged
+         * USB worker there is no `pa-wr:` log to explain it afterwards -- so the
+         * default has to be "refuse", not "try". */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t value = 0;
+        int rc;
+
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 2 ||
+            !len[0] || len[0] > 24u ||
+            !control_args_hex(tok[1], len[1], &value)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        rc = qud_sysreg_write(tok[0], len[0], value);
+        if (rc < 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "gated");
+            break;
+        }
+        if (rc == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "notwritable");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " name=");
+        for (size_t i = 0; i < len[0]; i++) (void)sxnu_control_writer_char(&writer, (char)tok[0][i]);
+        (void)sxnu_control_writer_text(&writer, " wrote=0x");
+        (void)sxnu_control_writer_hex(&writer, value, 16);
+        /* Deliberately NOT reading back. giulia's reg.write is documented as
+         * not reading back to protect W1C bits, and that is the right call for a
+         * register console: a read-back can itself have side effects. The
+         * caller verifies with a separate SYSREG, which is explicit about it. */
+        (void)sxnu_control_writer_text(&writer, " verify=separate");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host

@@ -137,6 +137,15 @@ main(void)
     check_accept(SXNU_CONTROL_VERB_KDPPUSH, "KDPPUSH fa0102", 1);
     check_accept(SXNU_CONTROL_VERB_PTDUMP, "PTDUMP 0xfffffff007004000", 1);
     check_accept(SXNU_CONTROL_VERB_PANICDUMP, "PANICDUMP", 1);
+    check_accept(SXNU_CONTROL_VERB_SYSCTL, "SYSCTL kern.maxproc", 1);
+    check_accept(SXNU_CONTROL_VERB_TASKDUMP, "TASKDUMP", 1);
+    check_accept(SXNU_CONTROL_VERB_THREADDUMP, "THREADDUMP 0xfffffff007004000", 1);
+    check_accept(SXNU_CONTROL_VERB_VSYNCON, "VSYNCON", 1);
+    check_accept(SXNU_CONTROL_VERB_BKPADD, "BKPADD 0xfffffff007004000", 1);
+    check_accept(SXNU_CONTROL_VERB_BKPDEL, "BKPDEL 0xfffffff007004000", 1);
+    check_accept(SXNU_CONTROL_VERB_BKPLIST, "BKPLIST", 1);
+    check_accept(SXNU_CONTROL_VERB_SYSREG, "SYSREG TCR_EL1", 1);
+    check_accept(SXNU_CONTROL_VERB_SYSREGW, "SYSREGW TTBR1_EL1 0xcae35000", 1);
     check_accept(SXNU_CONTROL_VERB_PANICDUMP, "PANICDUMP info", 1);
     check_accept(SXNU_CONTROL_VERB_PANICDUMP, "PANICDUMP log 0 100", 1);
 
@@ -193,6 +202,21 @@ main(void)
           "0xfffffff007004000");
     check("PTDUMP", 1, SXNU_CONTROL_VERB_PTDUMP, "");
     check("PANICDUMP", 1, SXNU_CONTROL_VERB_PANICDUMP, "");
+    check("SYSCTL kern.maxproc", 1, SXNU_CONTROL_VERB_SYSCTL, "kern.maxproc");
+    check("SYSCTL kern.maxproc 4", 1, SXNU_CONTROL_VERB_SYSCTL, "kern.maxproc 4");
+    check("TASKDUMP", 1, SXNU_CONTROL_VERB_TASKDUMP, "");
+    check("TASKDUMP 0xfffffff007004000", 1, SXNU_CONTROL_VERB_TASKDUMP, "0xfffffff007004000");
+    check("THREADDUMP 0xfffffff007004000", 1, SXNU_CONTROL_VERB_THREADDUMP, "0xfffffff007004000");
+    check("VSYNCON", 1, SXNU_CONTROL_VERB_VSYNCON, "");
+    check("VSYNCON 60", 1, SXNU_CONTROL_VERB_VSYNCON, "60");
+    check("BKPADD 0xfffffff007004000", 1, SXNU_CONTROL_VERB_BKPADD, "0xfffffff007004000");
+    check("BKPADD 0xfffffff007004000 1", 1, SXNU_CONTROL_VERB_BKPADD, "0xfffffff007004000 1");
+    check("BKPDEL 0xfffffff007004000", 1, SXNU_CONTROL_VERB_BKPDEL, "0xfffffff007004000");
+    check("BKPLIST", 1, SXNU_CONTROL_VERB_BKPLIST, "");
+    check("SYSREG TCR_EL1", 1, SXNU_CONTROL_VERB_SYSREG, "TCR_EL1");
+    check("SYSREG MIDR_EL1", 1, SXNU_CONTROL_VERB_SYSREG, "MIDR_EL1");
+    check("SYSREGW TTBR1_EL1 0xcae35000", 1, SXNU_CONTROL_VERB_SYSREGW,
+          "TTBR1_EL1 0xcae35000");
     check("PANICDUMP info", 1, SXNU_CONTROL_VERB_PANICDUMP, "info");
     check("PANICDUMP log 0 100", 1, SXNU_CONTROL_VERB_PANICDUMP, "log 0 100");
 

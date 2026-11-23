@@ -58,6 +58,15 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_KDPPUSH,   /* KDPPUSH <hex> -> queue bytes for KDP (no trap) */
     SXNU_CONTROL_VERB_PTDUMP,    /* PTDUMP <hexva> -> stage-1 page-table walk */
     SXNU_CONTROL_VERB_PANICDUMP, /* PANICDUMP [info|log <off> <len>] -> panic area */
+    SXNU_CONTROL_VERB_SYSCTL,    /* SYSCTL <name> -> kernel sysctl value        */
+    SXNU_CONTROL_VERB_TASKDUMP,  /* TASKDUMP [<hextask>] -> task list / one task */
+    SXNU_CONTROL_VERB_THREADDUMP,/* THREADDUMP <hexthread> -> thread state      */
+    SXNU_CONTROL_VERB_VSYNCON,   /* VSYNCON [<hz>] -> vsync info (write gated)  */
+    SXNU_CONTROL_VERB_BKPADD,    /* BKPADD <hexva> [<kind>] -> software breakpoint */
+    SXNU_CONTROL_VERB_BKPDEL,    /* BKPDEL <hexva> -> remove breakpoint         */
+    SXNU_CONTROL_VERB_BKPLIST,   /* BKPLIST -> list breakpoints                 */
+    SXNU_CONTROL_VERB_SYSREG,    /* SYSREG <name> -> read a system register     */
+    SXNU_CONTROL_VERB_SYSREGW,   /* SYSREGW <name> <hex> -> write (gated)        */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -258,6 +267,34 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 9u && text[0] == 'P' && text[1] == 'A' && text[2] == 'N' &&
         text[3] == 'I' && text[4] == 'C' && text[5] == 'D' && text[6] == 'U' &&
         text[7] == 'M' && text[8] == 'P') return SXNU_CONTROL_VERB_PANICDUMP;
+    if (bytes == 6u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'S' &&
+        text[3] == 'C' && text[4] == 'T' && text[5] == 'L')
+        return SXNU_CONTROL_VERB_SYSCTL;
+    if (bytes == 8u && text[0] == 'T' && text[1] == 'A' && text[2] == 'S' &&
+        text[3] == 'K' && text[4] == 'D' && text[5] == 'U' && text[6] == 'M' &&
+        text[7] == 'P') return SXNU_CONTROL_VERB_TASKDUMP;
+    if (bytes == 10u && text[0] == 'T' && text[1] == 'H' && text[2] == 'R' &&
+        text[3] == 'E' && text[4] == 'A' && text[5] == 'D' && text[6] == 'D' &&
+        text[7] == 'U' && text[8] == 'M' && text[9] == 'P')
+        return SXNU_CONTROL_VERB_THREADDUMP;
+    if (bytes == 7u && text[0] == 'V' && text[1] == 'S' && text[2] == 'Y' &&
+        text[3] == 'N' && text[4] == 'C' && text[5] == 'O' && text[6] == 'N')
+        return SXNU_CONTROL_VERB_VSYNCON;
+    if (bytes == 6u && text[0] == 'B' && text[1] == 'K' && text[2] == 'P' &&
+        text[3] == 'A' && text[4] == 'D' && text[5] == 'D')
+        return SXNU_CONTROL_VERB_BKPADD;
+    if (bytes == 6u && text[0] == 'B' && text[1] == 'K' && text[2] == 'P' &&
+        text[3] == 'D' && text[4] == 'E' && text[5] == 'L')
+        return SXNU_CONTROL_VERB_BKPDEL;
+    if (bytes == 7u && text[0] == 'B' && text[1] == 'K' && text[2] == 'P' &&
+        text[3] == 'L' && text[4] == 'I' && text[5] == 'S' && text[6] == 'T')
+        return SXNU_CONTROL_VERB_BKPLIST;
+    if (bytes == 6u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'S' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'G')
+        return SXNU_CONTROL_VERB_SYSREG;
+    if (bytes == 7u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'S' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'G' && text[6] == 'W')
+        return SXNU_CONTROL_VERB_SYSREGW;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -300,6 +337,15 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_KDPPUSH: return "KDPPUSH";
     case SXNU_CONTROL_VERB_PTDUMP: return "PTDUMP";
     case SXNU_CONTROL_VERB_PANICDUMP: return "PANICDUMP";
+    case SXNU_CONTROL_VERB_SYSCTL: return "SYSCTL";
+    case SXNU_CONTROL_VERB_TASKDUMP: return "TASKDUMP";
+    case SXNU_CONTROL_VERB_THREADDUMP: return "THREADDUMP";
+    case SXNU_CONTROL_VERB_VSYNCON: return "VSYNCON";
+    case SXNU_CONTROL_VERB_BKPADD: return "BKPADD";
+    case SXNU_CONTROL_VERB_BKPDEL: return "BKPDEL";
+    case SXNU_CONTROL_VERB_BKPLIST: return "BKPLIST";
+    case SXNU_CONTROL_VERB_SYSREG: return "SYSREG";
+    case SXNU_CONTROL_VERB_SYSREGW: return "SYSREGW";
     default: return "";
     }
 }
