@@ -15,8 +15,8 @@ T47 偏移全部验证；STACKSHOT 打通；T50 的两个解法（priority 拆�
 
 | 项 | 值 |
 |---|---|
-| **最新基线** | **`hold/kb-70-kdbgfix`**，kernel **`3480d5c12b7edb2a6cbb`** |
-| **最新 tag** | **`baseline-kb70-kdbgfix`**（`fb1a396`）|
+| **最新基线** | **`hold/kb-99-full`**，kernel **`f14f0ce6d33315272b29`** |
+| **最新 tag** | **`baseline-kb99-fivefeatures`**（`24113a8`）|
 | 模块仓库 | `D:/_nabu-usb-cdc` HEAD **`fb1a396`**（已 push）|
 | **设备端 verb 数** | **48**（枚举去重，排除 `INVALID`/`LAST`）|
 | 主机侧 KDP live 命令 | 4 个（`KDPREAD`/`KDPWRITE`/`KDPREBOOT`/`KDPRAW`），**不计入 verb** |
@@ -199,7 +199,8 @@ panic 时未 arm ⇒ 主机字节永远留在 DWC3 RX 环里没人读。
 
 | tag | kernel sha16 | 能力 | 用途 |
 |---|---|---|---|
-| **`baseline-kb70-kdbgfix`** | **`3480d5c12b7edb2a`** | ✅ **最全**：48 verb + KDBG + 结构化 dump + HFI + STACKSHOT + kdebug wrap | **当前基线** |
+| **`baseline-kb99-fivefeatures`** | **`f14f0ce6d3331527`** | ✅ **最全**：48 verb + TSENS + JOBSTAT + SLOW + CPSTAT + IRQSTAT | **当前基线** |
+| `baseline-kb70-kdbgfix` | `3480d5c12b7edb2a` | 上一个稳定基线（启动 207 s）| 回滚点 |
 | `baseline-kb68-stackshot` | `c129d83cee9ceb63` | 有 STACKSHOT，无 KDBG 修正 | 上一基线 |
 | `baseline-kb67-hfifix` | `2222a807b9c98e63` | 有 HFI，无 STACKSHOT | |
 | `baseline-kb59-ufsoffset` | `9cc32cf0f07f693f` | 方案 D 闭合，无 HFI/STACKSHOT | |
@@ -741,8 +742,8 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt
 > T47 偏移全部验证；STACKSHOT 打通（131 KB kcdata）；KDBG 绕过 sysctl 锁读到真
 > `oldest_time`；`task->priority` 拆成 `prio=81 maxprio=95` 精确命中 T50 的推断。**
 >
-> **当前基线 `hold/kb-70-kdbgfix`（kernel `3480d5c12b7edb2a6cbb`），
-> tag `baseline-kb70-kdbgfix`，HEAD `fb1a396` 已推远端。**
+> **当前基线 `hold/kb-99-full`（kernel `f14f0ce6d33315272b29`），
+> tag `baseline-kb99-fivefeatures`，HEAD `24113a8` 已推远端。**
 >
 > **改任何内核/驱动文件前：§2.1 五步 + §2.2 三个真源（生成器在 `l738-device/scripts`、
 > UFS 驱动在 `l738-device/drivers/NativeUfs`、GPU 驱动在 `UniXNU-nabu/drivers/NabuAdreno`）。**
