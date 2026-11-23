@@ -418,6 +418,24 @@ MSYS_NO_PATHCONV=1 wsl.exe --exec bash -c 'cd /mnt/d/_nabu-usb-cdc/tools && pyth
 - boot 红线：`sha256sum boot-merge-r3.img | cut -c1-16` = `ead4b53135d67516`
 - args：`python3 -I /mnt/e/nabu/tmp/args_count.py <payload.img>`
 
+**⚠️ 打包模板的致命陷阱（kb-73 踩过）**：
+`pack_kb56.sh` 里是 **`BASE=/mnt/e/nabu/hold/kb-50-readall`** ——它从 **kb-50** 复制 payload！
+kb-50 的 args 是 **`n=48 c=862`**（那时还没有 `trace=16384 trace_wrap=1` 等）。
+**直接从模板打出来的包，args 是旧配置。**
+**正确做法**：打完包后**再把当前基线的 payload 覆盖回去**，或改 `BASE` 指向当前基线：
+```bash
+cp -f /e/nabu/hold/<当前基线>/payload.img /e/nabu/hold/<新tag>/payload.img
+# 重新 mcopy kernel 进去
+mcopy -o -i <新tag>/payload.img "$K" ::/EFI/UniXNU/Payloads/kernel.macho
+# 再 sync args
+python3 -I tools/sync_payload_args.py /e/nabu/hold/<新tag>
+```
+**验收：args 条数必须 == board.toml 的条目数**（kb-73：board.toml 51 条 → `n=51 c=907`）。
+**并从 payload 内按 FAT 路径读 `unixnu.toml` 确认 gate 真的在里面**（读 `args_fp.py` 会读到 FAT 残留的旧串）：
+```bash
+mtype -i <payload.img> ::/EFI/UniXNU/unixnu.toml | grep -o "nabu-sysreg-write=[0-9]*"
+```
+
 ### 8.5 boot-args 改动（必须走 board.toml）
 
 ```bash
@@ -539,7 +557,7 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 
 ---
 
-## 11. 踩坑清单（59 条，编号 1–61，按主题分组）
+## 11. 踩坑清单（65 条，编号 1–66，按主题分组）
 
 ### 11.1 构建/环境（最致命）
 
@@ -616,6 +634,11 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 | **59** | **`QCOM USB LOSS contention=` 是真丢字节**，`dropped = overflow + contended`（`QcomUsbBuffer.h:73-77`）。**`STATUS rxo=0` 只代表控制环没溢出，不代表广播日志零丢失** |
 | **60** | **`native_ufs_block_reads` 不是块数**，是 `RootWindowRead.h:53` 的窗口 copy **迭代次数**（每次 while 迭代调一次 `ops.copy`）。**不能乘 4096 当字节数** |
 | **61** | **`native_ufs_read_ticks` 是全局累计值**，跨所有读者；**不能把某窗口的增量全算在单个进程头上**，只能作趋势证据 |
+| **62** | **在白名单里 ≠ 现在能读。** kb-72：`readpa 0x0105c000`（GCC，**白名单内**）照样卡死 worker，日志与 HELLO 同时停。全因是「时钟域此刻是否是开的」静态表无从得知。**已把 GCC 移出读白名单**（`QcomUsbDiag.c`，理由与当初撤 SMMU 一致）|
+| **63** | **CTL_FLUSH（`0xae02018`）是自清零寄存器。** 驱动每帧写 `0x3`（`NativeLegacyDisplay.cpp:535`），写前必须读到 `0`（`:506`）。**写完立刻 `READPA` 读回 `0` 是成功（已消费），不是失败。** 拿它做 WRITEPA 值变化验证最安全 |
+| **64** | **不要用 READPA 探测未知寄存器。** 正确方法是**从驱动源码里找驱动自己会写的寄存器**（如 `nabu_wdt_pet()` 写 WDT `+0x08`、`flip()` 写 `CTL_FLUSH`），用源码证据定目标。kb-72 的卡死就是"探测"方法本身的错，不是地址选得不巧 |
+| **65** | **两种失效模式要分清**：① `open` 成功但 OUT 死（IN 仍通，日志还在流）= 第二次 open 同一 boot；② IN/OUT 全死（日志停更）= worker 卡在 MMIO。判据分别是「HELLO 有无回复」和「`com.bin` 是否还在长」|
+| **66** | **`pack_kb56.sh` 的 `BASE` 指向 kb-50，args 是旧的 `n=48 c=862`。** 直接从模板打出来的包 args 全是旧配置。**打完必须用当前基线的 payload 覆盖 + 重 mcopy kernel + sync args**，验收看 `args 条数 == board.toml 条目数` |
 
 ---
 

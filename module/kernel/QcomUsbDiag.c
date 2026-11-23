@@ -356,6 +356,17 @@ static const struct qud_read_range qud_read_whitelist[] = {
     { UINT64_C(0x0ae6b000), UINT64_C(0x0ae6c000), "intf1"  },
     { UINT64_C(0x0ae6c000), UINT64_C(0x0ae6d000), "intf2"  },
     { UINT64_C(0x02c90000), UINT64_C(0x02ca0000), "gpucc"  },
+    /* GCC is back in the list for kb-75. kb-73 removed it and that round never
+     * reached userspace: `nabu:` output stopped after 6 lines, right after root
+     * owner authentication and before the display scanout hand-off. Nothing in
+     * this table can run that early -- qud_read_pa_allowed() is only reached
+     * from READPA -- so the removal is not a plausible cause. Restoring it makes
+     * this round differ from kb-73 in exactly one place (the boot-arg), which is
+     * what the bisect needs.
+     *
+     * The kb-72 hang still stands and is the reason this entry is on notice:
+     * `readpa 0x0105c000 4` wedged the worker although the address was here.
+     * Do not use GCC as a probe target. */
     { UINT64_C(0x01050000), UINT64_C(0x01090000), "gcc"    },
     { UINT64_C(0x0af00000), UINT64_C(0x0af01000), "discc"  },
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000), "dwc3"   },
