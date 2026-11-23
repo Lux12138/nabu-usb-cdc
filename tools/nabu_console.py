@@ -770,6 +770,32 @@ def main():
             % (tv[0], tv[1], tv[2], tv[3]))
         log("SLOW peak_obj=%d peak_bytes=%d slow_total=%d slow_kept=%d"
             % (tv[4], tv[5], tv[6], tv[7]))
+
+        # Why insertions were refused. insert_attempts - insertions says how many,
+        # this says why; without it a miss looks identical whether the object was
+        # Oversized, Imported, or lost to memory pressure.
+        rej = sym_addr("_nabu_console_reject")
+        if rej is not None:
+            r = read_qwords(rej, 13)
+            if r and any(r):
+                names = ["not_owned", "not_prepared", "not_write_combined",
+                         "quarantined", "no_spans", "zero_size", "OVERSIZED",
+                         "no_evictable", "no_slot", "imported", "pooled",
+                         "pressure", "busy"]
+                parts = ["%s=%d" % (names[i], r[i])
+                         for i in range(min(len(names), len(r))) if r[i]]
+                log("SLOW reject %s" % " ".join(parts))
+            else:
+                log("SLOW reject all zero (nothing has been refused yet)")
+        ev = sym_addr("_nabu_console_evict")
+        if ev is not None:
+            e = read_qwords(ev, 5)
+            if e and any(e):
+                en = ["object_limit", "byte_limit", "client_close",
+                      "memory_pressure", "allocation_retry"]
+                log("SLOW evict %s" % " ".join(
+                    "%s=%d" % (en[i], e[i]) for i in range(min(len(en), len(e))) if e[i]))
+
         cv = read_words(cnt, 1)
         have = cv[0] if cv else 0
         show = have if not arg.strip() else min(have, int(arg.strip(), 0))
