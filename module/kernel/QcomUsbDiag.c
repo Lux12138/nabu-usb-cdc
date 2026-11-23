@@ -288,6 +288,13 @@ qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
  * here; anything else returns "denied". Ranges are [lo, hi) in bytes. */
 struct qud_mmio_range { uint64_t lo, hi; };
 static const struct qud_mmio_range qud_write_whitelist[] = {
+    /* WDT. Added for the WRITEPA positive test, and justified by the driver
+     * itself: nabu_wdt_arm()/nabu_wdt_pet() write +0x08 (EN) on every pet, so
+     * that register is already known writable on this board from a path that
+     * runs thousands of times per boot. Note the difference from SMMU: here a
+     * WRITE is proven, there only configuration was; and a write to EN is not
+     * what hangs the machine. */
+    { UINT64_C(0x17c10000), UINT64_C(0x17c11000) }, /* WDT */
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000) }, /* DWC3 USB controller */
     { UINT64_C(0x01000000), UINT64_C(0x01010000) }, /* SMMU */
     { UINT64_C(0x01050000), UINT64_C(0x01090000) }, /* GCC (partial) */
@@ -406,6 +413,30 @@ qud_diag_write_phys(uint64_t pa, const void *src, size_t len, uint32_t *readback
         phys_cache_va = va;
     }
     dst = (volatile uint32_t *)(va + off);
+    /* Announce before writing, for the same reason qud_diag_read_phys_anno()
+     * announces reads: a write to a register whose clock domain is down can hang
+     * the worker exactly as a read can (kb-46 and kb-47 each cost a power
+     * cycle), and this log line is the only way to learn afterwards which
+     * address did it. */
+    {
+        char text[44];
+        size_t at = 0;
+        static const char hexd[] = "0123456789abcdef";
+        text[at++] = 'p'; text[at++] = 'a'; text[at++] = '-';
+        text[at++] = 'w'; text[at++] = 'r'; text[at++] = ':';
+        text[at++] = ' '; text[at++] = '0'; text[at++] = 'x';
+        for (int shift = 60; shift >= 0; shift -= 4)
+            text[at++] = hexd[(pa >> shift) & 0xfu];
+        text[at++] = ' '; text[at++] = 'l'; text[at++] = '=';
+        {
+            char digits[8];
+            unsigned n = 0, v = (unsigned)len;
+            do { digits[n++] = (char)('0' + (v % 10u)); v /= 10u; } while (v && n < sizeof(digits));
+            while (n) text[at++] = digits[--n];
+        }
+        text[at++] = '\n';
+        (void)qcom_usb_debug_write(text, at);
+    }
     memcpy((void *)dst, src, len);
     __asm__ volatile("dsb sy" ::: "memory");
     if (readback) *readback = dst[0];   /* self-attest: first word */
