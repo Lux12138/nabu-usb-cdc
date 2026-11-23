@@ -557,7 +557,7 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 
 ---
 
-## 11. 踩坑清单（65 条，编号 1–66，按主题分组）
+## 11. 踩坑清单（67 条，编号 1–68，按主题分组）
 
 ### 11.1 构建/环境（最致命）
 
@@ -639,6 +639,8 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 | **64** | **不要用 READPA 探测未知寄存器。** 正确方法是**从驱动源码里找驱动自己会写的寄存器**（如 `nabu_wdt_pet()` 写 WDT `+0x08`、`flip()` 写 `CTL_FLUSH`），用源码证据定目标。kb-72 的卡死就是"探测"方法本身的错，不是地址选得不巧 |
 | **65** | **两种失效模式要分清**：① `open` 成功但 OUT 死（IN 仍通，日志还在流）= 第二次 open 同一 boot；② IN/OUT 全死（日志停更）= worker 卡在 MMIO。判据分别是「HELLO 有无回复」和「`com.bin` 是否还在长」|
 | **66** | **`pack_kb56.sh` 的 `BASE` 指向 kb-50，args 是旧的 `n=48 c=862`。** 直接从模板打出来的包 args 全是旧配置。**打完必须用当前基线的 payload 覆盖 + 重 mcopy kernel + sync args**，验收看 `args 条数 == board.toml 条目数` |
+| **67** | **改 boot-arg = 必须重打 payload = 镜像 62% 字节全变。** kb-70 与 kb-75 比：`unixnu.toml` 只差 args 一行、FAT 目录全同、`scratch-data.img` 逐字节相同、模块符号地址相同——**但 payload 有 125,511,466 字节不同**（`mcopy` 写 125 MB 内核时重排了 FAT 簇）。两次（kb-73/kb-75）都因此卡在 `disk1s1` Data 卷挂载，`mount-complete` 永不出现。**⇒ 能不改 boot-arg 就不改。** |
+| **68** | **gate 可以运行时打开，不用刷机。** `_qud_sysreg_write_enabled`（`0xfffffff00c0f5a70`，`.data` 导出）初值 `-1`；`WRITE 0xfffffff00c0f5a70 01000000` 后 gate 即开，`if (< 0)` 永不成立、boot-arg 根本不会被读。**同类 gate 都可用这招**（找 `volatile`/`static int xxx_enabled = -1` 的导出变量）|
 
 ---
 
