@@ -776,7 +776,14 @@ def main():
         # Oversized, Imported, or lost to memory pressure.
         rej = sym_addr("_nabu_console_reject")
         if rej is not None:
+            # 104 bytes is 13 qwords; the reply budget is 192 bytes of data, so
+            # this fits, but the first read after a HELLO resync can still come
+            # back short. Retry once before believing a zero.
             r = read_qwords(rej, 13)
+            if not r or not any(r):
+                r2 = read_qwords(rej, 13)
+                if r2 and any(r2):
+                    r = r2
             if r and any(r):
                 names = ["not_owned", "not_prepared", "not_write_combined",
                          "quarantined", "no_spans", "zero_size", "OVERSIZED",

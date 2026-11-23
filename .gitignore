@@ -7,3 +7,7 @@ logs/
 *.img
 *.log
 __pycache__/
+
+# mainline memory/ops docs stay local (E:/nabu/state), never in the public repo
+docs/MEMORY.md
+docs/OPERATIONS.md
