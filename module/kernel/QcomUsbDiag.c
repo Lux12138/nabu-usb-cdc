@@ -185,7 +185,25 @@ qud_diag_write(uint64_t va, const void *src, size_t len)
 
 /* Read a physical range through a temporary device mapping. Returns the
  * number of bytes copied (0 on failure). ml_io_map() takes a byte size,
- * internally rounds to pages, and ml_io_unmap must get the same size. */
+ * internally rounds to pages.
+ *
+ * HAZARD, measured on kb-46 (2026-11-23): a PA that does not exist on the SoC
+ * wedges the whole USB worker. `readpa 0x3c0fc000 32` (a Raspberry Pi address
+ * that BCM2837.h defines, so it looked plausible) never returned: the CDC port
+ * stayed open but HELLO stopped answering, and with nabu-wdt-off=1 the board
+ * needed a power cycle.
+ *
+ * The reason is that ml_io_map() cannot be used as an existence test. Its
+ * kmem_alloc() runs with KMA_NOFAIL (osfmk/arm/io_map.c:119-135), so it
+ * essentially never returns 0; for a nonexistent PA it hands back a valid VA
+ * whose translation points at nothing, and the memcpy below then takes a
+ * synchronous external abort. mmu_kvtop() (the READ path) does not have this
+ * problem because the hardware AT instruction reports a fault instead.
+ *
+ * => Only call this for a PA already known to exist: an MMIO window in
+ *    qud_write_whitelist[], the XNU RAM range, or an address the caller has
+ *    read successfully before. A READPA whitelist mirroring WRITEPA's is the
+ *    intended hardening; until then the host side must not be fed guesses. */
 /* One cached device window. The console reads a few register blocks repeatedly
  * (MDSS, GPUCC, SMMU); reusing one permanent mapping avoids leaking a VM entry
  * per command. Different windows evict the previous one -- the mapping stays
