@@ -1131,6 +1131,8 @@ def main():
                         cmd_panictrig(rest)
                     elif verb == "STACKSHOT":
                         cmd_stackshot(rest)
+                    elif verb == "KDBG":
+                        send_cmd("KDBG", "")
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":

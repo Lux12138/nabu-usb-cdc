@@ -1509,6 +1509,50 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (panic)("nabu: PANICTRIG requested by host");
         break;   /* not reached */
     }
+    case SXNU_CONTROL_VERB_KDBG: {
+        /* KDBG: kdebug control state, read from the exported kd_control_trace
+         * instead of through sysctl.
+         *
+         * T50: kern.kdbg.* carries CTLFLAG_LOCKED and sysctlbyname cannot take that
+         * lock from this context -- kb-68 measured state=notfound for both
+         * kern.kdbg.oldest_time and kern.kdbg.debug while hw.ncpu worked. The
+         * structure itself is exported as D _kd_control_trace, so reading it
+         * directly bypasses the sysctl path entirely.
+         *
+         * Safe from here: the only lock involved is kdc_storage_lock, a lck_spin
+         * taken with interrupts off (kdebug_common.c:31), so it cannot sleep. We do
+         * not even take it -- kdc_oldest_time is a naturally aligned uint64_t, so
+         * the read is one instruction. A torn value is impossible on arm64 and a
+         * slightly stale timestamp is fine for this purpose. */
+        struct sxnu_control_writer writer;
+        uint64_t oldest = 0;
+        uint32_t enabled = 0, mode = 0, live_flags = 0, cpus = 0, flags = 0;
+
+        if (&kd_control_trace == 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (!qud_kdebug_state(&oldest, &enabled, &mode, &live_flags, &cpus, &flags)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unreadable");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " enabled=");
+        (void)sxnu_control_writer_decimal(&writer, enabled);
+        (void)sxnu_control_writer_text(&writer, " mode=");
+        (void)sxnu_control_writer_decimal(&writer, mode);
+        (void)sxnu_control_writer_text(&writer, " live_flags=0x");
+        (void)sxnu_control_writer_hex(&writer, live_flags, 8);
+        (void)sxnu_control_writer_text(&writer, " kdc_flags=0x");
+        (void)sxnu_control_writer_hex(&writer, flags, 8);
+        (void)sxnu_control_writer_text(&writer, " cpus=");
+        (void)sxnu_control_writer_decimal(&writer, cpus);
+        (void)sxnu_control_writer_text(&writer, " oldest_time=0x");
+        (void)sxnu_control_writer_hex(&writer, oldest, 16);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_STACKSHOT: {
         /* STACKSHOT: capture every thread's stack into the kernel buffer.
          *
@@ -2781,8 +2825,18 @@ debugger_done:
                         (void)sxnu_control_writer_hex(&writer, tthreads, 16);
                         (void)sxnu_control_writer_text(&writer, " nthreads=");
                         (void)sxnu_control_writer_decimal(&writer, nthreads);
+                        /* T50: task+0xbc is NOT a bitfield -- it is two adjacent
+                         * int16_t (osfmk/kern/task.h:216-217):
+                         *   int16_t priority;      base priority for threads
+                         *   int16_t max_priority;  maximum priority for threads
+                         * so split the word instead of reporting it raw. Measured
+                         * 0x005f0051 => priority=0x51=81, max_priority=0x5f=95. */
                         (void)sxnu_control_writer_text(&writer, " prio=");
-                        (void)sxnu_control_writer_decimal(&writer, prio);
+                        (void)sxnu_control_writer_decimal(&writer, (uint32_t)(int32_t)(int16_t)(prio & 0xffffu));
+                        (void)sxnu_control_writer_text(&writer, " maxprio=");
+                        (void)sxnu_control_writer_decimal(&writer, (uint32_t)(int32_t)(int16_t)(prio >> 16));
+                        (void)sxnu_control_writer_text(&writer, " prio_raw=");
+                        (void)sxnu_control_writer_hex(&writer, prio, 8);
                         (void)sxnu_control_writer_text(&writer, " task_ok=1");
                     } else {
                         (void)sxnu_control_writer_text(&writer, " task_ok=0");

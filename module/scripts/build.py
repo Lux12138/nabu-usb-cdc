@@ -124,6 +124,7 @@ def main():
                    '_gPanicBase', '_gPanicSize',
                    '_sysctlbyname', '_tasks', '_kernproc', '_proc_struct_size',
                    '_kern_stack_snapshot_with_reason', '_kernel_stackshot_buf', '_kernel_stackshot_buf_size',
+                   '_kd_control_trace',
                    '_panic'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))

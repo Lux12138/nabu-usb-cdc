@@ -1187,6 +1187,73 @@ qud_task_qhead(uint64_t *next, uint64_t *prev)
     return 1;
 }
 
+/* ---- kdebug control structure (T50: read without the sysctl lock) ----------
+ *
+ * bsd/kern/kdebug_common.c:28 declares `extern struct kd_control kd_control_trace;`
+ * and it IS exported (D _kd_control_trace), so the field can be read directly
+ * instead of through sysctl -- which fails from this context because kern.kdbg.*
+ * carries CTLFLAG_LOCKED and sysctlbyname cannot take that lock here (measured:
+ * kb-68 returned state=notfound for both kern.kdbg.oldest_time and kern.kdbg.debug
+ * while hw.ncpu worked).
+ *
+ * The struct below mirrors the HEAD of bsd/sys/kdebug_common.h:110 up to
+ * kdc_oldest_time only. Everything after it is omitted on purpose: we never touch
+ * those fields, and mirroring less means less to keep in sync. The leading members
+ * are here solely so the compiler computes the offset -- hardcoding "+48" would
+ * break silently if the layout ever changed.
+ *
+ * Locking: kdebug_storage_lock() is a lck_spin with interrupts disabled
+ * (kdebug_common.c:31-36), NOT a mutex, so taking it briefly from this context
+ * cannot sleep and cannot wedge the CDC the way ktrace_lock would. kdc_oldest_time
+ * is also a naturally aligned uint64_t, so even an unlocked read is a single
+ * instruction; we still note both options in the reply. */
+/* Offsets below are not hand-derived: they were read out of the LINKED kernel's
+ * own code. `llvm-objdump -d --disassemble-symbols=_qud_kdebug_state` against
+ * kb-69 shows exactly what the compiler emitted against kd_control_trace, so
+ * these numbers are the compiler's, not ours:
+ *
+ *   adr  x8, _kd_control_trace
+ *   ldr  x9, [x8, #0x30]   -> kdc_oldest_time
+ *   ldr  w9, [x8, #0x08]   -> enabled:1 / mode:3
+ *   ldr  w9, [x8, #0x2c]   -> kdc_live_flags
+ *   ldr  w9, [x8, #0x1c]   -> kdebug_cpus
+ *   ldr  w9, [x8, #0x24]   -> kdc_flags
+ *
+ * A mirrored struct was the first attempt and it was wrong: union kds_ptr is a
+ * 21+11 bitfield over uint32_t (kdebug_common.h:65-71), not a pointer, and
+ * declaring it as uint64_t shifted oldest_time to +0x38 while the real field is
+ * at +0x30. Hard offsets with the disassembly as the source of truth cannot drift
+ * silently in the same way -- if the layout changes, this verb reads the wrong
+ * u32 and the caller sees an implausible value, which is a loud failure. */
+#define QUD_KDC_ENABLED_MODE  0x08u
+#define QUD_KDC_CPUS          0x1cu
+#define QUD_KDC_FLAGS         0x24u
+#define QUD_KDC_LIVE_FLAGS    0x2cu
+#define QUD_KDC_OLDEST_TIME   0x30u
+
+extern char kd_control_trace;   /* D _kd_control_trace, opaque on purpose */
+
+/* 1 on success. Reports the oldest timestamp still in the trace buffer, plus the
+ * header fields that say whether tracing is on and how the buffer is behaving.
+ * Every access is a single naturally-aligned load: no lock, nothing to sleep on. */
+int
+qud_kdebug_state(uint64_t *oldest_time, uint32_t *enabled, uint32_t *mode,
+                 uint32_t *live_flags, uint32_t *cpus, uint32_t *flags)
+{
+    const uint8_t *base = (const uint8_t *)(const void *)&kd_control_trace;
+    uint32_t em;
+
+    if (!base) return 0;
+    em = *(const uint32_t *)(const void *)(base + QUD_KDC_ENABLED_MODE);
+    if (oldest_time) *oldest_time = *(const uint64_t *)(const void *)(base + QUD_KDC_OLDEST_TIME);
+    if (enabled) *enabled = em & 1u;
+    if (mode) *mode = (em >> 1) & 7u;
+    if (live_flags) *live_flags = *(const uint32_t *)(const void *)(base + QUD_KDC_LIVE_FLAGS);
+    if (cpus) *cpus = *(const uint32_t *)(const void *)(base + QUD_KDC_CPUS);
+    if (flags) *flags = *(const uint32_t *)(const void *)(base + QUD_KDC_FLAGS);
+    return 1;
+}
+
 /* ---- struct proc/task decoding (T47-verified offsets) -----------------------
  *
  * Every offset below was verified against this tree AND against the running
