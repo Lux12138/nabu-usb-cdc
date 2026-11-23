@@ -1410,9 +1410,24 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
          * the USB worker for good (ml_io_map's KMA_NOFAIL allocation returns a
          * valid VA for a PA that maps to nothing, and the memcpy never
          * returns). One mistyped address should not cost a power cycle. */
-        if (!qud_read_pa_allowed(pa, (size_t)count)) {
-            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "denied");
-            break;
+        {
+            const char *allow_why = NULL;
+            if (!qud_read_pa_allowed(pa, (size_t)count, &allow_why)) {
+                /* state=denied cost a debugging round on kb-47 because it did
+                 * not say WHICH check failed. name= names the block that would
+                 * have allowed it, or "outside" when nothing does. */
+                struct sxnu_control_writer w2;
+                sxnu_control_writer_init(&w2, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&w2, frame->session, frame->seq, frame->verb, "ERR");
+                (void)sxnu_control_writer_text(&w2, " state=denied name=");
+                (void)sxnu_control_writer_text(&w2, allow_why);
+                (void)sxnu_control_writer_text(&w2, " pa=0x");
+                (void)sxnu_control_writer_hex(&w2, pa, 16);
+                (void)sxnu_control_writer_text(&w2, " len=");
+                (void)sxnu_control_writer_decimal(&w2, count);
+                reply_bytes = sxnu_control_reply_finish(&w2);
+                break;
+            }
         }
         opened = qud_diag_read_begin(pa, (uint32_t)count, frame->seq, 1);
         if (opened != 1) {
@@ -1754,7 +1769,11 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             { "intf2", UINT64_C(0x0ae6c000), 0x1000   },
             { "gpucc", UINT64_C(0x02c90000), 0x9000   },
             { "gcc",   UINT64_C(0x01050000), 0x4000   },
-            { "smmu",  UINT64_C(0x01000000), 0x100000 },
+            /* "smmu" deliberately absent: RDBLK goes straight to
+             * qud_diag_read_phys and would bypass the READPA whitelist. Reading
+             * SMMU registers crashed the kernel on kb-47 -- its clock domain is
+             * not guaranteed up, and that is not knowable from here. Restore
+             * only with a board round proving the domain is up. */
             { "discc", UINT64_C(0x0af00000), 0x1000   },
             { "dwc3",  UINT64_C(0x0a600000), 0x10000  },
         };

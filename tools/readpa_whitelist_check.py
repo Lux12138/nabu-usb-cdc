@@ -21,15 +21,26 @@ Usage:  python -I tools/readpa_whitelist_check.py [--gphys 0xc007c000 --size 0x1
 import argparse
 import sys
 
-# The MMIO windows WRITEPA trusts (QcomUsbDiag.c qud_write_whitelist).
-# Ranges are [lo, hi).
+# The read whitelist (QcomUsbDiag.c qud_read_whitelist), NOT the write list.
+# It holds only blocks this console has read safely on hardware. Ranges are
+# [lo, hi) and a read must fit entirely inside one.
+#
+# Two entries teach the whole lesson:
+#   smmu is absent -- it is in the WRITE list (configuring it is supported) but
+#        reading its registers crashed the kernel on kb-47, because its clock
+#        domain is not guaranteed up. "exists" != "safe to read".
+#   wdt  is present -- 0x17c10008 has been read successfully for many rounds,
+#        yet an earlier revision reused the write list and refused it.
 MMIO = [
-    (0x0a600000, 0x0a700000, "dwc3"),
-    (0x01000000, 0x01010000, "smmu"),
-    (0x01050000, 0x01090000, "gcc"),
-    (0x02c90000, 0x02ca0000, "gpucc"),
+    (0x17c10000, 0x17c11000, "wdt"),
     (0x0ae00000, 0x0af00000, "mdss"),
-    (0x0af00000, 0x0af01000, "disp_cc"),
+    (0x0ae01000, 0x0ae02000, "mdp"),
+    (0x0ae6b000, 0x0ae6c000, "intf1"),
+    (0x0ae6c000, 0x0ae6d000, "intf2"),
+    (0x02c90000, 0x02ca0000, "gpucc"),
+    (0x01050000, 0x01090000, "gcc"),
+    (0x0af00000, 0x0af01000, "discc"),
+    (0x0a600000, 0x0a700000, "dwc3"),
 ]
 
 
@@ -42,9 +53,9 @@ def allowed(pa, length, gphys, size):
         end = gphys + size
         if pa >= gphys and pa <= end and length <= end - pa:
             return True
-    # Then the MMIO blocks WRITEPA may touch.
+    # Then the blocks that have been read safely on this board.
     for lo, hi, _name in MMIO:
-        if pa >= lo and pa + length <= hi:
+        if pa >= lo and pa <= hi and length <= hi - pa:
             return True
     return False
 
@@ -75,6 +86,11 @@ def main():
         (0x0a600000, 8,   True,  "DWC3 base"),
         # --- MMIO: must be refused (outside every window) ---
         (0x0ae01000, 0x200000, False, "MDSS read running past its window"),
+        # --- kb-47: the WDT register that was wrongly refused ---
+        (0x17c10008, 4,   True,  "WDT EN -- legal read, was denied once"),
+        # --- kb-47: the address that crashed the kernel while whitelisted ---
+        (0x01000000, 16,  False, "SMMU -- exists, but reading it crashed kb-47"),
+        (0x01000000, 4,   False, "SMMU base, any length"),
         (0x12340000, 4,   False, "unmapped gap between windows"),
         # --- The address that bricked the board on kb-46 ---
         (0x3c0fc000, 32,  False, "Raspberry Pi panic address from BCM2837.h"),

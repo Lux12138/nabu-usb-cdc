@@ -44,6 +44,11 @@ extern uintptr_t phystokv(uint64_t phys);
 extern unsigned long gPhysBase;
 extern unsigned long real_phys_size;
 
+/* Declared here because QcomXnuUsbDebug.h is pulled in after this file; the
+ * definition lives in QcomXnuUsbDebug.c and this is only used for the one
+ * pre-access log line. */
+size_t qcom_usb_debug_write(const void *bytes, size_t count);
+
 /* The kernel's own copy of the TTBR1 base address.
  *
  * arm_vm_init.c:1962/2151/2162 is the whole story:
@@ -213,7 +218,7 @@ static uint64_t phys_cache_span;
 static uintptr_t phys_cache_va;
 
 static size_t
-qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
+qud_diag_read_phys_anno(uint64_t pa, void *dst, size_t len, int anno)
 {
     const uint64_t base = pa & ~UINT64_C(0xfff);
     const uint64_t off = pa & UINT64_C(0xfff);
@@ -231,12 +236,49 @@ qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
         phys_cache_va = va;
     }
     __asm__ volatile("dsb sy" ::: "memory");
+    /* Announce host-supplied accesses before touching them. A read that wedges
+     * the machine never returns, so this line is the only way to learn
+     * afterwards which address did it -- kb-47 was diagnosed by guessing, at
+     * one power cycle per attempt.
+     *
+     * Hand-rolled instead of printf: this runs from the USB worker and must not
+     * take kprintf's lock (the module deliberately never enters kprintf; see
+     * the re-entry notes in QcomXnuUsbDebug.c). PTDUMP's own reads pass
+     * anno=0 -- those addresses come from the page tables and logging every
+     * level would flood the console. */
+    if (anno) {
+        char text[40];
+        size_t at = 0;
+        static const char hexd[] = "0123456789abcdef";
+        text[at++] = 'p'; text[at++] = 'a'; text[at++] = '-';
+        text[at++] = 'r'; text[at++] = 'd'; text[at++] = ':';
+        text[at++] = ' '; text[at++] = '0'; text[at++] = 'x';
+        for (int shift = 60; shift >= 0; shift -= 4)
+            text[at++] = hexd[(pa >> shift) & 0xfu];
+        text[at++] = ' '; text[at++] = 'l'; text[at++] = '=';
+        {
+            char digits[8];
+            unsigned n = 0, v = (unsigned)len;
+            do { digits[n++] = (char)('0' + (v % 10u)); v /= 10u; } while (v && n < sizeof(digits));
+            while (n) text[at++] = digits[--n];
+        }
+        text[at++] = '\n';
+        (void)qcom_usb_debug_write(text, at);
+    }
     memcpy(dst, (const void *)(va + off), len);
     __asm__ volatile("dsb sy" ::: "memory");
     /* XNU never calls ml_io_unmap: device mappings from ml_io_map are
        permanent (all XNU callers keep them). Unmapping panics vm_map_delete
        on a permanent entry. */
     return len;
+}
+
+/* Existing callers keep the two-argument spelling; only the two paths that
+ * take an address from the host pass anno=1 (see the log note above). */
+static size_t
+qud_diag_read_phys(uint64_t pa, void *dst, size_t len)
+{
+    return qud_diag_read_phys_anno(pa, dst, len, 0);
 }
 
 /* ---- WRITEPA: MMIO-only physical write ---------------------------------- */
@@ -268,34 +310,69 @@ qud_write_pa_allowed(uint64_t pa, size_t len)
 
 /* ---- READPA: which physical addresses may be read ------------------------
  *
- * This whitelist exists because reading a PA that does not exist on the SoC
- * wedges the USB worker permanently -- measured on kb-46: `readpa 0x3c0fc000 32`
- * never returned, the CDC port stayed open, HELLO stopped answering, and with
- * nabu-wdt-off=1 the board had to be power-cycled. See the hazard note above
- * qud_diag_read_phys(): ml_io_map() cannot serve as an existence test because
- * its allocation is KMA_NOFAIL, so a bogus PA yields a valid VA pointing at
- * nothing and the memcpy takes a synchronous external abort.
+ * History, because this went wrong twice in opposite directions on kb-47:
  *
- * Two kinds of address are safe, and both are listed:
- *   - the MMIO windows WRITEPA already trusts (a register block that exists)
- *   - the XNU RAM range, checked at runtime against gPhysBase/real_phys_size
- *     rather than hardcoded, because the base moves with the physmap slide
+ *   readpa 0x3c0fc000  -> wedged the worker for good (address does not exist;
+ *                         ml_io_map's KMA_NOFAIL allocation returns a valid VA
+ *                         whose pages map to nothing, so the memcpy never
+ *                         returns)
+ *   readpa 0x17c10008  -> refused, but that is the WDT EN register this port
+ *                         has read successfully for many rounds
+ *   RDBLK smmu         -> CRASHED the kernel, although SMMU is in the write
+ *                         whitelist because writing it is explicitly supported
  *
- * Everything else is refused without touching ml_io_map. That turns a mistyped
- * address from a bricking event into an "ERR state=denied" reply. */
+ * The last one is the important lesson: "the address exists" and "reading it
+ * right now is safe" are different statements. A static list cannot decide the
+ * second one -- SMMU needs its clock/power domain up, and that is not knowable
+ * from here. So this list is deliberately NOT the write list: it holds only
+ * blocks that have actually been read safely on this board, and it is expected
+ * to grow one entry at a time, each backed by a board round.
+ *
+ * Anything outside it is refused without touching ml_io_map, and every accepted
+ * read is announced on the console log first (see qud_diag_read_phys) so that if
+ * a read ever does wedge the machine, the last log line names the culprit. */
+struct qud_read_range { uint64_t lo, hi; const char *why; };
+static const struct qud_read_range qud_read_whitelist[] = {
+    /* Register blocks this console has read on hardware, repeatedly. */
+    { UINT64_C(0x17c10000), UINT64_C(0x17c11000), "wdt"    },
+    { UINT64_C(0x0ae00000), UINT64_C(0x0af00000), "mdss"   },
+    { UINT64_C(0x0ae01000), UINT64_C(0x0ae02000), "mdp"    },
+    { UINT64_C(0x0ae6b000), UINT64_C(0x0ae6c000), "intf1"  },
+    { UINT64_C(0x0ae6c000), UINT64_C(0x0ae6d000), "intf2"  },
+    { UINT64_C(0x02c90000), UINT64_C(0x02ca0000), "gpucc"  },
+    { UINT64_C(0x01050000), UINT64_C(0x01090000), "gcc"    },
+    { UINT64_C(0x0af00000), UINT64_C(0x0af01000), "discc"  },
+    { UINT64_C(0x0a600000), UINT64_C(0x0a700000), "dwc3"   },
+    /* SMMU is NOT here on purpose. It is in the write whitelist because
+     * configuring it is supported, but reading it crashed the kernel on kb-47
+     * (its clock domain is not guaranteed up). Add it back only with a board
+     * round that proves otherwise. */
+};
+
 static int
-qud_read_pa_allowed(uint64_t pa, size_t len)
+qud_read_pa_allowed(uint64_t pa, size_t len, const char **why)
 {
+    if (why) *why = "outside";
     if (!len) return 0;
 
-    /* RAM first: it is the common case (page tables, kernel data). */
+    /* RAM first: the common case (page tables, kernel data). Checked at runtime
+     * because gPhysBase moves with the physmap slide. */
     if (real_phys_size) {
         const uint64_t base = (uint64_t)gPhysBase;
         const uint64_t end = base + (uint64_t)real_phys_size;
-        if (pa >= base && pa <= end && (uint64_t)len <= end - pa) return 1;
+        if (pa >= base && pa <= end && (uint64_t)len <= end - pa) {
+            if (why) *why = "ram";
+            return 1;
+        }
     }
-    /* Then the same MMIO blocks WRITEPA is allowed to touch. */
-    return qud_write_pa_allowed(pa, len);
+    for (unsigned i = 0; i < sizeof(qud_read_whitelist)/sizeof(qud_read_whitelist[0]); i++) {
+        const struct qud_read_range *r = &qud_read_whitelist[i];
+        if (pa >= r->lo && pa <= r->hi && (uint64_t)len <= r->hi - pa) {
+            if (why) *why = r->why;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Write len bytes to a physical MMIO address through the cached device window.
@@ -389,7 +466,7 @@ int qud_dump_ufs_enqueue(uint64_t pa, uint32_t len, const uint8_t *tag, uint32_t
 {
     if (!qud_dump_ufs_available()) return -2;
     if (!len || (len & 0xfffu) || native_ufs_export_blocks() < (len / 4096u)) return -3;
-    if (!qud_read_pa_allowed(pa, len)) return -4;
+    if (!qud_read_pa_allowed(pa, len, NULL)) return -4;
     for (uint32_t i = 0; i < QUD_DUMP_SLOTS; i++) {
         struct qud_dump_slot *s = &qud_dump_slots[i];
         if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 0) continue;
@@ -421,7 +498,7 @@ int qud_dump_ufs_write_first(uint32_t slot_index, uint32_t *blocks_written,
     s = &qud_dump_slots[slot_index];
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == 0 || !s->len) return -1;
 
-    got = qud_diag_read_phys(s->pa, qud_dump_scratch, 4096u);
+    got = qud_diag_read_phys_anno(s->pa, qud_dump_scratch, 4096u, 1);
     if (got != 4096u) {
         if (write_err) *write_err = -1;   /* read path failed */
         __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE);
@@ -460,7 +537,7 @@ void qud_dump_ufs_progress(void)
         __atomic_store_n(&s->state, 2u, __ATOMIC_RELEASE);
         uint32_t budget = QUD_DUMP_TICKBYTES;
         while (s->done < s->len && budget >= 4096u) {
-            size_t got = qud_diag_read_phys(s->pa + s->done, qud_dump_scratch, 4096u);
+            size_t got = qud_diag_read_phys_anno(s->pa + s->done, qud_dump_scratch, 4096u, 1);
             if (got != 4096u) { __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE); break; }
             if (!native_ufs_export_write(s->rel, 1u, qud_dump_scratch)) {
                 __atomic_store_n(&s->state, 4u, __ATOMIC_RELEASE); break;
@@ -506,7 +583,9 @@ qud_diag_read_begin(uint64_t va, uint32_t len, uint32_t frame, int phys)
      * the CRC the host uses to verify the reassembled buffer. */
     while (at < len) {
         const uint32_t take = (len - at) < QUD_DIAG_CHUNK ? (len - at) : QUD_DIAG_CHUNK;
-        const size_t got = phys ? qud_diag_read_phys(va + at, scratch, take)
+        /* phys=1 means the address came from the host (READPA / RDBLK), so
+         * announce it: if this read wedges the worker, the log names it. */
+        const size_t got = phys ? qud_diag_read_phys_anno(va + at, scratch, take, 1)
                                 : qud_diag_read(va + at, scratch, take);
         if (got != take) {
             return -2;
@@ -548,7 +627,7 @@ qud_diag_read_next(uint8_t *out, size_t capacity, uint32_t *offset, uint32_t *fr
         take = (uint32_t)capacity;
     }
     got = qud_diag_cursor.is_phys
-        ? qud_diag_read_phys(qud_diag_cursor.va + qud_diag_cursor.offset, out, take)
+        ? qud_diag_read_phys_anno(qud_diag_cursor.va + qud_diag_cursor.offset, out, take, 1)
         : qud_diag_read(qud_diag_cursor.va + qud_diag_cursor.offset, out, take);
     if (got != take) {
         qud_diag_cursor.active = 0;
