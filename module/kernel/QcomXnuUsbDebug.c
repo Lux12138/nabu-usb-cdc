@@ -1450,6 +1450,67 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_READUFS: {
+        /* READUFS <hexrel> [<hexblocks>]: read the diagnostic log window back off
+         * the medium. This is the read side of the landing path -- without it the
+         * best we can prove is "the payload handed to the writer was correct",
+         * not "the bytes on the UFS are correct".
+         *
+         * One block per reply, so the reply stays under the 512-byte cap: 64 bytes
+         * of hex (the NABULOG1 header lives in the first 24) plus the CRC of the
+         * whole block, which lets the host verify the rest without shipping it.
+         * rel is a block offset from gLogRegionFirst, not an absolute LBA. */
+        const uint8_t *tok[3];
+        size_t len[3];
+        uint64_t rel = 0, blocks = 1;
+        struct sxnu_control_writer writer;
+        int argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 3);
+        if (argc < 1 || argc > 2 ||
+            !control_args_hex(tok[0], len[0], &rel) ||
+            (argc == 2 && !control_args_hex(tok[1], len[1], &blocks)) ||
+            blocks != 1) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        {
+            static uint8_t qud_logufs_block[4096];
+            int why = 0;
+            if (!qud_log_ufs_read_block(rel, qud_logufs_block, &why)) {
+                sxnu_control_writer_init(&writer, reply, sizeof(reply));
+                (void)sxnu_control_reply_start(&writer, frame->session, frame->seq,
+                                               frame->verb, "ERR");
+                (void)sxnu_control_writer_text(&writer, " state=");
+                (void)sxnu_control_writer_text(&writer,
+                    why == 1 ? "unsupported" : (why == 2 ? "nowindow" : "read"));
+                (void)sxnu_control_writer_text(&writer, " rel=");
+                (void)sxnu_control_writer_decimal(&writer, (uint32_t)rel);
+                reply_bytes = sxnu_control_reply_finish(&writer);
+                break;
+            }
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq,
+                                           frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " state=ready rel=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)rel);
+            (void)sxnu_control_writer_text(&writer, " crc32=");
+            {
+                uint32_t crc = 0xffffffffu;
+                for (uint32_t i = 0; i < 4096u; i++) {
+                    crc ^= qud_logufs_block[i];
+                    for (unsigned bit = 0; bit < 8; bit++) {
+                        crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+                    }
+                }
+                (void)sxnu_control_writer_hex(&writer, (uint64_t)(crc ^ 0xffffffffu), 8);
+            }
+            (void)sxnu_control_writer_text(&writer, " data=");
+            for (uint32_t i = 0; i < 64u; i++) {
+                (void)sxnu_control_writer_hex(&writer, qud_logufs_block[i], 2);
+            }
+            reply_bytes = sxnu_control_reply_finish(&writer);
+        }
+        break;
+    }
     case SXNU_CONTROL_VERB_READPANEXT: {
         const uint8_t *tok[4];
         size_t len[4];

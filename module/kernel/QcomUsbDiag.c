@@ -359,6 +359,22 @@ static const struct qud_read_range qud_read_whitelist[] = {
     { UINT64_C(0x01050000), UINT64_C(0x01090000), "gcc"    },
     { UINT64_C(0x0af00000), UINT64_C(0x0af01000), "discc"  },
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000), "dwc3"   },
+    /* 0x9b000000 is deliberately NOT here. kb-46 measured `readpa 0x9b000000`
+     * as returning zeros and it was whitelisted on that basis, but two later
+     * board rounds showed the address has no usable backing at all:
+     *
+     *   kb-51: mapping it before Mach VM (PE_create_console) builds a block
+     *          descriptor and the machine panics in machine_idle.
+     *   kb-52: mapping it after (STARTUP(KMEM)) succeeds, then bzero()ing
+     *          512 KiB wedges the USB worker.
+     *
+     * "Reads as zero" turned out to mean "the transaction completes without
+     * fault", not "there is memory there". Whitelisting an address because a
+     * read survived is not evidence it is safe to touch.
+     *
+     * Panic text now goes to the 4 MiB BSS ring in osfmk/console/serial_general.c
+     * and lands on UFS via nabu_log_land_now(); PANICDUMP has nothing to inspect
+     * on this board and correctly reports nobase. */
     /* SMMU is NOT here on purpose. It is in the write whitelist because
      * configuring it is supported, but reading it crashed the kernel on kb-47
      * (its clock domain is not guaranteed up). Add it back only with a board
@@ -465,6 +481,10 @@ extern int native_ufs_export_write(uint64_t rel, uint32_t blocks, const void *sr
 extern uint64_t native_ufs_export_blocks(void) __attribute__((weak_import));
 extern uint64_t native_ufs_export_first(void) __attribute__((weak_import));
 extern int native_ufs_log_sync(void) __attribute__((weak_import));
+/* READUFS: read the diagnostic log window back off the medium. Separate export so a
+ * kernel built before it still links (the verb answers unsupported). */
+extern int native_ufs_log_read(uint64_t rel, uint32_t blocks, void *dst)
+    __attribute__((weak_import));
 
 #define QUD_DUMP_SLOTS 4u
 #define QUD_DUMP_TICKBYTES (16u * 4096u)   /* <=64 KiB per 5 ms tick */
@@ -492,6 +512,19 @@ int qud_dump_ufs_available(void)
         (void)native_ufs_log_open(&first, &blocks, &why);
     }
     return native_ufs_export_blocks() != 0;
+}
+
+/* One-block read of the diagnostic log window. Returns 1 on success. Kept
+ * synchronous on purpose: the write side already runs one 4 KiB block inside the
+ * command handler (DUMPUFS blocks_written=1), so a single read block is the same
+ * order of work. Bounds are validated in the driver as well. */
+int qud_log_ufs_read_block(uint64_t rel, void *dst, int *why)
+{
+    if (why) *why = 0;
+    if (&native_ufs_log_read == 0) { if (why) *why = 1; return 0; }
+    if (!qud_dump_ufs_available()) { if (why) *why = 2; return 0; }
+    if (native_ufs_log_read(rel, 1u, dst) != 1) { if (why) *why = 3; return 0; }
+    return 1;
 }
 
 /* Enqueue a dump. Returns slot index 0..N-1, or -1 full, -2 unsupported,

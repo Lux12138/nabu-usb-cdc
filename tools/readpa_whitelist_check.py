@@ -46,6 +46,9 @@ MMIO = [
     (0x01050000, 0x01090000, "gcc"),
     (0x0af00000, 0x0af01000, "discc"),
     (0x0a600000, 0x0a700000, "dwc3"),
+    # 0x9b000000 is NOT here: kb-51 panicked and kb-52 wedged proving the address
+    # has no backing. Reading it returned zeros, which only meant the transaction
+    # completed -- not that memory existed.
 ]
 
 
@@ -161,7 +164,11 @@ def main():
         (0x12340000, 4,   False, "unmapped gap between windows"),
         # --- The address that bricked the board on kb-46 ---
         (0x3c0fc000, 32,  False, "Raspberry Pi panic address from BCM2837.h"),
-        (0x9b000000, 32,  False, "bootloader reservation, outside XNU RAM"),
+        # 0x9b000000 must stay refused: two board rounds proved no backing pages.
+        (0x9b000000, 32,  False, "no backing memory (kb-51 panic / kb-52 wedge)"),
+        (0x9b07fff0, 16,  False, "same region, different offset"),
+        (0x9b080000, 16,  False, "past the (nonexistent) region"),
+        (0x9b000000, 0x90000, False, "large read over it"),
         # --- Degenerate ---
         (0x0, 4,          False, "null page"),
         (a.gphys, 0,      False, "zero length"),

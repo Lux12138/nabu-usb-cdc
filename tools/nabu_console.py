@@ -43,7 +43,7 @@ KDP（单句柄下的自动握手，不需要另开脚本）：
 控制台会自动：发 DEBUGGER -> 排空日志 -> 关闭句柄 -> 运行 kdp_cli -> 重新打开句柄。
 """
 from __future__ import annotations
-import argparse, binascii, json, os, queue, re, subprocess, sys, threading, time
+import argparse, binascii, json, os, queue, re, struct, subprocess, sys, threading, time
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -546,6 +546,47 @@ def main():
             if reply:
                 log("PTDUMP %s -> %s" % (token, reply))
 
+    def cmd_readufs(arg):
+        """readufs <relblock> [<relblock> ...]  -- read the diagnostic log window.
+
+        Reads one 4 KiB block per offset straight off the medium and decodes the
+        NABULOG1 header, so a landing can be verified without trusting any kernel
+        counter. rel is a block offset from the start of the log window, not an
+        absolute LBA."""
+        words = arg.split()
+        if not words:
+            log("用法: readufs <relblock> [<relblock> ...]   (块偏移，0 = 日志窗开头)")
+            return
+        for w in words:
+            try:
+                rel = int(w, 0)
+            except ValueError:
+                log("! readufs: 非法偏移 %r" % w)
+                continue
+            reply = send_cmd("READUFS", "0x%x 1" % rel, timeout=30.0)
+            if not reply:
+                log("! readufs %d: 无回复" % rel)
+                continue
+            kv = dict(x.split("=", 1) for x in reply.split() if "=" in x)
+            data = kv.get("data", "")
+            if not data:
+                log("READUFS rel=%d -> %s" % (rel, reply))
+                continue
+            blob = binascii.unhexlify(data)
+            magic = blob[0:8]
+            if magic == b"NABULOG1":
+                # Header layout from serial_general.c:412-417 -- seven u32s at +8,
+                # with total split into lo/hi because it is 64-bit.
+                ver, is_panic, avail, dropped, t_lo, t_hi = struct.unpack_from("<IIIIII", blob, 8)
+                total = t_lo | (t_hi << 32)
+                log("READUFS rel=%d  crc32=%s  NABULOG1 ver=%d is_panic=%d available=%d total=%d dropped=%d"
+                    % (rel, kv.get("crc32", "?"), ver, is_panic, avail, total, dropped))
+            else:
+                log("READUFS rel=%d  crc32=%s  magic=%r  head=%s"
+                    % (rel, kv.get("crc32", "?"), magic, data[:48]))
+                if len(blob) >= 24:
+                    log("        words: %s" % " ".join("%08x" % v for v in struct.unpack_from("<IIIIII", blob, 0)))
+
     def cmd_panicdump(arg):
         """panicdump [info | log <off> <len>]  -- read the embedded panic region.
 
@@ -1016,6 +1057,8 @@ def main():
                         cmd_ptdump(rest)
                     elif verb == "PANICDUMP":
                         cmd_panicdump(rest)
+                    elif verb == "READUFS":
+                        cmd_readufs(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":

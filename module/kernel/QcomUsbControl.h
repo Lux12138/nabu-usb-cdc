@@ -67,6 +67,7 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_BKPLIST,   /* BKPLIST -> list breakpoints                 */
     SXNU_CONTROL_VERB_SYSREG,    /* SYSREG <name> -> read a system register     */
     SXNU_CONTROL_VERB_SYSREGW,   /* SYSREGW <name> <hex> -> write (gated)        */
+    SXNU_CONTROL_VERB_READUFS,   /* READUFS <relblock> <blocks> -> log window    */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -189,6 +190,9 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
         text[3] == 'P' && text[4] == 'U' && text[5] == 'F' && text[6] == 'S')
         return SXNU_CONTROL_VERB_DUMPUFS;
+    if (bytes == 7u && text[0] == 'R' && text[1] == 'E' && text[2] == 'A' &&
+        text[3] == 'D' && text[4] == 'U' && text[5] == 'F' && text[6] == 'S')
+        return SXNU_CONTROL_VERB_READUFS;
     if (bytes == 7u && text[0] == 'D' && text[1] == 'U' && text[2] == 'M' &&
         text[3] == 'L' && text[4] == 'I' && text[5] == 'S' && text[6] == 'T')
         return SXNU_CONTROL_VERB_DUMLIST;
@@ -319,6 +323,7 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_BOOTARGS: return "BOOTARGS";
     case SXNU_CONTROL_VERB_VERSION: return "VERSION";
     case SXNU_CONTROL_VERB_DUMPUFS: return "DUMPUFS";
+    case SXNU_CONTROL_VERB_READUFS: return "READUFS";
     case SXNU_CONTROL_VERB_DUMLIST: return "DUMLIST";
     case SXNU_CONTROL_VERB_UPTIME: return "UPTIME";
     case SXNU_CONTROL_VERB_RDBLK: return "RDBLK";
