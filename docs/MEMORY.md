@@ -539,7 +539,7 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 
 ---
 
-## 11. 踩坑清单（54 条，按主题分组）
+## 11. 踩坑清单（59 条，编号 1–61，按主题分组）
 
 ### 11.1 构建/环境（最致命）
 
@@ -612,6 +612,10 @@ printf 'reboot\n' >> E:/nabu/logs/<t>-cmd.txt     # PSCI 直发，~16 秒回 rec
 | 34 | `board.toml` 会与实际 payload 漂移；`sync_payload_args.py` 会静默弄丢 `DB_KDP_GETC_ENA` |
 | 54 | 主动触发 panic 去测 KDP 退出 = 拿设备冒险换不需要的功能 |
 | 57 | `idle()` 是 IOKit 初始化回调，**a640 发布后停止调用**（HFI 导出放错位置，kb-66 全 0）|
+| **58** | **`nabu: spawn … dur=/t=/rt=` 的单位是 `mach_absolute_time()` 裸 tick（19.2 MHz），不是微秒。** 把 `dur=25857324` 读成 "25.8 s" 实际是 1.35 s，差 1920 万倍。**换算一律 `/19200000`** |
+| **59** | **`QCOM USB LOSS contention=` 是真丢字节**，`dropped = overflow + contended`（`QcomUsbBuffer.h:73-77`）。**`STATUS rxo=0` 只代表控制环没溢出，不代表广播日志零丢失** |
+| **60** | **`native_ufs_block_reads` 不是块数**，是 `RootWindowRead.h:53` 的窗口 copy **迭代次数**（每次 while 迭代调一次 `ops.copy`）。**不能乘 4096 当字节数** |
+| **61** | **`native_ufs_read_ticks` 是全局累计值**，跨所有读者；**不能把某窗口的增量全算在单个进程头上**，只能作趋势证据 |
 
 ---
 
