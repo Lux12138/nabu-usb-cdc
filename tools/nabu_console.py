@@ -574,6 +574,14 @@ def main():
             log("用法: readufs <relblock> [<relblock> ...]   (块偏移，0 = 日志窗开头)")
             return
         for w in words:
+            inner_off = 0
+            if "@" in w:
+                w, off_s = w.split("@", 1)
+                try:
+                    inner_off = int(off_s, 0)
+                except ValueError:
+                    log("! readufs: 非法块内偏移 %r" % off_s)
+                    continue
             # Named offsets, so nobody has to remember the slot numbers.
             named = {"panic": 8190, "panicheader": 8190,
                      "panictail": 8166, "header": 0, "tail": 1}
@@ -585,7 +593,7 @@ def main():
                 except ValueError:
                     log("! readufs: 非法偏移 %r（可用 header/tail/panic/panictail）" % w)
                     continue
-            reply = send_cmd("READUFS", "0x%x 1" % rel, timeout=30.0)
+            reply = send_cmd("READUFS", "0x%x 0x%x" % (rel, inner_off), timeout=30.0)
             if not reply:
                 log("! readufs %d: 无回复" % rel)
                 continue

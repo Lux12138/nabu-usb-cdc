@@ -1510,24 +1510,26 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         break;   /* not reached */
     }
     case SXNU_CONTROL_VERB_READUFS: {
-        /* READUFS <hexrel> [<hexblocks>]: read the diagnostic log window back off
+        /* READUFS <hexrel> [<hexoffset>]: read the diagnostic log window back off
          * the medium. This is the read side of the landing path -- without it the
          * best we can prove is "the payload handed to the writer was correct",
          * not "the bytes on the UFS are correct".
          *
          * One block per reply, so the reply stays under the 512-byte cap: 64 bytes
-         * of hex (the NABULOG1 header lives in the first 24) plus the CRC of the
-         * whole block, which lets the host verify the rest without shipping it.
+         * of hex plus the CRC of the whole block. <offset> picks where inside the
+         * block those 64 bytes start -- needed because a 4 KiB block usually holds
+         * several lines and the interesting one (a NABULOG1 header, or a PANICSTR
+         * marker near the end of the newest block) is not always at the front.
          * rel is a block offset from gLogRegionFirst, not an absolute LBA. */
         const uint8_t *tok[3];
         size_t len[3];
-        uint64_t rel = 0, blocks = 1;
+        uint64_t rel = 0, offset = 0;
         struct sxnu_control_writer writer;
         int argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 3);
         if (argc < 1 || argc > 2 ||
             !control_args_hex(tok[0], len[0], &rel) ||
-            (argc == 2 && !control_args_hex(tok[1], len[1], &blocks)) ||
-            blocks != 1) {
+            (argc == 2 && !control_args_hex(tok[1], len[1], &offset)) ||
+            (offset & 0x3fu) || offset > 4096u - 64u) {
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
             break;
         }
@@ -1562,9 +1564,11 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
                 }
                 (void)sxnu_control_writer_hex(&writer, (uint64_t)(crc ^ 0xffffffffu), 8);
             }
+            (void)sxnu_control_writer_text(&writer, " off=");
+            (void)sxnu_control_writer_decimal(&writer, (uint32_t)offset);
             (void)sxnu_control_writer_text(&writer, " data=");
             for (uint32_t i = 0; i < 64u; i++) {
-                (void)sxnu_control_writer_hex(&writer, qud_logufs_block[i], 2);
+                (void)sxnu_control_writer_hex(&writer, qud_logufs_block[offset + i], 2);
             }
             reply_bytes = sxnu_control_reply_finish(&writer);
         }
