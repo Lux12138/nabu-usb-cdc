@@ -2160,6 +2160,20 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[12], 8);
         (void)sxnu_control_writer_text(&writer, " protect=");
         (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[13], 8);
+        /* T46-Q2: GMU HFI state, exported by NativeAdrenoService into slots the
+         * driver never used for anything else. hfiQueue/hfiHeader is the message
+         * queue and its head; hfiMessage/hfiError are the last exchange result.
+         * A wedged GPU is usually distinguishable from an idle one right here. */
+        (void)sxnu_control_writer_text(&writer, " hfi_q=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[2], 8);
+        (void)sxnu_control_writer_text(&writer, " hfi_hdr=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[3], 8);
+        (void)sxnu_control_writer_text(&writer, " hfi_msg=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[14], 8);
+        (void)sxnu_control_writer_text(&writer, " hfi_err=");
+        (void)sxnu_control_writer_hex(&writer, native_adreno_a6xx_stats[15], 8);
+        (void)sxnu_control_writer_text(&writer, " hfi_ack=");
+        (void)sxnu_control_writer_decimal(&writer, native_adreno_a6xx_stats[19]);
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
