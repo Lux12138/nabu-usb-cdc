@@ -8,21 +8,37 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ---
 
-## 现在的状态（2026-11-23）
+## 现在的状态（2026-11-23 21:30）
 
-**48 个命令全部真机验证，panic 日志跨重启存活。**
+**48 个设备端命令 + 9 条主机侧命令，全部真机验证。**
 
 | 指标 | 状态 |
 |---|---|
-| 命令总数 | **48**，全部真机验证 |
+| 设备端 verb | **48** 个（`module/kernel/QcomUsbControl.h`）|
+| 主机侧命令 | **9** 条（读已导出数组，不需要内核改动）|
 | 内核日志 | 开机到复位连续，无需第二串口 |
 | 读内存 | 内核虚拟地址 + 物理地址/MMIO，带白名单防护 |
-| 写内存 | `WRITEPA` 白名单内已验证 |
-| panic 日志 | **BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活** |
-| 链路 | CDC 约 42–57 s 枚举，命令往返正常 |
+| **写内存/寄存器** | `WRITE` / `WRITEPA` / `SYSREGW` **三条都做过值变化验证** |
+| panic 日志 | BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活 |
+| **`Debugger()` 进出** | **可进可出**（预置 ≥8 个 `'c'`，见下文）|
+| 链路 | CDC 约 38–57 s 枚举，命令往返正常 |
 
-**最新可用基线**：`baseline-kb59-ufsoffset` tag（kernel `9cc32cf0f07f693f`，boot-args 无危险 gate）。
-详细基线说明见 [`docs/BASELINE.md`](docs/BASELINE.md)。
+**最新可用基线**：`hold/kb-92-nop18`（kernel `e3cb7046d0f8eec1c6fa`，已打 NOP18 补丁）。
+
+> ### ⚠️ NOP18 是硬性步骤
+>
+> 构建出的 `kernel.macho` **必须**跑一次
+> `python3 /e/nabu/tools/_nop18_l800.py`。它把签名 `6100005408214439` 后面的
+> `cbnz`（`a8000037`）改成 `nop`（`1f2003d5`）。
+>
+> **没打这个补丁的内核会在 `disk1s1` 挂载阶段卡死，日志只出 6 行 `nabu:`。**
+> 2026-11-23 一晚上有 6 轮构建因此白跑。
+>
+> 验证：
+> ```
+> python3 -c "d=open('kernel.macho','rb').read();i=d.find(bytes.fromhex('6100005408214439'));print(d[i+8:i+12].hex())"
+> # 期望 1f2003d5
+> ```
 
 ---
 
@@ -36,7 +52,20 @@ clang -std=c11 -D_GNU_SOURCE -Wall -Wextra -I. \
   tests/test_usb_control_args.c -o /tmp/t && /tmp/t   # 应 ALL PASS
 ```
 
-### 2. 上板一次（先起控制台，再刷机）
+### 2. 打包（一条命令）
+
+```bash
+bash /e/nabu/tmp/pack_round.sh <新包名> [基线包名]
+```
+
+它会：**检查 NOP18** → 原地替换 kernel（不重排 FAT 簇）→ 校验三条 sha →
+校验簇链布局 → 校验 boot 镜像 → 打印 args 数量。任一步失败就**不产出包**。
+
+> **不要用 `mcopy` 直接替换 payload 里的 `kernel.macho`。** 那会重新分配
+> 125 MB 的簇，FAT 布局全变。`payload_swap_kernel.py` 按原有簇链原地写入，
+> 布局保持不变。
+
+### 3. 上板（先起控制台，再刷机）
 
 ```bash
 # 终端 1：控制台（务必在刷机前启动）
@@ -45,14 +74,13 @@ python -u nabu_console.py --tag run1 --out /path/to/logs \
   --wait 300 --deadline 900 --kernel /path/to/kernel.macho
 
 # 终端 2：刷机
-cd /path/to/build
 bash go_round_next.sh <包名>
 ```
 
 控制台每 2 秒扫描端口，发现 COM3 后打开，日志写入 `<tag>-com.bin`，
 命令写入 `<tag>-cmd.txt`（**只追加，勿截断**）。
 
-### 3. 发命令
+### 4. 发命令
 
 向 `<tag>-cmd.txt` 追加一行即可：
 
@@ -62,30 +90,129 @@ ptdump _gPhysBase
 readpa 0x17c10008 16
 sysreg TCR_EL1
 readufs panic
+vmstat
 ```
 
-回复写入 `<tag>-ctl.txt`。`readufs panic` 读回 panic 槽头；
-`readufs 8166@4032` 读 panic 文本所在的块尾。
+回复写入 `<tag>-ctl.txt`。
 
 ---
 
-## 命令一览（48 个）
+## 设备端命令（48 个 verb）
 
 | 类别 | 命令 |
 |---|---|
-| 基础 | `HELLO` `PING` `STATUS` `BOOTARGS` `VERSION` `UPTIME` `REBOOT` |
-| 内存读 | `READ` `READNEXT` `READPA` `READPANEXT` `RDBLK` `DUMP` `DUMPPA` |
-| 内存写 | `WRITEPA` `WRITE` |
-| UFS | `DUMPUFS` `DUMLIST` `READUFS` |
-| 调试 | `DEBUGGER` `KDPPUSH` `KDPREAD` `KDPWRITE` `KDPREBOOT` `KDPRAW` |
-| 页表 / panic | `PTDUMP` `PANICDUMP` `PANICTRIG` |
-| 系统信息 | `SYSCTL` `TASKDUMP` `THREADDUMP` `SYSREG` `SYSREGW` `SYM` `SYMS` |
-| 显示 | `SCREENSHOT` `SHOTNEXT` `VSYNCON` `FLIPNOW` `DISPREGS` `SMMUDUMP` |
-| GPU | `GPUPROFILE` `GPUFREQ` `GPUHWCG` `GMUSTATE` `PERFSTART` `PERFSTOP` `PERFREAD` `PERFCLEAR` |
-| 断点 | `BKPADD` `BKPDEL` `BKPLIST` |
+| 基础 7 | `HELLO` `PING` `STATUS` `BOOTARGS` `VERSION` `UPTIME` `REBOOT` |
+| 内存读 7 | `READ` `READNEXT` `READPA` `READPANEXT` `RDBLK` `DUMP` `DUMPPA` |
+| 内存写 2 | `WRITE` `WRITEPA` |
+| UFS 3 | `DUMPUFS` `DUMLIST` `READUFS` |
+| 调试 2 | `DEBUGGER` `KDPPUSH` |
+| 页表 / panic 3 | `PTDUMP` `PANICDUMP` `PANICTRIG` |
+| 系统 7 | `SYSCTL` `TASKDUMP` `THREADDUMP` `SYSREG` `SYSREGW` `SYM` `SYMS` |
+| 显示 6 | `SCREENSHOT` `SHOTNEXT` `VSYNCON` `FLIPNOW` `DISPREGS` `SMMUDUMP` |
+| GPU 6 | `GMUSTATE` `GPUFREQ` `GPUHWCG` `GPUPROFILE` `PERFSTART` `PERFSTOP` |
+| PERF 2 | `PERFREAD` `PERFCLEAR` |
+| 断点 3 | `BKPADD` `BKPDEL` `BKPLIST` |
+| 诊断 2 | `STACKSHOT` `KDBG` |
 
-`SYM`/`SYMS` 按设计回 `unsupported`（符号表在主机侧解析）。
-`PANICTRIG` 和 `SYSREGW` 是破坏性命令，各有 boot-arg 安全阀，默认关闭。
+`SYM`/`SYMS` 按设计回 `unsupported`（符号表 53k 条在主机侧解析）。
+
+### 命令的安全阀
+
+| 命令 | 条件 |
+|---|---|
+| `PANICTRIG` | 需要 boot-arg `nabu-panic-trig=1` **且** 字面 key `PANIC-NOW` |
+| `SYSREGW` | 需要 `nabu-sysreg-write=1`，或运行时把 `qud_sysreg_write_enabled`（`.data` 导出，`0xfffffff00c0f5a70`）写成 1 |
+| `WRITEPA` | 需要 `qcom-usb-write=1`，且地址在 MMIO 白名单内 |
+
+**运行时开 gate 的例子**（不用刷机）：
+
+```
+read  0xfffffff00c0f5a70 4      → ffffffff   (-1 = 未解析)
+write 0xfffffff00c0f5a70 01000000
+read  0xfffffff00c0f5a70 4      → 01000000   (gate 已开)
+```
+
+---
+
+## 主机侧命令（9 条，零内核改动）
+
+这些不是 verb。它们用 `READ` 直接读**已导出的统计数组**，解析全在 Python 里做，
+因此不需要重新编译内核。
+
+| 命令 | 数据源 | 说明 |
+|---|---|---|
+| `VMSTAT` | `native_adreno_vm_phase_us[2][8]` | map/unmap 各阶段耗时 |
+| `MEMSTAT` | `native_adreno_backing_cache_stats[12]` | backing cache 计数 |
+| `POOLSTAT` | `native_adreno_pool_stats[8]` | 自有池统计 |
+| `MEMSTAGE` | `native_adreno_memory_stage_stats[10][4]` | 10 个内存阶段 |
+| `ALIASSTAT` | `nabu_alias_stats[6]` | alias 构建统计 |
+| `METHODS` | `native_adreno_method_stats[20][4]` | 20 个 gpu method 槽 |
+| `CLIENTS` | `native_adreno_client_stats[5][6]` | 5 个 client 槽 |
+| `WAITOUTER` | `native_adreno_wait_outer[4]` | external method 等待计数 |
+| `IB [n]` | `native_adreno_ib_log[4][32]` + `_count` | 最近提交的 IB 头 |
+
+另有控制台自用命令：`VAR <sym>`（按符号名读）、`STATS`、`MARK`、`DUMP`/`DUMPPA`。
+
+> **`READ` 的回复上限**：`SXNU_CONTROL_REPLY_BYTES = 512`，扣掉协议开销后
+> `data=` 最多 **192 字节**。**`len=` 是请求长度，不是实际返回长度。**
+> 超过 192 字节的数组由 `read_bytes()` 自动分块。
+
+**`TSENS`** 已实现但**当前基线没有对应符号**（那次导出已回滚），会报"读取失败"。
+
+---
+
+## KDP 调试器：进得去也出得来
+
+**两种场景，退出方式完全不同**：
+
+| 场景 | 退出方式 | 为什么 |
+|---|---|---|
+| **未 CONNECT** | **预置的裸 `'c'`（≥8 个）** | 走 `kdp_getc()` 循环，事后发的字节要经 `serial_rx_drain()`，被 `acquire()` 的 `cpu_number() != master_cpu` 挡住 |
+| **已 CONNECT** | **`kdp resume`**（`KDP_RESUMECPUS` 请求）| 走 KDP 协议，不经过 `kdp_getc()` |
+
+### 进入 + 退出（一条命令）
+
+```
+kdp enter 6363636363636363
+```
+
+即 `DEBUGGER 6363636363636363`。模块回复会给出三个关键字段：
+
+```
+DEBUGGER OK state=entering queued=8 pending=8 ovf=0
+```
+
+`queued=8 pending=8 ovf=0` = 8 个字节全部进环、零丢失。
+
+### 日志判据
+
+**成功**（kb-94 实测）：
+
+```
+Using serial KDP.
+Waiting for remote debugger connection.
+Options.....    Type
+------------    ----
+continue....    'c'
+reboot......    'r'
+Continuing...                      ← 'c' 生效，Debugger() 返回
+NabuGPU: state=starting step=0     ← 内核继续跑
+```
+
+**8 个是实测有效量**：2 个不够（kb-93 用 `6363` 失败）。
+
+### 两个坑
+
+1. **`kdp resume` 在未 CONNECT 时不生效** —— 它发的是裸字节，同样被 `acquire()` 挡住。
+   控制台现在会直接报错并打印正确命令。
+2. **`'r'` 走不通** —— `kdp_machine_reboot()` 传 `kPEPanicRestartCPU = 4`，
+   而模块的 halt 钩子只认 `CONTROL_PE_RESTART_CPU = 1`，其余返回 `-1` 后空转。
+   要让 `'r'` 通，只需让钩子也接受 `type == 4`（只改模块）。**尚未做。**
+
+### panic 之后仍然出不来
+
+panic 路径 `kdp_rx_armed = 0`，`serial_getc()` 读的是**控制环**（只有 SXNU1 文本），
+而且我们无法在 panic 前预置字节。**只能断电**，除非改 XNU。
 
 ---
 
@@ -111,7 +238,7 @@ panic 时 `nabu_log_land_now()` 强制落盘到**专用槽**，与周期槽分�
 ```
 readufs header            # 周期槽头，is_panic 应为 0
 readufs panic             # panic 槽头，is_panic 应为 1
-readufs 8166@4032         # panic 文本（PANICSTR: ...）在最新尾部块的最后 64 字节
+readufs 8166@4032         # panic 文本（PANICSTR: ...）
 ```
 
 `NABULOG1` 头布局（小端）：magic(8) + version(4) + is_panic(4) +
@@ -124,12 +251,19 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 ## 重要操作纪律
 
 1. **一个 tag 用到底**：`<tag>-cmd.txt` 只用 `>>` 追加，不截断。要重来就换 tag。
-2. **一个控制台、一个句柄**：不要同时开第二个串口工具。
+   （控制台按字节偏移追踪，截断后命令会被静默跳过。）
+2. **一个 boot 只能 open 一次 CDC**：`close()` 后再 `open()`，即使返回成功、
+   即使日志还在流，**OUT 方向也可能已失效**。活性判据只能是「HELLO 有回复」。
 3. **先起控制台，再刷机**：否则早期日志全丢。
 4. **复位判据**：COM3 消失 **且** adb 出现 `f91fa664 recovery`；`adb devices` 空不算。
 5. **复位发 `reboot`**（走 PSCI，可靠）；**禁 `--arm-at` 自动复位**。
-6. **panic 后进 KDP 退不出来**：已知限制（已交反编译侧排查），只能断电。
+6. **改 boot-arg 必须重打 payload**，而重打会改 FAT 布局。能不改就不改；
+   要开 gate，优先用运行时 `WRITE` 改对应的 `.data` 变量。
 7. **写危险寄存器前先看原值**：像 `0xfffffff9...` 这种内核指针，写随机值会直接卡死内核。
+8. **`READPA` 的目标地址必须有同 boot 的成功读记录**；不要用它探测未知寄存器
+   （kb-72 用 `readpa 0x0105c000` 卡死过 worker，尽管那个地址在白名单内）。
+9. **构建流程不要留 bind mount**：`out-v6/nabu` 现在是指向 `l738-full/out/nabu`
+   的符号链接。历史上 91 层残留 mount 导致构建读到 11 月的旧快照。
 
 更完整的纪律见 [`docs/DISCIPLINE.md`](docs/DISCIPLINE.md)。
 
@@ -139,7 +273,11 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 
 | 路径 | 内容 |
 |---|---|
-| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 命令 + KDP |
+| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 48 verb + 9 条主机侧命令 + KDP |
+| `tools/payload_swap_kernel.py` | 原地替换 payload 里的 kernel（保持 FAT 布局）|
+| `tools/payload_layout_check.py` | 校验 kernel 簇链是否为已知可启动的布局 |
+| `tools/pack_round.sh` | 打包入口（含 NOP18 与布局门）|
+| `tools/build_and_pack.sh` | 构建 + 打包全流程 |
 | `tools/pipeline.py` | 日志分析流水线 |
 | `tools/symtab.py` | 主机侧符号表（53k 符号）|
 | `module/kernel/` | 控制协议与 verb 实现（C）|
@@ -154,7 +292,7 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 | 内容 | 位置 | 远端 |
 |---|---|---|
 | 源码 / 设备树活源 | `docs/backup/source/`（本仓库）| ✅ 已提交 |
-| 编译产物（7 基线，2.3 GB）| 本地 `hold/_baseline_archive/20261123/` | ❌ 太大，不上传；见 [`docs/BACKUP.md`](docs/BACKUP.md) |
+| 编译产物 | 本地 `hold/_baseline_archive/20261123/` | ❌ 太大，不上传；见 [`docs/BACKUP.md`](docs/BACKUP.md) |
 
 ---
 
