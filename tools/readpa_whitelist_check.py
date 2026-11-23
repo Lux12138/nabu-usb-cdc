@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Offline check of the READPA / DUMPUFS physical-address whitelist.
+"""Offline check of the READPA / WRITEPA / DUMPUFS physical-address whitelists.
 
 qud_read_pa_allowed() decides whether a physical address may be read through
 ml_io_map(). Getting it wrong is expensive in both directions:
@@ -11,6 +11,11 @@ ml_io_map(). Getting it wrong is expensive in both directions:
                     power cycle)
   too strict     -> the diagnostics that depend on READPA (PTDUMP's acceptance
                     cross-check, RDBLK, page-table probes) stop working
+
+The write list is checked separately because it is a different table with a
+different history -- SMMU sat in it, and `writepa 0x01000000 0` wedged the
+worker on kb-49 just as reading SMMU did on kb-47: "writing this block is
+supported" is not "writing it right now is safe".
 
 So the rule is pinned here with the real numbers this board reports, and this
 script is the regression test. It mirrors the C function; if the C changes, this
@@ -44,6 +49,29 @@ MMIO = [
 ]
 
 
+# The write whitelist (QcomUsbDiag.c qud_write_whitelist). It is a *different*
+# table on purpose: writes are an explicit, gated capability, so a block belongs
+# here only if a write to it has actually been exercised safely on hardware.
+WRITE_MMIO = [
+    (0x17c10000, 0x17c11000, "wdt"),
+    (0x0a600000, 0x0a700000, "dwc3"),
+    (0x01050000, 0x01090000, "gcc"),
+    (0x02c90000, 0x02ca0000, "gpucc"),
+    (0x0ae00000, 0x0af00000, "mdss"),
+    (0x0af00000, 0x0af01000, "discc"),
+]
+
+
+def write_allowed(pa, length):
+    """Mirror of qud_write_pa_allowed()."""
+    if not length:
+        return False
+    for lo, hi, _name in WRITE_MMIO:
+        if pa >= lo and pa + length <= hi:
+            return True
+    return False
+
+
 def allowed(pa, length, gphys, size):
     """Mirror of qud_read_pa_allowed()."""
     if not length:
@@ -58,6 +86,45 @@ def allowed(pa, length, gphys, size):
         if pa >= lo and pa <= hi and length <= hi - pa:
             return True
     return False
+
+
+def self_check_source():
+    """Verify the C source's write list matches WRITE_MMIO above.
+
+    Grepping the compiled object for 0x01000000 is not a valid check: the
+    address also appears in a comment explaining why SMMU was removed, and
+    comments do not survive into the binary but other copies of the constant can.
+    Parsing the source table is what actually answers the question.
+    """
+    import re
+    path = "D:/_nabu-usb-cdc/module/kernel/QcomUsbDiag.c"
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as exc:
+        print("SKIP source check: %s" % exc)
+        return 0
+    m = re.search(r"qud_write_whitelist\[\]\s*=\s*\{(.*?)\n\};", text, re.S)
+    if not m:
+        print("SKIP source check: table not found")
+        return 0
+    body = m.group(1)
+    # strip block comments so prose mentions do not count
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    entries = re.findall(r"\{\s*UINT64_C\(0x([0-9a-fA-F]+)\)\s*,\s*UINT64_C\(0x([0-9a-fA-F]+)\)", body)
+    src = [(int(lo, 16), int(hi, 16)) for lo, hi in entries]
+    want = [(lo, hi) for lo, hi, _n in WRITE_MMIO]
+    bad = 0
+    print("\n== source check: qud_write_whitelist (comments stripped) ==")
+    for lo, hi in src:
+        hit = (lo, hi) in want
+        print("  %s 0x%08x-0x%08x %s" % ("PASS" if hit else "FAIL", lo, hi,
+                                         "" if hit else "(not in the expected write list)"))
+        bad += 0 if hit else 1
+    for lo, hi in want:
+        if (lo, hi) not in src:
+            print("  FAIL 0x%08x-0x%08x missing from source" % (lo, hi))
+            bad += 1
+    return bad
 
 
 def main():
@@ -110,10 +177,35 @@ def main():
             failures += 1
 
     print()
+    print("== write whitelist (qud_write_pa_allowed) ==")
+    write_cases = [
+        # The one block proven writable on hardware, twice over: nabu_wdt_pet()
+        # writes +0x08 thousands of times per boot, and kb-49 wrote it directly.
+        (0x17c10008, 4,   True,  "WDT EN -- written safely on kb-49"),
+        # kb-49: writing SMMU wedged the worker, pa-wr named 0x1000000.
+        (0x01000000, 4,   False, "SMMU -- write wedged kb-49, must stay out"),
+        (0x01000008, 4,   False, "SMMU another register"),
+        # Never writable from here.
+        (0x0, 4,          False, "null page"),
+        (0x3c0fc000, 4,   False, "Raspberry Pi panic address"),
+        (0x12340000, 4,   False, "unmapped gap"),
+        (0x17c10008, 0,   False, "zero length"),
+    ]
+    for pa, length, expect, why in write_cases:
+        got = write_allowed(pa, length)
+        ok = (got == expect)
+        print("%s pa=0x%-10x len=0x%-8x expect=%-5s got=%-5s  %s"
+              % ("PASS" if ok else "FAIL", pa, length, expect, got, why))
+        if not ok:
+            failures += 1
+
+    failures += self_check_source()
+
+    print()
     if failures:
         print("%d FAILURE(S)" % failures)
         return 1
-    print("ALL PASS (%d cases)" % len(cases))
+    print("ALL PASS (%d read + %d write cases)" % (len(cases), len(write_cases)))
     return 0
 
 

@@ -296,7 +296,16 @@ static const struct qud_mmio_range qud_write_whitelist[] = {
      * what hangs the machine. */
     { UINT64_C(0x17c10000), UINT64_C(0x17c11000) }, /* WDT */
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000) }, /* DWC3 USB controller */
-    { UINT64_C(0x01000000), UINT64_C(0x01010000) }, /* SMMU */
+    /* SMMU deliberately absent, on the same evidence that removed it from the
+     * read list: `writepa 0x01000000 00000000` wedged the USB worker on kb-49
+     * exactly as `RDBLK smmu` did on kb-47. The pa-wr line named it directly:
+     *
+     *     pa-wr: 0x0000000001000000 l=4     <- last action before the silence
+     *
+     * Writing SMMU registers is a supported operation in the driver, but doing
+     * it through this console is not the same thing: the clock/power domain has
+     * to be up, and that cannot be guaranteed from here. Restore only with a
+     * board round that proves the domain is up at the moment of the write. */
     { UINT64_C(0x01050000), UINT64_C(0x01090000) }, /* GCC (partial) */
     { UINT64_C(0x02c90000), UINT64_C(0x02ca0000) }, /* GPUCC */
     { UINT64_C(0x0ae00000), UINT64_C(0x0af00000) }, /* MDSS */
