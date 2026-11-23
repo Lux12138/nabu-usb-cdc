@@ -67,14 +67,14 @@ do {
 **理论上是 2 个。实测 2 个不够**（kb-93 用 `6363` 失败），说明预检查与循环之间还有别的消费者。
 **8 个是实测有效的最小可用量，留了余量。**
 
-## 4. 事后补发无效（kb-93 实测）
+## 4. 事后补发无效 —— **只对"未 CONNECT"的场景成立**
 
-**进入调试器之后**再发 `c`（`kdp resume`）**没有任何效果**，连发 12 个也读不到。
+**进入调试器之后**、**在未 CONNECT 的情况下**再发 `c`（`kdp resume`）**没有任何效果**，连发 12 个也读不到。
 
 **根因链：**
 
 ```
-kdp_connection_wait() 循环
+kdp_connection_wait() 循环（未 CONNECT 走这里）
   → kdp_getc() → console_try_read_char() → qcom_usb_debug_serial_getc()
     → kdp_rx_used == 0 → serial_rx_drain()
       → acquire()
@@ -86,7 +86,20 @@ kdp_connection_wait() 循环
 
 **日志里的 `QCOM USB LOSS overflow=0 contention=218 transport=0` 是同一件事的旁证。**
 
-**⇒ 所有字节都必须在 `Debugger()` 之前压进 `kdp_rx`（走 `qcom_usb_debug_kdp_push`，那条路不经过 `acquire`）。**
+**⇒ 在未 CONNECT 的场景下，所有字节都必须在 `Debugger()` 之前压进 `kdp_rx`
+（走 `qcom_usb_debug_kdp_push`，那条路不经过 `acquire`）。**
+
+### 4.1 【更正】已 CONNECT 的场景，`kdp resume` 是可用的
+
+上面说的"事后补发无效"**只适用于未 CONNECT**。两条路必须分开（反编译侧 T38 的界定）：
+
+| 场景 | 退出方式 | 为什么 |
+|---|---|---|
+| **未 CONNECT**（没有 `Connected to remote debugger.`）| **裸 `'c'`**，且必须在陷入前预置 | 走 `kdp_getc()` 循环，事后字节要经 `serial_rx_drain()`，被 `acquire()` 挡住 |
+| **已 CONNECT** | **`kdp resume`**（`KDP_RESUMECPUS` 请求）| 走 KDP 协议请求处理，**不经过 `kdp_getc()`**，因此不受 `acquire()` 限制 |
+
+**⇒ `kdp resume` 不是"没用"，是"只在已 CONNECT 时有用"。**
+kb-94 那一轮没有 CONNECT，所以起作用的是预置的裸 `'c'`。
 
 ## 5. panic 之后仍然出不来（与 Debugger 是两回事）
 
@@ -106,7 +119,27 @@ kdp_connection_wait() 循环
 - `send_frame_only()` —— 改成等 2 s 回复，这样能看到 `queued=/pending=/ovf=`，
   这三个字段是判断预置是否成功的唯一窗口
 
-## 7. 一句话
+## 7. `'r'` 走不通（反编译侧指出的，代码已印证）
 
-> **`Debugger()` 可进可出；退出的唯一办法是在陷入之前预置 ≥8 个 `'c'`。**
-> **进之后再发一个字节都读不到，因为 `serial_rx_drain()` 的 `acquire()` 拒绝非 master CPU。**
+```c
+static int qcom_usb_control_halt_restart(unsigned int type)
+{
+    if (type == CONTROL_PE_RESTART_CPU &&            /* == 1 */
+        control_reboot_requested && control_reboot_armed)
+        platform_smc_reset();
+    return -1;                                        /* type 4 落这里，空转 */
+}
+```
+
+`'r'` → `kdp_machine_reboot()` → `kPEPanicRestartCPU = 4` → 被拒 → `return -1` → 空转。
+**所以 `'r'` 目前只能断电。**
+
+若要让它通：halt 钩子接受 `type == 4` 时也走 `platform_smc_reset()`
+（只改模块，不动 XNU）。**与 debugger 退出是两件事，没做。**
+
+## 8. 一句话
+
+> **未 CONNECT：进入用 `DEBUGGER`（空参），退出用预置的裸 `'c'`（≥8 个），
+> 因为事后字节过不了 `serial_rx_drain()` 的 `acquire()`。**
+> **已 CONNECT：`kdp resume`（`KDP_RESUMECPUS`）可用，它不走 `kdp_getc()`。**
+> **`'r'` 两种场景都走不通（halt 钩子只认 type 1）。**
