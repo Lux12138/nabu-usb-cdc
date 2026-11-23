@@ -715,6 +715,133 @@ def main():
                         sensors.append("%d:-" % (i + 1))
                 log("TSENS sensors %s" % " ".join(sensors))
 
+    def cmd_jobstat(arg):
+        """JOBSTAT [n] -- the newest scheduler samples (kb-95 onward)."""
+        arr = sym_addr("_nabu_console_job_samples")
+        cnt = sym_addr("_nabu_console_job_sample_count")
+        if arr is None or cnt is None:
+            log("! jobstat: kernel has no nabu_console_job_samples "
+                "(needs the kb-95+ export)")
+            return
+        c = read_words(cnt, 1)
+        if not c:
+            log("! jobstat 读取失败（count）")
+            return
+        have = c[0]
+        want = 16
+        if arg.strip():
+            try:
+                want = max(1, min(64, int(arg.strip(), 0)))
+            except ValueError:
+                pass
+        show = min(want, have)
+        log("JOBSTAT samples=%d (showing %d, newest last)" % (have, show))
+        if show == 0:
+            log("JOBSTAT no submissions since boot")
+            return
+        # Each row is 14 u32; the kernel mirrors newest last.
+        base = (64 - have) if have < 64 else 0
+        for i in range(show):
+            row = read_words(arr + (base + i) * 14 * 4, 14)
+            if not row or len(row) < 14:
+                log("! jobstat row %d 读取失败" % i)
+                return
+            completion = row[0] | (row[1] << 32)
+            accepted = row[2] | (row[3] << 32)
+            completed = row[4] | (row[5] << 32)
+            log("JOB completion=%d queue=%d hw=%d res=%d waits=%d signals=%d "
+                "gpu_dep=%d dpu=%d status=%08x accepted_us=%d completed_us=%d"
+                % (completion, row[6], row[7], row[8], row[9], row[10],
+                   row[11], row[12], row[13], accepted, completed))
+
+    def cmd_slow(arg):
+        """SLOW -- memory operations that took >= 8000 us (kb-95 onward)."""
+        tot = sym_addr("_nabu_console_diag_totals")
+        flat = sym_addr("_nabu_console_slow_flat")
+        cnt = sym_addr("_nabu_console_slow_count")
+        if tot is None or flat is None or cnt is None:
+            log("! slow: kernel has no flat diag arrays (needs the kb-95+ export)")
+            return
+        tv = read_qwords(tot, 8)
+        if not tv:
+            log("! slow 读取失败（totals）")
+            return
+        log("SLOW insert_attempts=%d insertions=%d cached_obj=%d cached_bytes=%d"
+            % (tv[0], tv[1], tv[2], tv[3]))
+        log("SLOW peak_obj=%d peak_bytes=%d slow_total=%d slow_kept=%d"
+            % (tv[4], tv[5], tv[6], tv[7]))
+        cv = read_words(cnt, 1)
+        have = cv[0] if cv else 0
+        show = have if not arg.strip() else min(have, int(arg.strip(), 0))
+        if show == 0:
+            log("SLOW no operation exceeded 8000 us since boot")
+            return
+        names = ["allocation", "prepare", "spans", "zero", "initial_clean",
+                 "set_wc", "reassert_wc", "restore_attributes", "complete",
+                 "descriptor_release"]
+        for i in range(show):
+            row = read_words(flat + i * 12 * 4, 12)
+            if not row or len(row) < 12:
+                log("! slow row %d 读取失败" % i)
+                return
+            seq = row[0] | (row[1] << 32)
+            elapsed = row[2] | (row[3] << 32)
+            nbytes = row[4] | (row[5] << 32)
+            op = row[7]
+            opname = names[op] if op < len(names) else ("op%d" % op)
+            log("SLOW seq=%d %s elapsed_us=%d bytes=%d spans=%d "
+                "source=%d cache_result=%d flags=%08x avail_pages=%d"
+                % (seq, opname, elapsed, nbytes, row[6], row[8], row[9],
+                   row[10], row[11]))
+
+    def cmd_cpstat(arg):
+        """CPSTAT -- CP/ring status, mostly already in GMUSTATE."""
+        a = sym_addr("_native_adreno_a6xx_stats")
+        if a is None:
+            log("! cpstat: _native_adreno_a6xx_stats not found")
+            return
+        v = read_words(a, 24)
+        if not v or len(v) < 24:
+            log("! cpstat 读取失败")
+            return
+        log("CPSTAT step=%d failed=%d ctx_step=%d ctx_prog=%d "
+            "fence=%08x completed=%08x chip=%08x"
+            % (v[0], v[1], v[6], v[7], v[8], v[9], v[10]))
+        log("CPSTAT cp_status=%08x protect_status=%08x "
+            "hfi_q=%d hfi_hdr=%08x hfi_msg=%08x hfi_err=%08x hfi_ack=%d"
+            % (v[12], v[13], v[2], v[3], v[14], v[15], v[19]))
+        log("CPSTAT zap phase=%d transport=%d result=%d stopped=%d"
+            % (v[16], v[17], v[18], v[20]))
+
+    def cmd_irqstat(arg):
+        """IRQSTAT -- interrupt counters the kernel exports as data.
+
+        nabu_irq_count() and nabu_ipi_count() are functions, so READ cannot
+        reach them; their running values already appear in every
+        `nabu: spawn` line as irq=N ipi=M. What IS reachable through READ is
+        nabu_rtclock_intr_count, a plain counter.
+        """
+        rt = sym_addr("_nabu_rtclock_intr_count")
+        if rt is None:
+            return
+        v = read_qwords(rt, 1)
+        if not v:
+            log("! irqstat 读取失败")
+            return
+        log("IRQSTAT rtclock_intr=%d" % v[0])
+        try:
+            import re as _re
+            last = None
+            with open(ctl_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f.readlines()[-400:]:
+                    m = _re.search(r"irq=(\d+)", line)
+                    if m:
+                        last = m.group(1)
+            if last:
+                log("IRQSTAT irq_total=%s (newest nabu: spawn line)" % last)
+        except Exception:
+            pass
+
     def cmd_dump(arg):
         """dump <addr> <len> <file> | dumppa <pa> <len> <file>"""
         parts = arg.split()
@@ -1352,6 +1479,14 @@ def main():
                     cmd_waitouter(rest)
                 elif verb == "TSENS":
                     cmd_tsens(rest)
+                elif verb == "JOBSTAT":
+                    cmd_jobstat(rest)
+                elif verb == "SLOW":
+                    cmd_slow(rest)
+                elif verb == "CPSTAT":
+                    cmd_cpstat(rest)
+                elif verb == "IRQSTAT":
+                    cmd_irqstat(rest)
                 elif verb in ("DUMP", "DUMPPA"):
                     cmd_dump(raw)
                 elif verb == "STATS":
@@ -1450,6 +1585,14 @@ def main():
                         cmd_waitouter(rest)
                     elif verb == "TSENS":
                         cmd_tsens(rest)
+                    elif verb == "JOBSTAT":
+                        cmd_jobstat(rest)
+                    elif verb == "SLOW":
+                        cmd_slow(rest)
+                    elif verb == "CPSTAT":
+                        cmd_cpstat(rest)
+                    elif verb == "IRQSTAT":
+                        cmd_irqstat(rest)
                     elif verb in ("DUMP", "DUMPPA"):
                         cmd_dump(raw)
                     elif verb == "STATS":
