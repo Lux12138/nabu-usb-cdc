@@ -3627,8 +3627,22 @@ serial_rx_drain(void)
         }
     }
 
-    if (text_count != 0 && __atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE))
-        control_service(text, text_count, generation, &status);
+    if (text_count != 0 && __atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE)) {
+        /* While the debugger owns the wire, the host sends bare control
+         * characters ('c' to continue, 'r' to reset) and KDP frames -- none of
+         * that is an SXNU1 line. Feeding it to control_service() put a lone 'c'
+         * into the parser and the round died in _control_handle_frame+0x593c
+         * with four nested panics right after `Options.....    Type`.
+         *
+         * The console ring above keeps its copy of every byte, so nothing that
+         * used to work stops working; the control parser simply must not see
+         * traffic that belongs to the debugger. Note that kdp_rx_armed is only
+         * ever set (never cleared), so this suppression lasts for the rest of
+         * the boot once a DEBUGGER verb has run -- which is fine, because the
+         * kernel is in the debugger from then on. */
+        if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
+            control_service(text, text_count, generation, &status);
+    }
 }
 
 void

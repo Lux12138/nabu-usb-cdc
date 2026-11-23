@@ -671,6 +671,50 @@ def main():
             return
         log("WAITOUTER s0=%d s1=%d s2=%d s3=%d" % tuple(v[:4]))
 
+    def cmd_tsens(arg):
+        """TSENS -- thermal readings exported by NabuCpuFreq (kb-82 onward)."""
+        t = sym_addr("_nabu_cpufreq_tsens_tenths")
+        lvl = sym_addr("_nabu_cpufreq_thermal_level")
+        sw = sym_addr("_nabu_cpufreq_switches")
+        votes = sym_addr("_nabu_cpufreq_vote_khz")
+        if t is None:
+            return
+        tv = read_words(t, 1)
+        if not tv:
+            log("! tsens 读取失败")
+            return
+        tenths = tv[0]
+        if tenths >= 0x80000000:          # signed
+            tenths -= 0x100000000
+        log("TSENS hottest=%.1f C (%d tenths)" % (tenths / 10.0, tenths))
+        if lvl is not None:
+            lv = read_words(lvl, 1)
+            if lv:
+                log("TSENS thermal_level=%d  (0=normal 1=warm 2=hot)" % lv[0])
+        if sw is not None:
+            s = read_words(sw, 1)
+            if s:
+                log("TSENS switches=%d" % s[0])
+        if votes is not None:
+            v = read_words(votes, 4)
+            if v:
+                log("TSENS vote l3/small/big/prime=%d/%d/%d/%d kHz"
+                    % (v[0], v[1], v[2], v[3]))
+        raw = sym_addr("_nabu_cpufreq_tsens_raw")
+        if raw is not None:
+            r = read_words(raw, 14)
+            if r:
+                sensors = []
+                for i, s in enumerate(r):
+                    if s & (1 << 21):
+                        t10 = s & 0xfff
+                        if t10 & 0x800:
+                            t10 -= 0x1000
+                        sensors.append("%d:%.1f" % (i + 1, t10 / 10.0))
+                    else:
+                        sensors.append("%d:-" % (i + 1))
+                log("TSENS sensors %s" % " ".join(sensors))
+
     def cmd_dump(arg):
         """dump <addr> <len> <file> | dumppa <pa> <len> <file>"""
         parts = arg.split()
@@ -1016,16 +1060,31 @@ def main():
             pass
 
     def send_frame_only(verb, arg=""):
-        """发一帧但不等回复（DEBUGGER 会阻塞在内核里，本来就没有回复）。"""
+        """Send a frame and wait a SHORT time for its reply.
+
+        DEBUGGER does reply -- the module builds and queues the reply before it
+        arms the ring and calls Debugger() (QcomXnuUsbDebug.c:2397-2412), and
+        that reply carries `queued=` and `pending=`, which is the only way to
+        see whether the staged bytes actually reached kdp_rx. The trap follows,
+        so the reply must be collected before the log floods; a 2 s wait is
+        enough and never blocks on the trap itself.
+        """
         verb = verb.upper()
         if not ctl.hello_done:
             log("! skip %s: HELLO 尚未成功" % verb)
             return False
         ctl.seq += 1
+        seq = ctl.seq
         frame = ctl.build(verb, arg)
-        log("TX %s %s (seq=%d) [no reply expected]" % (verb, arg, ctl.seq))
+        log("TX %s %s (seq=%d)" % (verb, arg, seq))
         sess.send(frame)
-        event(kind="cmd", verb=verb, ok=True, reply="(none expected)")
+        reply = sess.wait_reply(verb, 2.0, seq=seq)
+        if reply:
+            log("RX %s" % reply)
+            event(kind="cmd", verb=verb, ok=True, reply=reply)
+        else:
+            # Expected for a verb that traps before answering; not an error.
+            event(kind="cmd", verb=verb, ok=True, reply="(no reply)")
         return True
 
     def wait_port_gone(timeout=12.0):
@@ -1072,20 +1131,34 @@ def main():
             return True
 
         if action == "resume":
-            # Rescue path: kdp_connection_wait() reads kdp_getc(); 'c' means
-            # Continuing and returns from Debugger(). No kdp_cli involved, so the
-            # console keeps the handle the whole time.
-            log("[kdp] sending 'c' to leave the debugger")
-            try:
-                sess.send(b"c")
-                sess.s.flush()
-            except Exception as e:
-                log("! write failed: %s" % e)
-                return False
-            time.sleep(1.5)
-            kdp_state["entered"] = False
-            log("[kdp] sent; look for 'Continuing...' in the log")
-            return True
+            # Rescue path for a Debugger() entry.
+            #
+            # MEASURED (kb-94): sending bytes AFTER the trap does not work. The
+            # loop in kdp_connection_wait() reads through kdp_getc() ->
+            # console_try_read_char() -> our serial_getc(), which with
+            # kdp_rx_used == 0 calls serial_rx_drain(); and serial_rx_drain()
+            # starts with acquire(), whose first line is
+            #
+            #     if (cpu_number() != master_cpu) return 0;
+            #
+            # The trapping thread is not on the master CPU, so the drain never
+            # runs, nothing reaches kdp_rx, and kdp_getc() keeps returning 0.
+            # Twelve bytes sent this way changed nothing (kb-93).
+            #
+            # What does work is staging the bytes BEFORE the trap:
+            #
+            #     DEBUGGER 6363636363636363
+            #
+            # kb-94 measured queued=8 pending=8 ovf=0 and then "Continuing..."
+            # followed by the kernel carrying on with GPU init. Eight bytes, not
+            # two: the pre-loop check and the loop itself both consume, and two
+            # was not enough in practice.
+            log("[kdp] resume-after-trap does not work: serial_rx_drain() "
+                "cannot acquire on a non-master CPU")
+            log("[kdp] stage the bytes before the trap instead:")
+            log("[kdp]   kdp enter 6363636363636363")
+            log("[kdp] (queued=8/pending=8 measured good on kb-94)")
+            return False
 
         if action == "reset":
             # T46-Q1 exit: send a bare 'r'. kdp_connection_wait() answers it with
@@ -1277,12 +1350,8 @@ def main():
                     cmd_clients(rest)
                 elif verb == "WAITOUTER":
                     cmd_waitouter(rest)
-                elif verb == "METHODS":
-                    cmd_methods(rest)
-                elif verb == "CLIENTS":
-                    cmd_clients(rest)
-                elif verb == "WAITOUTER":
-                    cmd_waitouter(rest)
+                elif verb == "TSENS":
+                    cmd_tsens(rest)
                 elif verb in ("DUMP", "DUMPPA"):
                     cmd_dump(raw)
                 elif verb == "STATS":
@@ -1379,12 +1448,8 @@ def main():
                         cmd_clients(rest)
                     elif verb == "WAITOUTER":
                         cmd_waitouter(rest)
-                    elif verb == "METHODS":
-                        cmd_methods(rest)
-                    elif verb == "CLIENTS":
-                        cmd_clients(rest)
-                    elif verb == "WAITOUTER":
-                        cmd_waitouter(rest)
+                    elif verb == "TSENS":
+                        cmd_tsens(rest)
                     elif verb in ("DUMP", "DUMPPA"):
                         cmd_dump(raw)
                     elif verb == "STATS":
