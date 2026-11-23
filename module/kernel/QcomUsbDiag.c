@@ -778,6 +778,113 @@ qud_pt_walk(uint64_t va, struct qud_pt_result *r)
     return 0;
 }
 
+/* ---- PANICDUMP: the embedded panic region -------------------------------
+ *
+ * Layout comes from osfmk/kern/debug.h:356-383 (struct embedded_panic_header),
+ * whose offsets are fixed by __attribute__((packed)) -- verified by compiling
+ * the struct and printing offsetof():
+ *
+ *     magic       +0x00   u32   EMBEDDED_PANIC_MAGIC ('FUNK')
+ *     crc         +0x04   u32
+ *     version     +0x08   u32
+ *     flags       +0x0c   u64   (eph_panic_flags_t is uint64_t, debug.h:324)
+ *     log_offset  +0x14   u32   from the start of the header
+ *     log_len     +0x18   u32
+ *     ss_offset   +0x1c   u32
+ *     ss_len      +0x20   u32
+ *     other_off   +0x24   u32
+ *     other_len   +0x28   u32
+ *     os_version  +0x34   32 bytes, NUL padded
+ *     sizeof      = 169
+ *
+ * gPanicBase is a *virtual* address: pe_init.c:112/159 assigns it from
+ * ml_io_map_wcomb(PLATFORM_PANIC_LOG_PADDR, PLATFORM_PANIC_LOG_SIZE), and
+ * pe_init.c:4-5 defaults those to 0x9b000000 / 0x80000 before the device-tree
+ * path can override them. So the region is read through qud_diag_read() (the
+ * hardware-AT path), never through a PA derived by arithmetic -- the exact
+ * mistake that cost kb-42/43 on PTDUMP.
+ *
+ * The magic test is the point of "info" mode: anything other than 'FUNK' means
+ * there is no panic to dump, and reporting which magic was found distinguishes
+ * "iBoot already cleared the region" from "we read the wrong place". */
+
+struct qud_panic_summary {
+    uint64_t base;          /* gPanicBase, a kernel VA */
+    uint32_t size;          /* gPanicSize */
+    uint32_t magic;
+    uint32_t version;
+    uint64_t flags;
+    uint32_t log_offset;
+    uint32_t log_len;
+    uint32_t ss_offset;
+    uint32_t ss_len;
+    uint32_t other_offset;
+    uint32_t other_len;
+    char     os_version[33];
+};
+
+extern vm_offset_t gPanicBase;
+extern unsigned int gPanicSize;
+
+static uint32_t
+qud_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Read and validate the panic header.
+ * 1 = valid panic ('FUNK' + sane bounds), 0 = magic absent,
+ * -1 = header unreadable / region not mapped, -2 = magic ok but bounds absurd. */
+static int
+qud_panic_header(struct qud_panic_summary *out)
+{
+    uint8_t raw[0x60];
+    size_t got;
+
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->base = (uint64_t)gPanicBase;
+    out->size = (uint32_t)gPanicSize;
+    if (!gPanicBase || !gPanicSize) return -1;
+
+    got = qud_diag_read((uint64_t)gPanicBase, raw, sizeof(raw));
+    if (got < 0x34) return -1;
+
+    out->magic = qud_le32(raw + 0x00);
+    out->version = qud_le32(raw + 0x08);
+    for (unsigned i = 0; i < 8u; i++)
+        out->flags |= (uint64_t)raw[0x0c + i] << (8u * i);
+    out->log_offset = qud_le32(raw + 0x14);
+    out->log_len = qud_le32(raw + 0x18);
+    out->ss_offset = qud_le32(raw + 0x1c);
+    out->ss_len = qud_le32(raw + 0x20);
+    out->other_offset = qud_le32(raw + 0x24);
+    out->other_len = qud_le32(raw + 0x28);
+
+    /* eph_os_version at +0x34: 32 bytes, NUL padded. Copy at most 32 and
+     * terminate unconditionally -- a region of garbage must not produce a
+     * non-terminated string in the reply. */
+    for (unsigned i = 0; i < 32u && (0x34u + i) < got; i++)
+        out->os_version[i] = (char)raw[0x34u + i];
+    out->os_version[32] = 0;
+
+    if (out->magic != UINT32_C(0x46554e4b))      /* 'FUNK' */
+        return 0;
+    /* Bounds must stay inside the region; a stale header can carry absurd
+     * lengths and a later chunk read would walk off the mapping. */
+    if (out->log_len && (out->log_offset > gPanicSize ||
+                         out->log_len > gPanicSize - out->log_offset))
+        return -2;
+    if (out->ss_len && (out->ss_offset > gPanicSize ||
+                        out->ss_len > gPanicSize - out->ss_offset))
+        return -2;
+    if (out->other_len && (out->other_offset > gPanicSize ||
+                           out->other_len > gPanicSize - out->other_offset))
+        return -2;
+    return 1;
+}
+
 #endif /* QCOM_USB_DIAG_C */
 
 /* ==== NABU-PROBE-L808 BEGIN (temporary) ==== */

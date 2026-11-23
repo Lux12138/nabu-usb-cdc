@@ -2331,6 +2331,122 @@ debugger_done:
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_PANICDUMP: {
+        /* PANICDUMP [info | log <hexoff> <hexlen>]
+         *
+         * Reads the embedded panic region. Pure read: no state is touched and
+         * nothing is cleared, so the region survives for a later iBoot/astris
+         * extraction exactly as it was found.
+         *
+         * info (the default) reports the header plus a 16-byte peek of the log,
+         * which is enough to tell a real panic from an emptied region.
+         * log <off> <len> streams a slice of the log text; <off> is relative to
+         * the log start, not to the region start. */
+        const uint8_t *tok[4]; size_t len[4];
+        unsigned argc;
+        uint64_t want_off = 0, want_len = 0;
+        unsigned mode = 1;                      /* 1 = info, 2 = log */
+        struct qud_panic_summary ps;
+        struct sxnu_control_writer writer;
+        uint8_t chunk[QUD_DIAG_CHUNK];
+        char tagbuf[17];
+        size_t got = 0;
+        uint64_t from, take;
+        int status;
+
+        argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 4);
+        if (argc >= 1) {
+            if (len[0] == 4u && tok[0][0] == 'i' && tok[0][1] == 'n' &&
+                tok[0][2] == 'f' && tok[0][3] == 'o') {
+                mode = 1;
+            } else if (len[0] == 3u && tok[0][0] == 'l' && tok[0][1] == 'o' &&
+                       tok[0][2] == 'g') {
+                mode = 2;
+            } else {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        if (mode == 2 &&
+            (argc != 3 ||
+             !control_args_hex(tok[1], len[1], &want_off) ||
+             !control_args_hex(tok[2], len[2], &want_len) ||
+             !want_len || want_len > QUD_DIAG_CHUNK)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+
+        status = qud_panic_header(&ps);
+        if (status < 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                status == -2 ? "range" : "nobase");
+            break;
+        }
+        if (status == 0) {
+            /* No panic. Report the magic actually found so a caller can tell
+             * "iBoot cleared it" (0x00000000) from "wrong address" (anything
+             * else). */
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " state=empty magic=0x");
+            (void)sxnu_control_writer_hex(&writer, ps.magic, 8);
+            (void)sxnu_control_writer_text(&writer, " base=0x");
+            (void)sxnu_control_writer_hex(&writer, ps.base, 16);
+            (void)sxnu_control_writer_text(&writer, " size=");
+            (void)sxnu_control_writer_decimal(&writer, ps.size);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+
+        if (mode == 2 && want_off >= ps.log_len) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "range");
+            break;
+        }
+
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " base=0x");
+        (void)sxnu_control_writer_hex(&writer, ps.base, 16);
+        (void)sxnu_control_writer_text(&writer, " size=");
+        (void)sxnu_control_writer_decimal(&writer, ps.size);
+        (void)sxnu_control_writer_text(&writer, " version=");
+        (void)sxnu_control_writer_decimal(&writer, ps.version);
+        (void)sxnu_control_writer_text(&writer, " flags=0x");
+        (void)sxnu_control_writer_hex(&writer, ps.flags, 16);
+        (void)sxnu_control_writer_text(&writer, " logoff=");
+        (void)sxnu_control_writer_decimal(&writer, ps.log_offset);
+        (void)sxnu_control_writer_text(&writer, " loglen=");
+        (void)sxnu_control_writer_decimal(&writer, ps.log_len);
+        (void)sxnu_control_writer_text(&writer, " sslen=");
+        (void)sxnu_control_writer_decimal(&writer, ps.ss_len);
+        (void)sxnu_control_writer_text(&writer, " otherlen=");
+        (void)sxnu_control_writer_decimal(&writer, ps.other_len);
+        for (size_t i = 0; i < sizeof(tagbuf) - 1u; i++) {
+            const char c = ps.os_version[i];
+            tagbuf[i] = (c >= 0x20 && c < 0x7f) ? c : 0;
+            if (!tagbuf[i]) break;
+        }
+        tagbuf[sizeof(tagbuf) - 1u] = 0;
+        (void)sxnu_control_writer_text(&writer, " os=");
+        (void)sxnu_control_writer_text(&writer, tagbuf);
+
+        from = ps.base + ps.log_offset;
+        if (mode == 2) {
+            from += want_off;
+            take = (want_len < ps.log_len - want_off) ? want_len : ps.log_len - want_off;
+        } else {
+            take = (ps.log_len < 16u) ? ps.log_len : 16u;   /* peek */
+        }
+        if (take > sizeof(chunk)) take = sizeof(chunk);
+        got = qud_diag_read(from, chunk, (size_t)take);
+        (void)sxnu_control_writer_text(&writer, " offset=");
+        (void)sxnu_control_writer_decimal(&writer, mode == 2 ? want_off : 0);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (size_t i = 0; i < got; i++)
+            (void)sxnu_control_writer_hex(&writer, chunk[i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host

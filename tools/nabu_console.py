@@ -546,6 +546,30 @@ def main():
             if reply:
                 log("PTDUMP %s -> %s" % (token, reply))
 
+    def cmd_panicdump(arg):
+        """panicdump [info | log <off> <len>]  -- read the embedded panic region.
+
+        'info' (the default) reports the header and peeks 16 bytes of the log;
+        'log' streams a slice of the log text. Never writes: the region is left
+        exactly as found so iBoot/astris can still extract it."""
+        words = arg.split()
+        if not words:
+            reply = send_cmd("PANICDUMP", "")
+        elif words[0].lower() == "info":
+            reply = send_cmd("PANICDUMP", "info")
+        elif words[0].lower() == "log" and len(words) == 3:
+            try:
+                off = int(words[1], 0)
+                n = int(words[2], 0)
+            except ValueError:
+                log("用法: panicdump log <offset> <len>")
+                return
+            reply = send_cmd("PANICDUMP", "log %x %x" % (off, n))
+        else:
+            log("用法: panicdump [info | log <offset> <len>]")
+            return
+        log("PANICDUMP -> %s" % (reply or "(no reply)"))
+
     def cmd_kdpraw(hexstr):
         """Write raw bytes straight to the serial port, bypassing SXNU1.
 
@@ -920,6 +944,8 @@ def main():
                     do_kdp(rest)
                 elif verb == "PTDUMP":
                     cmd_ptdump(rest)
+                elif verb == "PANICDUMP":
+                    cmd_panicdump(rest)
                 elif verb == "SYM":
                     cmd_sym(rest)
                 elif verb == "SYMS":
@@ -988,6 +1014,8 @@ def main():
                         do_kdp(rest)
                     elif verb == "PTDUMP":
                         cmd_ptdump(rest)
+                    elif verb == "PANICDUMP":
+                        cmd_panicdump(rest)
                     elif verb == "SYM":
                         cmd_sym(rest)
                     elif verb == "SYMS":

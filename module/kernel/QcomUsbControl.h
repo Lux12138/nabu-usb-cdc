@@ -57,6 +57,7 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_DEBUGGER,  /* DEBUGGER -> enter the kernel debugger (KDP)  */
     SXNU_CONTROL_VERB_KDPPUSH,   /* KDPPUSH <hex> -> queue bytes for KDP (no trap) */
     SXNU_CONTROL_VERB_PTDUMP,    /* PTDUMP <hexva> -> stage-1 page-table walk */
+    SXNU_CONTROL_VERB_PANICDUMP, /* PANICDUMP [info|log <off> <len>] -> panic area */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -254,6 +255,9 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 6u && text[0] == 'P' && text[1] == 'T' && text[2] == 'D' &&
         text[3] == 'U' && text[4] == 'M' && text[5] == 'P')
         return SXNU_CONTROL_VERB_PTDUMP;
+    if (bytes == 9u && text[0] == 'P' && text[1] == 'A' && text[2] == 'N' &&
+        text[3] == 'I' && text[4] == 'C' && text[5] == 'D' && text[6] == 'U' &&
+        text[7] == 'M' && text[8] == 'P') return SXNU_CONTROL_VERB_PANICDUMP;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -295,6 +299,7 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_DEBUGGER: return "DEBUGGER";
     case SXNU_CONTROL_VERB_KDPPUSH: return "KDPPUSH";
     case SXNU_CONTROL_VERB_PTDUMP: return "PTDUMP";
+    case SXNU_CONTROL_VERB_PANICDUMP: return "PANICDUMP";
     default: return "";
     }
 }
