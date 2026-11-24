@@ -592,35 +592,9 @@ def main():
             return
         log("ALIASSTAT builds=%d max_hits=%d sum_hits=%d s3=%d s4=%d s5=%d" % tuple(v[:6]))
 
-    def cmd_ib(arg):
-        """IB [n] -- dump the ring's last 4 submitted IB headers (n=4 by default)."""
-        cnt_a = sym_addr("_native_adreno_ib_log_count")
-        arr_a = sym_addr("_native_adreno_ib_log")
-        if cnt_a is None or arr_a is None:
-            return
-        cnt = read_words(cnt_a, 1)
-        if not cnt:
-            log("! ib 读取失败（count）")
-            return
-        total = cnt[0]
-        log("IB count=%d slots=%d" % (total, min(4, total)))
-        n = 4
-        if arg.strip():
-            try:
-                n = max(1, min(4, int(arg.strip(), 0)))
-            except ValueError:
-                pass
-        for i in range(n):
-            v = read_words(arr_a + i * (4 + 28) * 4, 32)
-            if not v or len(v) < 32:
-                log("! ib slot %d 读取失败" % i)
-                return
-            if not any(v):
-                continue
-            log("IB slot=%d fence=%d iova=%08x%08x bytes=%d" %
-                (i, v[0], v[2], v[1], v[3]))
-            log("   head %s" % " ".join("%08x" % x for x in v[4:20]))
-            log("   more %s" % " ".join("%08x" % x for x in v[20:32]))
+    # kb-159: the IB verb is gone with native_adreno_ib_log. It was written only
+    # by the legacy submit() path, which the compositor never uses, so it always
+    # read count=0. SUBMIT reads the replacement on the path that runs.
 
     # ---- 方案第 4/7 组：其余可零改动读取的数组 ----
     def cmd_methods(arg):
@@ -715,44 +689,348 @@ def main():
                         sensors.append("%d:-" % (i + 1))
                 log("TSENS sensors %s" % " ".join(sensors))
 
-    def cmd_jobstat(arg):
-        """JOBSTAT [n] -- the newest scheduler samples (kb-95 onward)."""
-        arr = sym_addr("_nabu_console_job_samples")
-        cnt = sym_addr("_nabu_console_job_sample_count")
-        if arr is None or cnt is None:
-            log("! jobstat: kernel has no nabu_console_job_samples "
-                "(needs the kb-95+ export)")
+    def cmd_framestat(arg):
+        """FRAMESTAT -- the whole frame-pipeline shape from ONE READ (kb-156).
+
+        The latency distribution used to be recovered by pulling every
+        NativeAdrenoProfile S/A/R line out of the serial log and doing the
+        arithmetic on the host: 8770 rows across hundreds of round trips, each
+        capped at ~192 bytes of data. That is slow enough to distort what it
+        measures, and it is how a three-second window got mistaken for the run's
+        p90 (kb-152: reported 15.8 ms, real 284 ms).
+
+        The kernel now keeps an always-on histogram (native_adreno_frame_hist,
+        26 words = 104 bytes) so the entire shape arrives in one reply: bucket
+        masses, min/max, the GPU-clock share, and a pipeline-overlap count.
+
+        Two readings are useful:
+          * mass in b0..b4 (< 40 ms)   -> frames keep up
+          * mass in b7+ (>= 100 ms)    -> frames queue or the GPU is slow
+          * gpu_us/wall_us near 1.0    -> the GPU really ran for that time
+            gpu_us/wall_us near 0.0    -> it was waiting (queueing / gating)
+        """
+        a = sym_addr("_native_adreno_frame_hist")
+        if a is None:
+            log("! framestat: kernel has no native_adreno_frame_hist "
+                "(needs the kb-156+ export)")
             return
-        c = read_words(cnt, 1)
-        if not c:
-            log("! jobstat 读取失败（count）")
+        v = read_words(a, 26)
+        if not v or len(v) < 26:
+            log("! framestat 读取失败")
             return
-        have = c[0]
-        want = 16
-        if arg.strip():
-            try:
-                want = max(1, min(64, int(arg.strip(), 0)))
-            except ValueError:
-                pass
-        show = min(want, have)
-        log("JOBSTAT samples=%d (showing %d, newest last)" % (have, show))
-        if show == 0:
-            log("JOBSTAT no submissions since boot")
+        edges = ["<5ms", "<10ms", "<20ms", "<30ms", "<40ms", "<60ms",
+                 "<80ms", "<100ms", "<150ms", "<200ms", "<300ms", ">=300ms"]
+        total = v[1]
+        log("FRAMESTAT n=%d issued=%d min=%dus max=%dus last=%dus"
+            % (total, v[16], v[2], v[3], v[23]))
+        if not total:
+            log("FRAMESTAT no completions since boot")
+        else:
+            parts = []
+            for i, name in enumerate(edges):
+                c = v[4 + i]
+                if c:
+                    parts.append("%s=%d(%.1f%%)" % (name, c, 100.0 * c / total))
+            log("FRAMESTAT hist %s" % " ".join(parts))
+        if v[18] and v[20]:
+            log("FRAMESTAT last gpu_us=%d wall_us=%d ratio=%.3f"
+                % (v[19], v[20], float(v[19]) / float(v[20])))
+        elif v[18] == 0:
+            log("FRAMESTAT gpu_us=none (GMU AO counter unreadable from this path)")
+        # kb-157: the running totals are 64-bit globals beside the array, because
+        # the 32-bit h[19]/h[20] wrap after 4.29e9 us (71 minutes of summed wall
+        # time) and then report a plausible-looking wrong ratio. Both totals are
+        # printed so the ratio can be checked by hand.
+        gt = sym_addr("_native_adreno_frame_gpu_us_total")
+        wt = sym_addr("_native_adreno_frame_wall_us_total")
+        gs = sym_addr("_native_adreno_frame_gpu_samples")
+        if gt is not None and wt is not None and gs is not None:
+            tot = read_qwords(gt, 2)
+            cnt = read_words(gs, 1)
+            if tot and cnt:
+                gpu_total, wall_total = tot[0], tot[1]
+                log("FRAMESTAT total gpu_us=%d wall_us=%d ratio=%.4f samples=%d"
+                    % (gpu_total, wall_total,
+                       (float(gpu_total) / float(wall_total)) if wall_total else 0.0,
+                       cnt[0]))
+                if gpu_total and wall_total:
+                    share = 100.0 * gpu_total / wall_total
+                    if gpu_total * 100 < wall_total * 20:
+                        log("FRAMESTAT verdict: GPU mostly WAITING (gpu share %.1f%%)"
+                            % share)
+                    elif gpu_total * 100 >= wall_total * 80:
+                        log("FRAMESTAT verdict: GPU mostly EXECUTING (gpu share %.1f%%)"
+                            % share)
+                    else:
+                        log("FRAMESTAT verdict: MIXED (gpu share %.1f%%)" % share)
+        else:
+            log("FRAMESTAT total: kernel has no kb-157 64-bit totals")
+        log("FRAMESTAT overlap=%d (completions that shared the pipeline) last_gpu=%dus"
+            % (v[22], v[24]))
+
+    def cmd_gpustate(arg):
+        """GPUSTATE -- the GPU's own counters and the newest job ticks (kb-158).
+
+        Two questions this answers, both from one or two READs:
+
+        1. What is the GPU doing during a slow frame? FRAMESTAT can already say a
+           frame took 160 ms with the GPU clock running for 160 ms. It cannot say
+           whether the shaders were computing or waiting. These counters can:
+
+               sp_busy / sp_alu            shaders executing  -> real work
+               sp_stall_uche/_rb/_tp       shaders waiting    -> starved
+               uche_vbif_latency_cycles    memory read latency
+               rb_busy / rb_stall_ccu      raster state
+               cp_busy / cp_wfi_stall      command processor
+
+           When sp_stall_* dominates, the GPU is busy waiting on memory and the
+           fix is on the memory path. When sp_busy dominates, the work itself is
+           the problem.
+
+        2. Per-fence GPU clock. Each job carries issue/cp/rb ticks at 19.2 MHz, so
+           cp-issue is the queue time and rb-cp the execution time, for the newest
+           eight submissions. That is per-frame, not an average.
+        """
+        names = ["core_cycles", "sp_busy", "sp_alu", "vs_alu", "fs_alu",
+                 "fs_tex", "vs_tex", "sp_stall_tp", "sp_stall_uche", "sp_stall_rb",
+                 "tp_busy", "tp_stall_uche", "uche_busy", "uche_stall_arb",
+                 "uche_read_tp", "uche_read_sp", "uche_write_sp", "uche_gmem_read",
+                 "uche_vbif_lat", "uche_vbif_n", "rb_busy", "rb_stall_ccu",
+                 "ccu_gmem_rd", "ccu_gmem_wr", "cp_busy", "cp_wfi_stall",
+                 "cp_sync_stall", "fs_stage", "vs_stage"]
+
+        a = sym_addr("_native_adreno_gpu_counter_now")
+        seq = sym_addr("_native_adreno_gpu_counter_seq")
+        if a is None or seq is None:
+            log("! gpustate: kernel has no kb-158 counter export")
             return
-        # Each row is 14 u32; the kernel mirrors newest last.
-        base = (64 - have) if have < 64 else 0
-        for i in range(show):
-            row = read_words(arr + (base + i) * 14 * 4, 14)
-            if not row or len(row) < 14:
-                log("! jobstat row %d 读取失败" % i)
+        v = read_qwords(a, 29)
+        sq = read_words(seq, 1)
+        if not v or not sq:
+            log("! gpustate 读取失败")
+            return
+        log("GPUSTATE samples=%d (continuous capture)" % sq[0])
+        if sq[0] == 0:
+            log("GPUSTATE no sample yet")
+        else:
+            # The exported words are raw register readings, not deltas, so a
+            # single read says nothing about rate. Take two samples one recorder
+            # period apart and difference them: that is what the counters mean.
+            import time as _t
+            _t.sleep(1.0)
+            v2 = read_qwords(a, 29)
+            sq2 = read_words(seq, 1)
+            if not v2 or not sq2:
+                log("! gpustate 第二次读数失败")
                 return
-            completion = row[0] | (row[1] << 32)
-            accepted = row[2] | (row[3] << 32)
-            completed = row[4] | (row[5] << 32)
-            log("JOB completion=%d queue=%d hw=%d res=%d waits=%d signals=%d "
-                "gpu_dep=%d dpu=%d status=%08x accepted_us=%d completed_us=%d"
-                % (completion, row[6], row[7], row[8], row[9], row[10],
-                   row[11], row[12], row[13], accepted, completed))
+            d = [max(0, v2[i] - v[i]) for i in range(min(len(v), len(v2)))]
+            log("GPUSTATE delta over samples %d -> %d" % (sq[0], sq2[0]))
+            for i, name in enumerate(names):
+                if i < len(d) and (d[i] or i < 12):
+                    log("GPUSTATE %-16s %d" % (name, d[i]))
+            # The numbers that answer the question: what was the command
+            # processor doing, and were the shaders computing or waiting.
+            cp_busy = d[24]
+            cp_wfi = d[25]
+            cp_sync = d[26]
+            cp_total = cp_busy + cp_wfi + cp_sync
+            if cp_total:
+                log("GPUSTATE cp: busy=%d(%.1f%%) wfi_stall=%d(%.1f%%) sync_stall=%d(%.1f%%)"
+                    % (cp_busy, 100.0 * cp_busy / cp_total,
+                       cp_wfi, 100.0 * cp_wfi / cp_total,
+                       cp_sync, 100.0 * cp_sync / cp_total))
+                if cp_wfi + cp_sync > cp_busy:
+                    log("GPUSTATE verdict: CP is mostly STALLED "
+                        "(waiting on work/sync, not executing)")
+                else:
+                    log("GPUSTATE verdict: CP is mostly BUSY (executing commands)")
+            busy = d[1]
+            stall = d[7] + d[8] + d[9]
+            sp_total = busy + stall
+            if sp_total:
+                log("GPUSTATE sp: busy=%d(%.1f%%) stall_tp=%d stall_uche=%d stall_rb=%d"
+                    % (busy, 100.0 * busy / sp_total, d[7], d[8], d[9]))
+            else:
+                log("GPUSTATE sp: all zero (shader counters not accumulating on this "
+                    "configuration; cp_* and rb_busy still valid)")
+            if d[20]:
+                log("GPUSTATE rb_busy=%d rb_stall_ccu=%d" % (d[20], d[21]))
+
+        ja = sym_addr("_native_adreno_gpu_job_now")
+        js = sym_addr("_native_adreno_gpu_job_seq")
+        if ja is not None and js is not None:
+            jn = read_words(js, 1)
+            if jn and jn[0]:
+                log("GPUSTATE jobs=%d (newest 8, ticks at 19.2MHz: 52.083ns each)"
+                    % jn[0])
+                seen = min(8, jn[0])
+                for k in range(seen):
+                    row = read_words(ja + ((jn[0] - seen + k) & 7) * 6 * 4, 6)
+                    if not row or len(row) < 6:
+                        continue
+                    fence, queue, issue, cp, rb, valid = row[:6]
+                    qticks = (cp - issue) & 0xffffffff if (valid & 1) else 0
+                    rticks = (rb - cp) & 0xffffffff if (valid & 2) else 0
+                    log("GPUSTATE job fence=%-5d queue=%-4d queue_us=%-8d exec_us=%-8d valid=%d"
+                        % (fence, queue, qticks * 625 // 12000,
+                           rticks * 625 // 12000, valid))
+
+    def cmd_ibclass(arg):
+        """IBCLASS -- TYPE7 opcode histogram of the largest IB (kb-162).
+
+        The latency model from kb-159/161 is lat = 206 ms + 0.409 ms/KiB of
+        command stream, i.e. 67 GPU clocks per dword. Every other candidate is
+        measured and excluded, so the cost is inside the stream. This says which
+        packets fill it.
+
+        Reading it:
+          * one opcode dominating -> that packet is the expense
+          * flat, full of register writes (TYPE4 / CP_SET_BIN / CP_REG_RMW)
+            -> the stream is redundant, fix it upstream of the GPU driver
+        """
+        cls = sym_addr("_native_adreno_ib_class")
+        top = sym_addr("_native_adreno_ib_class_top")
+        scanned = sym_addr("_native_adreno_ib_scanned")
+        order = sym_addr("_native_adreno_ib_order")
+        if cls is None or top is None:
+            log("! ibclass: kernel has no kb-162 export")
+            return
+        c = read_words(cls, 32)
+        t = read_words(top, 8)
+        sc = read_words(scanned, 1)
+        od = read_words(order, 8)
+        if not c or not t or not sc:
+            log("! ibclass 读取失败")
+            return
+        log("IBCLASS scanned_dwords=%d" % sc[0])
+        if not sc[0]:
+            log("IBCLASS nothing scanned yet")
+            return
+        names = {0x46: "CP_EVENT_WRITE7", 0x26: "CP_WAIT_FOR_IDLE",
+                 0x14: "CP_WAIT_TIMESTAMP", 0x17: "CP_THREAD_CONTROL",
+                 0x65: "CP_SET_MARKER", 0x3e: "CP_REG_TO_MEM",
+                 0x3f: "CP_INDIRECT_BUFFER", 0x32: "CACHE_FLUSH7",
+                 0x33: "CACHE_INVALIDATE7", 0x16: "RB_DONE_TS",
+                 0x1d: "CP_SET_DRAW_STATE", 0x2c: "CP_DRAW_INDX_OFFSET",
+                 0x2f: "CP_SET_BIN_DATA5", 0x36: "CP_SET_BIN",
+                 0x38: "CP_DRAW_INDIRECT", 0x21: "CP_SET_VISIBILITY_OVERRIDE",
+                 0x1f: "CP_RESET_CONTEXT_STATE", 0x0e: "CP_WAIT_REG_MEM"}
+        total = sum(c)
+        if total:
+            log("IBCLASS total_packets=%d  (buckets are opcode & 31)" % total)
+        for i in range(8):
+            v = t[i]
+            if not v:
+                continue
+            cnt = v >> 8
+            op = v & 0xff
+            log("IBCLASS top%d: op=0x%03x %-24s count=%d (%.1f%%)"
+                % (i + 1, op, names.get(op, "?"), cnt,
+                   100.0 * cnt / total if total else 0.0))
+        log("IBCLASS stream order: %s"
+            % " ".join("0x%03x(%s)" % (x, names.get(x, "?")) for x in od if x))
+
+    def cmd_submit(arg):
+        """SUBMIT -- what one compositor submission asks the GPU to do (kb-159).
+
+        Replaces JOBSTAT, whose mirror was written only from the publish path and
+        therefore froze at boot traffic (count=6 on board).
+
+        Why this is the next measurement: FRAMESTAT established that frames are
+        not queued (queue 2 us) and not gated (GPU clock runs 99.99% of wall
+        time), so the GPU is executing for the whole 149-340 ms. The remaining
+        question is what it executes. A single full-screen render at 675 MHz is
+        ~0.38 ms of ROP work, so the board is doing 400x that somewhere.
+
+          ibs        indirect buffers referenced -- how many separate command
+                     blocks this submission chains
+          packages   TYPE7 command headers assembled into the ring -- how many
+                     GPU commands in total
+          resources  memory objects the submission declares
+          ib_bytes   total bytes of indirect buffer it points at
+
+        Many small packages => the compositor issues a long command stream.
+        Few large ones => each command covers far more than the visible frame.
+        The first IB's leading dwords name the command stream itself.
+        """
+        a = sym_addr("_native_adreno_submit_observe")
+        if a is None:
+            log("! submit: kernel has no native_adreno_submit_observe "
+                "(needs the kb-159+ export)")
+            return
+        v = read_words(a, 24)
+        if not v or len(v) < 24:
+            log("! submit 读取失败")
+            return
+        n = v[0]
+        log("SUBMIT observed=%d   last: ibs=%d packages=%d resources=%d ib_bytes=%d"
+            % (n, v[1], v[10], v[2], v[3]))
+        if not n:
+            log("SUBMIT no submission since boot")
+            return
+        log("SUBMIT max:    ibs=%d packages=%d resources=%d ib_bytes=%d"
+            % (v[4], v[11], v[5], v[6]))
+        if n:
+            log("SUBMIT mean:   ibs=%.2f resources=%.2f ib_bytes=%.0f"
+                % (float(v[7]) / n, float(v[8]) / n, float(v[9]) / n))
+        head = " ".join("%08x" % v[16 + i] for i in range(8))
+        log("SUBMIT first IB head: %s" % head)
+
+        # kb-160: decode the first four IBs' leading packets. A CP_WAIT_FOR_IDLE
+        # at the head of each IB would drain the pipeline per IB and serialise a
+        # 32..58 IB submission -- the candidate for the 5.96 ms/IB slope.
+        harr = sym_addr("_native_adreno_submit_ib_head")
+        hcnt = sym_addr("_native_adreno_submit_ib_head_count")
+        if harr is not None and hcnt is not None:
+            hc = read_words(hcnt, 1)
+            if hc and hc[0]:
+                pkt_names = {0x46: "CP_EVENT_WRITE7", 0x26: "CP_WAIT_FOR_IDLE",
+                             0x14: "CP_WAIT_TIMESTAMP", 0x17: "CP_THREAD_CONTROL",
+                             0x65: "CP_SET_MARKER", 0x3e: "CP_REG_TO_MEM",
+                             0x3f: "CP_INDIRECT_BUFFER", 0x32: "CACHE_FLUSH7",
+                             0x33: "CACHE_INVALIDATE7", 0x16: "RB_DONE_TS",
+                             0x36: "CP_SET_BIN", 0x2c: "CP_DRAW_INDX_OFFSET",
+                             0x2f: "CP_SET_BIN_DATA5", 0x1d: "CP_SET_DRAW_STATE",
+                             0x38: "CP_DRAW_INDIRECT"}
+                waits = 0
+                iovas = v[12:16] if len(v) >= 16 else [0, 0, 0, 0]
+                for k in range(min(4, hc[0])):
+                    row = read_words(harr + k * 9 * 4, 9)
+                    if row and len(row) >= 9:
+                        log("SUBMIT ib%d iova=%08x bytes=%d%s"
+                            % (k, iovas[k], row[8],
+                               "  <-- SAME IOVA AS PREVIOUS" if k and iovas[k] == iovas[k-1] else ""))
+                        row = row[:8]
+                    if not row or len(row) < 8:
+                        continue
+                    toks = []
+                    i = 0
+                    while i < len(row):
+                        w = row[i]
+                        typ = (w >> 28) & 0xf
+                        if typ == 7:
+                            op = (w >> 16) & 0xfff
+                            cnt = w & 0x3fff
+                            toks.append(pkt_names.get(op, "0x%03x" % op))
+                            if op == 0x26:
+                                waits += 1
+                            i += 1 + cnt
+                        elif typ == 4:
+                            toks.append("REG%05x=%08x" % ((w >> 8) & 0xffff,
+                                                          row[i + 1] if i + 1 < len(row) else 0))
+                            i += 2
+                        else:
+                            i += 1
+                    log("SUBMIT ib%d (%s): %s"
+                        % (k, " ".join("%08x" % x for x in row[:4]),
+                           " | ".join(toks[:5])))
+                log("SUBMIT IBs with CP_WAIT_FOR_IDLE in head: %d of %d"
+                    % (waits, min(4, hc[0])))
+        # Name the first package if it matches a known PM4 shape.
+        if v[16]:
+            opcode = v[16] & 0xff
+            typ = (v[16] >> 30) & 3
+            log("SUBMIT first dword: type=%d opcode=0x%02x" % (typ, opcode))
 
     def cmd_slow(arg):
         """SLOW -- memory operations that took >= 8000 us (kb-95 onward)."""
@@ -803,15 +1081,41 @@ def main():
                 log("SLOW evict %s" % " ".join(
                     "%s=%d" % (en[i], e[i]) for i in range(min(len(en), len(e))) if e[i]))
 
+        # kb-103: "busy" alone spans five different causes. This says which.
+        bd = sym_addr("_nabu_console_busy_detail")
+        if bd is not None:
+            b = read_qwords(bd, 16)
+            if b and any(b):
+                hist = ["refs%d=%d" % (i, b[i]) for i in range(8) if b[i]]
+                total = b[13]
+                mean = (b[14] / total) if total else 0.0
+                log("BUSY total=%d hist[%s] imported=%d pooled=%d no_spans=%d "
+                    "single=%d oversat=%d mean=%.1f max=%d"
+                    % (total, " ".join(hist) if hist else "empty",
+                       b[8], b[9], b[10], b[11], b[12], mean, b[15]))
+                if total and b[11] * 10 >= total * 9:
+                    log("BUSY verdict: every refusal held exactly one reference -- "
+                        "one holdForDevice() was never retired")
+                elif b[15] > 8:
+                    log("BUSY verdict: references accumulate (>8 on one object) -- "
+                        "holdJob() ran more often than retireJobAfterCompletion()")
+                elif b[10]:
+                    log("BUSY verdict: objects with no spans were held -- "
+                        "check the early map() path")
+
         cv = read_words(cnt, 1)
         have = cv[0] if cv else 0
         show = have if not arg.strip() else min(have, int(arg.strip(), 0))
         if show == 0:
             log("SLOW no operation exceeded 8000 us since boot")
             return
-        names = ["allocation", "prepare", "spans", "zero", "initial_clean",
-                 "set_wc", "reassert_wc", "restore_attributes", "complete",
-                 "descriptor_release"]
+        # NativeAdrenoMemorySlowOperation has exactly four values
+        # (NativeAdrenoMemory.h:57-62). The ten-name list that used to be here
+        # belongs to MemoryStage, a different enum, and it made every
+        # OwnedDescriptorRelease print as "prepare" -- which is how a 13 ms
+        # descriptor release got mistaken for allocation work.
+        names = ["allocation", "owned_descriptor_release",
+                 "imported_descriptor_release", "import"]
         for i in range(show):
             row = read_words(flat + i * 12 * 4, 12)
             if not row or len(row) < 12:
@@ -1502,8 +1806,6 @@ def main():
                     cmd_memstage(rest)
                 elif verb == "ALIASSTAT":
                     cmd_aliasstat(rest)
-                elif verb == "IB":
-                    cmd_ib(rest)
                 elif verb == "METHODS":
                     cmd_methods(rest)
                 elif verb == "CLIENTS":
@@ -1512,8 +1814,14 @@ def main():
                     cmd_waitouter(rest)
                 elif verb == "TSENS":
                     cmd_tsens(rest)
-                elif verb == "JOBSTAT":
-                    cmd_jobstat(rest)
+                elif verb == "FRAMESTAT":
+                    cmd_framestat(rest)
+                elif verb == "GPUSTATE":
+                    cmd_gpustate(rest)
+                elif verb == "SUBMIT":
+                    cmd_submit(rest)
+                elif verb == "IBCLASS":
+                    cmd_ibclass(rest)
                 elif verb == "SLOW":
                     cmd_slow(rest)
                 elif verb == "CPSTAT":
@@ -1608,8 +1916,6 @@ def main():
                         cmd_memstage(rest)
                     elif verb == "ALIASSTAT":
                         cmd_aliasstat(rest)
-                    elif verb == "IB":
-                        cmd_ib(rest)
                     elif verb == "METHODS":
                         cmd_methods(rest)
                     elif verb == "CLIENTS":
@@ -1618,8 +1924,14 @@ def main():
                         cmd_waitouter(rest)
                     elif verb == "TSENS":
                         cmd_tsens(rest)
-                    elif verb == "JOBSTAT":
-                        cmd_jobstat(rest)
+                    elif verb == "FRAMESTAT":
+                        cmd_framestat(rest)
+                    elif verb == "GPUSTATE":
+                        cmd_gpustate(rest)
+                    elif verb == "SUBMIT":
+                        cmd_submit(rest)
+                    elif verb == "IBCLASS":
+                        cmd_ibclass(rest)
                     elif verb == "SLOW":
                         cmd_slow(rest)
                     elif verb == "CPSTAT":
