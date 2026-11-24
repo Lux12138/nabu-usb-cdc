@@ -1,0 +1,148 @@
+diff --git a/osfmk/kdp/kdp.c b/osfmk/kdp/kdp.c
+index 1a54594..224d0ed 100644
+--- a/osfmk/kdp/kdp.c
++++ b/osfmk/kdp/kdp.c
+@@ -33,6 +33,10 @@
+ #include <uuid/uuid.h>
+ 
+ #include <kdp/kdp_internal.h>
++/* nabu: defined in kdp_udp.c, where the debugger loop lives. Set here when the
++ * host sends KDP_RESUMECPUS so the loop's exit test can tell an explicit resume
++ * apart from a re-entry. */
++extern volatile int nabu_kdp_resume_pending;
+ #include <kdp/kdp_private.h>
+ #include <kdp/kdp_core.h>
+ 
+@@ -424,6 +428,11 @@ kdp_resumecpus(
+ 	dprintf(("kdp_resumecpus %x\n", rq->cpu_mask));
+ 
+ 	kdp.is_halted = FALSE;
++	/* nabu: kdp.is_halted only ends the inner kdp_handler() loop; the outer
++	 * control flow in kdp_raise_exception() then re-enters it, which is why
++	 * resume did nothing on arm64. Record the host's intent there too.
++	 * Cleared by the exit test in kdp_udp.c, so it applies to one resume only. */
++	nabu_kdp_resume_pending = 1;
+ 
+ 	*reply_port = kdp.reply_port;
+ 	*len = rp->hdr.len;
+diff --git a/osfmk/kdp/kdp_udp.c b/osfmk/kdp/kdp_udp.c
+index a0ad7d8..3a5cccc 100644
+--- a/osfmk/kdp/kdp_udp.c
++++ b/osfmk/kdp/kdp_udp.c
+@@ -252,6 +252,12 @@ static const char
+ };
+ 
+ volatile int kdp_flag = 0;
++/* nabu: set by kdp_resumecpus() (osfmk/kdp/kdp.c), cleared by the exit test at
++ * the bottom of kdp_raise_exception(). Kept separate from kdp.is_halted because
++ * that flag only ends the inner kdp_handler() loop, after which the outer
++ * control flow re-enters it -- which is why resume was a no-op on arm64.
++ * Static-zero and cleared on use, so the default path is unchanged. */
++volatile int nabu_kdp_resume_pending = 0;
+ boolean_t kdp_corezip_disabled = 0;
+ 
+ kdp_send_t    kdp_en_send_pkt;
+@@ -1143,7 +1149,26 @@ kdp_handler(
+ 			    saved_reply.len);
+ 			goto again;
+ 		} else if ((hdr->seq != exception_seq) &&
+-		    (hdr->request != KDP_CONNECT)) {
++		    (hdr->request != KDP_CONNECT) &&
++		    (hdr->request != KDP_HOSTREBOOT)) {
++			/* nabu: KDP_HOSTREBOOT is exempt from the sequence check,
++			 * alongside KDP_CONNECT.
++			 *
++			 * exception_seq belongs to the session that CONNECTed. A second
++			 * host -- or our own kdp_cli.py, which never saw that CONNECT --
++			 * has no way to learn it, so every request it sends is dropped
++			 * here with "bad sequence". For a normal request that is correct:
++			 * it keeps a stale client from disturbing a live session. For a
++			 * reboot it is not: it leaves a board parked in the debugger with
++			 * no software way out, and the only recovery is a power cycle.
++			 * Measured 2026-11-25: the board sat in kdp_handler with COM3 up
++			 * and adb empty, and HOSTREBOOT from kdp_cli was discarded exactly
++			 * here.
++			 *
++			 * kdp_packet() dispatches KDP_HOSTREBOOT to kdp_reboot(), which
++			 * calls kdp_machine_reboot() unconditionally, so nothing further
++			 * is needed to make the request act. There is no reply to match
++			 * against a sequence either -- the machine is on its way down. */
+ 			printf("kdp: bad sequence %d (want %d)\n",
+ 			    hdr->seq, exception_seq);
+ 			goto again;
+@@ -1476,13 +1501,21 @@ again:
+ 
+ 	kdp_sync_cache();
+ 
+-#if defined(__x86_64__)
+-	/* We only support returning from KDP on x86 */
+-	if (reattach_wait == 1)
+-#endif
+-	{
++	/* nabu: an explicit KDP_RESUMECPUS is the host asking to leave, on every
++	 * architecture. Upstream gates this on x86_64 alone, which on arm64 makes
++	 * the "goto again" unconditional: kdp_connection_wait() and kdp_handler()
++	 * are re-entered forever and the machine cannot be resumed from the host at
++	 * all. Measured on the board: after Continue() lldb still reports the PC
++	 * inside DebuggerTrapWithState's TRAP_DEBUGGER, and nothing advances.
++	 *
++	 * Falling through only unwinds this loop. Whether the kernel itself resumes
++	 * is decided afterwards by debugger_collect_diagnostics in debug.c -- the
++	 * second half of this patch. */
++	if (!nabu_kdp_resume_pending) {
+ 		goto again;
+ 	}
++	nabu_kdp_resume_pending = 0;
++	printf("Continuing (host resume).\n");
+ 
+ exit_debugger_loop:
+ 	if (kdp_en_setmode) {
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e9daeed..a00a10c 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1599,6 +1599,13 @@ handle_debugger_trap(unsigned int exception, unsigned int code, unsigned int sub
+ 		console_suspend();
+ 	}
+ 
++	/* nabu: this flag is only ever cleared, never restored (grep the tree: the
++	 * sole "= TRUE" is the definition at :320). One panic-path entry therefore
++	 * leaves it FALSE for the rest of the boot, and a later Debugger() entry
++	 * could not return even with the nesting test fixed above. Decide it here,
++	 * per entry, from the nesting depth we just captured. */
++	debugger_safe_to_return = (kernel_debugger_entry_count <= 1);
++
+ 	/*
+ 	 * TODO: Should we do anything special for nested panics here? i.e. if we've trapped more than twice
+ 	 * should we call into the debugger if it's configured and then reboot if the panic log has been written?
+@@ -1608,9 +1615,28 @@ handle_debugger_trap(unsigned int exception, unsigned int code, unsigned int sub
+ 		/* If there was no debugger context setup, we trapped due to a software breakpoint */
+ 		debugger_current_op = DBOP_BREAKPOINT;
+ 	} else {
+-		/* Not safe to return from a nested panic/debugger call */
++		/* Not safe to return from a NESTED panic/debugger call.
++		 *
++		 * nabu: upstream clears this for a first-level DBOP_DEBUGGER too, and
++		 * that is what stops a host-requested resume from ever returning: the
++		 * caller's branch in debugger_collect_diagnostics() (:1522) requires
++		 * debugger_safe_to_return, and there is no other path back to user
++		 * code from a Debugger() entry.
++		 *
++		 * Ordering, which the first draft of this patch got wrong:
++		 * DebuggerWithContext() bumps CPUDEBUGGERCOUNT (:886), then
++		 * handle_debugger_trap() assigns kernel_debugger_entry_count from it
++		 * (:1597), and only afterwards calls debugger_collect_diagnostics()
++		 * (:1678) which reads the count at :1522. So the value here is the NEW
++		 * one: the outermost entry already reads 1, not 0. The nesting test
++		 * therefore has to be > 1 -- "!= 0" would keep the old behaviour and
++		 * the patch would do nothing.
++		 *
++		 * debugger_safe_to_return is cleared for the nested cases below, so a
++		 * genuine nested panic still cannot return. */
+ 		if (debugger_current_op == DBOP_PANIC ||
+-		    debugger_current_op == DBOP_DEBUGGER) {
++		    (debugger_current_op == DBOP_DEBUGGER &&
++		     kernel_debugger_entry_count > 1)) {
+ 			debugger_safe_to_return = FALSE;
+ 		}
+ 
