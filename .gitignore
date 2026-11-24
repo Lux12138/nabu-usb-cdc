@@ -11,3 +11,7 @@ __pycache__/
 # mainline memory/ops docs stay local (E:/nabu/state), never in the public repo
 docs/MEMORY.md
 docs/OPERATIONS.md
+
+# KDP client runtime state (session key and breakpoint list belong to a boot)
+kdp_client/kdp_session.json
+kdp_client/kdp_breakpoints.json
