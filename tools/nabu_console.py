@@ -62,6 +62,25 @@ CST = timezone(timedelta(hours=8))
 VID, PID = "1209", "316D"
 DEV_TIME_RE = re.compile(rb"^nabu: (?:spawn|exec)[^\n]*?\bt=(\d{6,})\b")
 
+# The GPU core clock the job rows' cp/rb tick at. The driver prints the value it
+# programmed at boot ("NabuGPU: ... freq=675000000"); 675 MHz is what this board
+# comes up with. Only the per-job exec time depends on it -- queue_us stays on
+# the 19.2 MHz always-on counter.
+GPU_CLOCK_HZ = 675000000
+
+
+def gpu_clock_hz():
+    """The clock RBBM_TIMESTAMP counts at, in Hz.
+
+    Read from this script's environment so a different OPP can be tried without
+    editing the file:  NABU_GPU_CLOCK_HZ=587000000 python tools/nabu_console.py
+    """
+    try:
+        hz = int(os.environ.get("NABU_GPU_CLOCK_HZ", "") or 0)
+    except ValueError:
+        hz = 0
+    return hz if hz > 0 else GPU_CLOCK_HZ
+
 
 def now_hms():
     return datetime.now(CST).strftime("%H:%M:%S")
@@ -739,8 +758,17 @@ def main():
             log("FRAMESTAT gpu_us=none (GMU AO counter unreadable from this path)")
         # kb-157: the running totals are 64-bit globals beside the array, because
         # the 32-bit h[19]/h[20] wrap after 4.29e9 us (71 minutes of summed wall
-        # time) and then report a plausible-looking wrong ratio. Both totals are
-        # printed so the ratio can be checked by hand.
+        # time).
+        #
+        # What the ratio actually is, and is not: gpu_us comes from
+        # frameHistAlwaysOn(), the GMU always-on counter. That is a free-running
+        # 19.2 MHz clock, not a busy/idle signal, so it advances by exactly the
+        # wall time between the submit and the completion being noticed. The
+        # ratio therefore sits at 1.0 by construction -- it cannot report that
+        # the GPU waited, and the old "GPU mostly EXECUTING/WAITING" verdict read
+        # into it was wrong. It still has one use: a ratio well below 1.0 means
+        # the two samples straddled an AO counter reset, i.e. the number is junk.
+        # Real GPU execution time comes from GPUSTATE's per-job exec_ms.
         gt = sym_addr("_native_adreno_frame_gpu_us_total")
         wt = sym_addr("_native_adreno_frame_wall_us_total")
         gs = sym_addr("_native_adreno_frame_gpu_samples")
@@ -749,20 +777,13 @@ def main():
             cnt = read_words(gs, 1)
             if tot and cnt:
                 gpu_total, wall_total = tot[0], tot[1]
-                log("FRAMESTAT total gpu_us=%d wall_us=%d ratio=%.4f samples=%d"
+                log("FRAMESTAT total ao_us=%d wall_us=%d ao_ratio=%.4f samples=%d"
                     % (gpu_total, wall_total,
                        (float(gpu_total) / float(wall_total)) if wall_total else 0.0,
                        cnt[0]))
-                if gpu_total and wall_total:
-                    share = 100.0 * gpu_total / wall_total
-                    if gpu_total * 100 < wall_total * 20:
-                        log("FRAMESTAT verdict: GPU mostly WAITING (gpu share %.1f%%)"
-                            % share)
-                    elif gpu_total * 100 >= wall_total * 80:
-                        log("FRAMESTAT verdict: GPU mostly EXECUTING (gpu share %.1f%%)"
-                            % share)
-                    else:
-                        log("FRAMESTAT verdict: MIXED (gpu share %.1f%%)" % share)
+                if gpu_total and wall_total and gpu_total * 100 < wall_total * 90:
+                    log("FRAMESTAT note: ao_ratio < 0.9 -- the always-on counter "
+                        "was reset mid-run, ignore it")
         else:
             log("FRAMESTAT total: kernel has no kb-157 64-bit totals")
         log("FRAMESTAT overlap=%d (completions that shared the pipeline) last_gpu=%dus"
@@ -787,9 +808,16 @@ def main():
            fix is on the memory path. When sp_busy dominates, the work itself is
            the problem.
 
-        2. Per-fence GPU clock. Each job carries issue/cp/rb ticks at 19.2 MHz, so
-           cp-issue is the queue time and rb-cp the execution time, for the newest
-           eight submissions. That is per-frame, not an average.
+        2. Per-fence clock domains. A job row carries issue, cp and rb, and they
+           do NOT share a time base. `issue` is sampled host-side from the GMU
+           always-on counter at 19.2 MHz. `cp` and `rb` are written by the GPU:
+           cp by CP_REG_TO_MEM (0x3e) and rb by CP_EVENT_WRITE7 (0x46) with bit
+           30 set, both of which read RBBM_TIMESTAMP, i.e. the GPU core clock
+           (675 MHz on this board, printed by the driver at boot as
+           "freq=675000000"). Converting all three at 19.2 MHz inflated rb-cp by
+           675/19.2 = 35.2x: a real 4.18 ms read as 147 ms, which is where the
+           "GPU runs 147 ms per frame" reading came from. queue_us is a genuine
+           19.2 MHz figure; exec_us is converted with the GPU clock.
         """
         names = ["core_cycles", "sp_busy", "sp_alu", "vs_alu", "fs_alu",
                  "fs_tex", "vs_tex", "sp_stall_tp", "sp_stall_uche", "sp_stall_rb",
@@ -861,7 +889,7 @@ def main():
         if ja is not None and js is not None:
             jn = read_words(js, 1)
             if jn and jn[0]:
-                log("GPUSTATE jobs=%d (newest 8, ticks at 19.2MHz: 52.083ns each)"
+                log("GPUSTATE jobs=%d (newest 8; queue_us at 19.2MHz, exec_us at GPU clock)"
                     % jn[0])
                 seen = min(8, jn[0])
                 for k in range(seen):
@@ -871,9 +899,13 @@ def main():
                     fence, queue, issue, cp, rb, valid = row[:6]
                     qticks = (cp - issue) & 0xffffffff if (valid & 1) else 0
                     rticks = (rb - cp) & 0xffffffff if (valid & 2) else 0
-                    log("GPUSTATE job fence=%-5d queue=%-4d queue_us=%-8d exec_us=%-8d valid=%d"
+                    # issue is the GMU always-on counter (19.2 MHz); cp/rb come
+                    # from RBBM_TIMESTAMP, so they tick at the GPU core clock.
+                    log("GPUSTATE job fence=%-5d queue=%-4d queue_us=%-8d "
+                        "exec_us=%-8d exec_ms=%.3f valid=%d"
                         % (fence, queue, qticks * 625 // 12000,
-                           rticks * 625 // 12000, valid))
+                           rticks * 625 // 12000,
+                           rticks / float(gpu_clock_hz()) * 1e3, valid))
 
     def cmd_ibclass(arg):
         """IBCLASS -- TYPE7 opcode histogram of the largest IB (kb-162).

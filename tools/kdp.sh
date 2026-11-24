@@ -83,7 +83,7 @@ cmd_bridge() {
     local framing=${1:-kdpf}
     stop_all || return 1
     : > "$LOGS/kdp-bridge.log"
-    cd "$ROOT/kdp_net_bridge" || return 1
+    cd "$REPO/kdp_net_bridge" || return 1
     # nohup so the bridge outlives this shell; the log is the only handle on it
     nohup python -u kdp_net_bridge.py --port "$PORT" --cdc-framing "$framing" \
         --udp-mode eth --verbose > "$LOGS/kdp-bridge.log" 2>&1 &
