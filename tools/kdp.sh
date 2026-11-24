@@ -20,9 +20,11 @@ set -uo pipefail
 
 PORT=${PORT:-COM3}
 UDP_PORT=${UDP_PORT:-41139}
-ROOT=/e/nabu/state/bridge/answers
-BRIDGE=$ROOT/kdp_net_bridge/kdp_net_bridge.py
-CLIENT=$ROOT/kdp_client
+# Script lives in tools/, so the bridge and client are its siblings.
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+BRIDGE=$REPO/kdp_net_bridge/kdp_net_bridge.py
+CLIENT=$REPO/kdp_client
 LOGS=/e/nabu/logs
 
 py_count() {
