@@ -366,7 +366,7 @@ python E:/nabu/tools/kernel_edit_guard.py object <unit>.o.json
 
 本文（构建侧）+ `MEMORY-MASTER-20261123-0915.md` §1.1（上板侧）= 完整纪律。
 
-上板侧八条速查（详见原文档）：
+上板侧九条速查（详见原文档）：
 
 1. 10 秒轮询，永不 sleep 30/48/60
 2. 先起控制台，再刷机
@@ -376,6 +376,50 @@ python E:/nabu/tools/kernel_edit_guard.py object <unit>.o.json
 6. 不要盲试，用现成控制台读状态
 7. 不要自己下需求单
 8. 改源，不改产物
+9. **本轮采集数据达到预期后，立刻发复位命令**（2026-11-24 用户拍板）
+
+### 8.1 第 9 条的展开
+
+**每轮上板前先写清楚「这一轮要拿到的数据是什么」。一旦控制台已经拿到，
+就发 `reboot`，不要继续挂着。**
+
+理由：一个 boot 周期只有一次 CDC open 机会。数据拿到之后继续挂着的唯一后果
+是端口被占着，下一轮想刷机时要么杀不掉阻塞在串口的进程、要么撞
+`PermissionError(13)`，只能断电。设备留在系统态不会产生新信息。
+
+做法：
+
+```bash
+printf 'reboot\n' >> /e/nabu/logs/<tag>-cmd.txt
+# kb-129 起的正确现象：TX REBOOT 之后【没有】RX 回复，3 秒内回到 recovery
+```
+
+**判据仍按第 3 条**：COM3 消失 **且** `adb devices` 出现 recovery，
+`adb devices` 为空不等于设备死了。
+
+这条与第 4 条不冲突：第 4 条禁的是**自动**复位兜底（`--arm-at` 那种会在该看
+日志的时候把设备抢走）；第 9 条说的是**数据已经到手之后**由人主动发的那一次。
+
+### 8.2 复位命令已经修好（kb-129，2026-11-24 05:44 真机验证）
+
+**REBOOT 现在真的能复位设备。判据：发命令后 3 秒内 adb 出现 recovery，随后 COM3 消失。**
+
+**关键现象：`TX REBOOT` 之后不会收到 `REBOOT OK`。** 这是正确的——复位走
+PSCI `SYSTEM_RESET`，`noreturn`，回复帧来不及发出。**看到 TX 无 RX 就是成功的信号。**
+
+**为什么以前不行：** 正确实现一直在 `patches/0008-nabu-reboot-worker-and-wake.patch`
+里，但它从来没进构建序列 —— `series` 里没列它（那里有个同名的
+`0008-nabu-wdt-init.patch`，是另一个东西），而且它调用了模块里从未实现的
+`qcom_usb_debug_set_wake_hook`，加进去编译不过。
+
+**修法（已固化）：** 复制成 `0018-nabu-reboot-worker-and-wake.patch`，删掉
+wake-hook 那 4 行，加进 `patches/xnu/series` 第 9 行（`0007` 之后）。
+
+**完整记录见** `E:/nabu/state/SOLVED-reboot-command-kb129.md`，含：
+- 三条失败路径的定位过程
+- 反汇编验证方法（`qcom_usb_reboot_worker` 应 `bl _qcom_usb_debug_platform_reset`）
+- 内核变大 4,096 B 后必须重生 payload（`<90-61499>` → `<90-61501>`）
+- 复位路径的完整调用链（worker 循环 → take → arm → PSCI）
 
 ---
 
@@ -432,3 +476,89 @@ llvm-strings K | grep -c "hfi_q"         # 1
 > 改完核对对象比源码新、符号真在对象里。五步全过才上板。**
 > **上板只用一个工具；换工具前先复位。**
 > **换内核包后按地址读任何变量之前，先 `llvm-nm` 重查地址。**
+
+---
+
+## 11. 排查一律先用控制台，不许插探针（2026-11-24 用户拍板，优先级同 0）
+
+**控制台就是为了不插探针才做出来的。** 它支持 48 个设备端 verb + 14 条主机侧命令，
+能读内核虚拟地址、能读物理地址/MMIO、能写、能发复位——**每一轮遇到疑问时的第一个动作
+必须是「用哪个 verb 能读到这个值」，而不是「我该在哪加一行 IOLog」。**
+
+### 11.1 为什么这条要写进纪律
+
+2026-11-24 一天里，我至少四次在遇到未知值时先去改驱动加打印，每次都被用户拦住。
+其中最典型的一次：`presenter.bind()` 返回 `kIOReturnIOError`，我准备在
+`NabuDpuNativePresenter.cpp` 里加一行打印 `snapshotActive` 的七个字段；
+**而正确的做法是 `READ` 那两组已经导出的数组**
+（`native_ufs_dpu_check[]` / `native_ufs_dpu_smmu[]`），一步就拿到了
+TCR、FSR、表物理地址。
+
+**探针的代价是真实存在的：**
+- 一轮构建 4 分钟 + 一轮上板 3 分钟，而一次 `READ` 是 8 秒
+- 探针会改变时序（IOLog 在关键路径上会拖慢甚至改变行为）
+- 探针留在源码里会污染后续的「证据链」——分不清是原逻辑还是调试代码的结果
+- 探针加在 `fail()` 路径上尤其危险：它可能永远不执行，白费一轮
+
+### 11.2 决策顺序（照着问自己）
+
+| 想知道的 | 先用 |
+|---|---|
+| 某个全局变量的值 | `sym <名字>` 拿地址 → `READ <addr> <len>` |
+| 某个结构体字段 | `sym` 拿基址 → 按偏移 `READ`；偏移从 `llvm-nm` + 反汇编确认，不猜 |
+| 导出的计数/状态数组 | 直接 `READ`（`native_ufs_dpu_check` / `native_ufs_dpu_smmu` / `native_legacy_*`）|
+| MMIO 寄存器（白名单内）| `READPA`。**一次不超过 ~40 字节**，超长会卡死 worker（kb-72 实证）|
+| MMIO 寄存器（白名单外，如 SMMU）| 读不到。**改读「驱动自己缓存的那份」**（如 `native_ufs_dpu_smmu[]`），或从旁边能读的证据推断 |
+| 内核走到哪一步 | 日志里的具名行（`NABU DPU ...`、`owner stage=`、`nabu-display: frames ...`）|
+| 某个函数被调用过没有 | 看它自己的日志行；没有日志就用 `sym`+`READ` 读它的计数器（如果导出）|
+| 真的读不到（值只在栈上、或设备已卡死）| **才可以考虑改代码**——且必须在代码注释里写明为什么控制台做不到 |
+
+#### 11.2.1 【2026-11-24 事故】READPA 猜物理地址把内核打死
+
+**`READPA 0xd15a6000 64` 直接触发 `panic(cpu 0): Unaligned kernel data abort`。**
+
+```
+pa-rd: 0x00000000d15a6000 l=100
+panic(cpu 0): Unaligned kernel data abort at pc 0xfffffff007ae382c
+	  x12: 0x00000000d15a6003   esr: 0x96000021   far: 0xfffffff000a1a044
+```
+
+`esr=0x96000021` 的 DFSC `0x21` = **alignment fault**。`x12` 是「物理地址 + 3」，
+说明 worker 内部按字节推进后做了未对齐的宽访问。当时的意图是读 SMMU 页表，
+而这个物理地址**不是 READPA 设计要读的 MMIO 区间**——同一次会话里
+`READPA 0x15082000` 明确回了 `state=denied name=outside`，白名单确实存在，
+但页表地址落在了**允许却未验证**的范围内，于是命令被放行并打死了内核。
+
+**三条硬规则（缺一即不许发）：**
+
+1. **READPA 的地址必须来自白名单。** 「我猜这个物理地址有我要的值」不是理由。
+   页表、SMMU context、struct 这类结构体**不通过 READPA 读**。
+2. **长度 ≤ 40 字节**（§11.2 原有规定，这次用了 64）。
+3. **读不到就先想「驱动是不是已经导出了」。** 本次真正想要的 SMMU 状态，
+   `native_ufs_dpu_check[]` / `native_ufs_dpu_smmu[]` 里本来就有，既安全又是同一份数据。
+
+**代价**：设备 panic 进 KDP 等待，CDC 句柄被占死无法软件复位，只能断电；
+屏幕冻结在锁屏，看起来像「系统卡死」，实际是这条命令。一轮诊断因此报废。
+
+### 11.3 已导出的诊断数组（优先用这些）
+
+| 符号 | 内容 |
+|---|---|
+| `native_ufs_dpu_smmu[24]` | `[0]`summary `[2]`idr0 `[3]`idr1 `[4]`slot\|bank `[5]`smr `[6]`s2cr `[7]`cbar `[9]`sctlr `[22]`fsr |
+| `native_ufs_dpu_check[10]` | `[0]`TTBR0 读回 `[1]`TCR 读回 `[2]`FSR `[3]`fault 时的 FSR `[7]`us |
+| `native_ufs_dpu_state` | `0x80000002` = UFS 已装 bank 2 |
+| `native_legacy_transfer[]` / `native_legacy_frame[]` | swap/帧计数 |
+| `native_legacy_validation[]` | `[2]` = nrej |
+
+**⚠️ 缓存的数组是快照，不是实时值。** `native_ufs_dpu_smmu[9]` 是 UFS
+**启用 bank 之前**读的 SCTLR（`0xe0`），实时值是 `dpuEnable` 写的 `0x61`。
+**用之前先问「这是什么时候写的」。**
+
+### 11.4 加代码的唯一合法理由
+
+只有这三种，缺一不可：
+1. **功能本身**（不是诊断）——例如让 adopt 的 context 通过检查
+2. 控制台**结构上**读不到（值只在函数栈、或需要在内核态做决策）
+3. 用户明确要求
+
+**「我想知道 X 是不是 Y」不是理由。** 那一定能用 `READ` 或日志回答。
