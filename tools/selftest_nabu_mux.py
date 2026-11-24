@@ -89,14 +89,19 @@ def test_sxnu1_seq():
     body, _, crc_hex = hello.rstrip(b"\n").rpartition(b" ")
     assert len(crc_hex) == 8 and int(crc_hex, 16) == M.crc32(body), hello
     s.note_reply("SXNU1R 1122334455667788 00000000 HELLO OK session=1122334455667788")
-    assert s.hello_done and s.session == 0x1122334455667788 and s.seq == 1
+    assert s.hello_done and s.session == 0x1122334455667788 and s.seq == 0, s.seq
     ping = s.build("PING")
-    assert ping.startswith(b"SXNU1 1122334455667788 00000001 PING ")
+    # build() advances first, so the first command after HELLO is seq 1.
+    assert ping.startswith(b"SXNU1 1122334455667788 00000001 PING "), ping
     pbody, _, pcrc = ping.rstrip(b"\n").rpartition(b" ")
     assert int(pcrc, 16) == M.crc32(pbody), ping
     s.note_reply("SXNU1R 1122334455667788 00000001 PING OK")
     assert s.seq == 2, s.seq
-    print("PASS  SXNU1 session/seq tracking, CRC field present")
+    # A later HELLO on the same session must adopt the device's counter verbatim:
+    # last_seq is "the last one that committed" and the next request reuses it.
+    s.note_reply("SXNU1R 1122334455667788 00000000 HELLO OK session=1122334455667788 last_seq=0000000a")
+    assert s.seq == 0x0a, "HELLO must adopt last_seq verbatim, got %d" % s.seq
+    print("PASS  SXNU1 session/seq tracking, CRC field present, HELLO adopts last_seq")
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ import binascii
 import json
 import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -200,20 +201,24 @@ class Sxnu1:
         self.hello_done = False
 
     def build(self, verb: str, arg: str = "") -> bytes:
-        """Build one request line.
+        """Build one request line and advance the sequence.
 
-        The trailing 8 hex digits are CRC-32 of the body that precedes them,
-        computed over the body WITHOUT the trailing space -- same shape as
-        nabu_console.py:Control.build(). Omitting it makes the device drop the
-        line silently, which is exactly how the first version of this script
-        failed: the write succeeded, no reply ever came, and nothing in the log
-        said why.
+        Two details, both copied from nabu_console.py because the device checks
+        them and says nothing when they are wrong:
+
+          * the trailing 8 hex digits are CRC-32 of the body before them;
+          * self.seq holds the last committed number, so the request uses
+            seq + 1. After HELLO adopts the device's last_seq verbatim, the next
+            command must be last_seq + 1 -- sending last_seq itself is treated
+            as a replay and dropped, which is how this script's second version
+            lost every command.
         """
         if verb.upper() == "HELLO":
             body = "SXNU1 %016x %08x %s" % (0, 0, "HELLO")
         else:
             if not self.hello_done:
                 raise RuntimeError("HELLO has not succeeded yet")
+            self.seq = (self.seq + 1) & 0xFFFFFFFF
             body = "SXNU1 %016x %08x %s" % (self.session, self.seq, verb.upper())
         if arg:
             body += " " + arg
@@ -229,8 +234,17 @@ class Sxnu1:
         except ValueError:
             return
         if "HELLO" in parts[3]:
+            # Take the device's counter verbatim -- last_seq is "the last one
+            # that committed", and the next request reuses that number. This is
+            # what nabu_console.py does (ctl.seq = last_seq, no +1) and it is the
+            # behaviour the device accepts; starting at last_seq+1 made every
+            # command after a restart time out.
+            m = re.search(r"last_seq=([0-9a-fA-F]{8})", line)
+            if m:
+                self.seq = int(m.group(1), 16)
+            else:
+                self.seq = 0
             self.session = session
-            self.seq = 1
             self.hello_done = True
             return
         if session != self.session:
@@ -244,16 +258,25 @@ class Sxnu1:
 # --------------------------------------------------------------------------
 
 class Mux:
-    def __init__(self, port: str, tag: str, outdir: str, verbose: bool):
+    def __init__(self, port: str, tag: str, outdir: str, verbose: bool,
+                 kernel_path: str | None = None):
         try:
             import serial
         except ImportError:
             raise SystemExit("pyserial is required: python -m pip install pyserial")
-        self.serial = serial.Serial(port, 115200, timeout=0.02, write_timeout=2.0)
+        self._serial_mod = serial
+        self.port = port
+        self.serial = None
         self.verbose = verbose
         self.tag = tag
         self.outdir = outdir
         os.makedirs(outdir, exist_ok=True)
+        # Open the sinks first, then wait for the port. nabu_console.py does the
+        # same thing, and the reason matters: the round's whole point is to catch
+        # the boot, so the console is started BEFORE flashing and spends the
+        # wait scanning for the port. Opening the port here unconditionally is
+        # how this script lost a round's opening log -- COM3 does not exist yet
+        # at that moment and Serial() raises instead of waiting.
         self.raw_path = os.path.join(outdir, tag + "-com.bin")
         self.ctl_path = os.path.join(outdir, tag + "-ctl.txt")
         self.cmd_path = os.path.join(outdir, tag + "-cmd.txt")
@@ -265,8 +288,25 @@ class Mux:
 
         self.deframer = KdpfDeframer()
         self.sxnu = Sxnu1()
+        self.reply_timeout = 6.0
+        self._pending = None
+        self._replies = queue.Queue()
+        self._held_replies = []
         self.write_lock = threading.Lock()
         self.stop_event = threading.Event()
+
+        # Host-side pseudo-commands need symbol addresses, which live in the
+        # kernel image, not on the device. Optional: without it the pseudo
+        # commands report why they cannot run instead of guessing.
+        self.symtab = None
+        self._sym_cache = {}
+        if kernel_path:
+            try:
+                import symtab as _symtab
+                self.symtab = _symtab.Symtab(kernel_path)
+                self.log(">>> symbols loaded from %s" % kernel_path)
+            except Exception as exc:
+                self.log("! cannot load symbols from %s: %s" % (kernel_path, exc))
 
         self.peer = None
         self.peer_lock = threading.Lock()
@@ -312,6 +352,9 @@ class Mux:
     # -- writes ----------------------------------------------------------
     def _write_cdc(self, wire: bytes, what: str) -> None:
         with self.write_lock:
+            if self.serial is None:
+                self.log("! %s dropped: port is not open" % what)
+                return
             try:
                 self.serial.write(wire)
                 self.serial.flush()
@@ -321,6 +364,150 @@ class Mux:
         self.counters["bytes_tx"] += len(wire)
         if self.verbose:
             self.log("TX %d B (%s)" % (len(wire), what))
+
+    def sym_addr(self, name: str):
+        """Resolve a kernel symbol to its address, using the loaded image.
+
+        Two naming conventions are in play: llvm-nm prints a leading underscore
+        (`_native_adreno_gpu_busy`) while symtab.py strips it
+        (`native_adreno_gpu_busy`). Accept either spelling.
+        """
+        if name in self._sym_cache:
+            return self._sym_cache[name]
+        addr = None
+        if self.symtab is not None:
+            bare = name[1:] if name.startswith("_") else name
+            prefixed = "_" + bare
+            try:
+                for entry in self.symtab.entries():
+                    nm = entry[0]
+                    if nm == bare or nm == prefixed:
+                        addr = entry[1] if len(entry) > 1 else None
+                        break
+            except Exception:
+                addr = None
+        self._sym_cache[name] = addr
+        return addr
+
+    def read_words(self, addr: int, nwords: int):
+        """Issue a READ and parse the reply into words.
+
+        Returns None when the reply does not arrive. The READ reply carries hex
+        bytes; anything longer than one chunk needs READNEXT, which this does
+        not attempt -- the arrays here are all under 256 bytes.
+        """
+        nbytes = nwords * 4
+        want = (self.sxnu.seq + 1) & 0xFFFFFFFF
+        if not self.send_sxnu1("READ", "0x%x %d" % (addr, nbytes)):
+            return None
+        rx = self._wait_reply("READ", seq=want, timeout=self.reply_timeout)
+        if not rx:
+            return None
+        m = re.search(r"data=([0-9a-fA-F]+)", rx)
+        if not m:
+            return None
+        raw = bytes.fromhex(m.group(1))
+        if len(raw) < nbytes:
+            return None
+        return list(struct.unpack("<%dI" % nwords, raw[:nbytes]))
+
+    def read_qwords(self, addr: int, n: int):
+        nbytes = n * 8
+        want = (self.sxnu.seq + 1) & 0xFFFFFFFF
+        if not self.send_sxnu1("READ", "0x%x %d" % (addr, nbytes)):
+            return None
+        rx = self._wait_reply("READ", seq=want, timeout=self.reply_timeout)
+        if not rx:
+            return None
+        m = re.search(r"data=([0-9a-fA-F]+)", rx)
+        if not m:
+            return None
+        raw = bytes.fromhex(m.group(1))
+        if len(raw) < nbytes:
+            return None
+        return list(struct.unpack("<%dQ" % n, raw[:nbytes]))
+
+    def _wait_reply(self, verb: str, seq: int | None = None, timeout: float = 6.0):
+        """Wait for the reply to `verb` at `seq`.
+
+        Matching on the sequence number matters: two pseudo-commands issued back
+        to back put two READs in flight, and a queue that only looked at the verb
+        let the second one consume the first one's reply. The device stamps every
+        reply with the seq it answers, so requiring it makes the pairing exact.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                item = self._replies.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not item:
+                continue
+            if verb.upper() not in item:
+                self._stash_reply(item)
+                continue
+            if seq is not None:
+                m = re.search(r"\s([0-9a-fA-F]{8})\s+%s" % verb.upper(), item)
+                if m and int(m.group(1), 16) != (seq & 0xFFFFFFFF):
+                    self._stash_reply(item)
+                    continue
+            # The reply arrived, so the resync watchdog must stand down. _line
+            # clears this too, but a reply can also be picked up from the queue
+            # here, and leaving the flag set makes the next _resync_if_stuck
+            # fire a HELLO that burns a sequence number.
+            self._pending = None
+            return item
+        return None
+
+    def _stash_reply(self, item: str) -> None:
+        """Hold a reply that belongs to a different request."""
+        self._held_replies.append(item)
+        if len(self._held_replies) > 32:
+            del self._held_replies[:16]
+
+    def _dispatch_host_command(self, verb: str, arg: str) -> bool:
+        """Run a host-side pseudo-command. Returns False if `verb` is not one.
+
+        These names look like device verbs but are not: the console issues READs
+        and decodes the arrays itself. Forwarding them to the device gets them
+        rejected, which is why FRAMESTAT appeared to stop working under this
+        script.
+        """
+        v = verb.upper()
+        if v not in ("FRAMESTAT", "GPUBUSY", "A6XXSTATS"):
+            return False
+        if self.symtab is None:
+            self.log("! %s needs --kernel <image> to resolve symbol addresses" % v)
+            return True
+        import nabu_hostcmd as HC
+        try:
+            if v == "FRAMESTAT":
+                a = self.sym_addr(HC.SYMBOLS["frame_hist"])
+                if a is None:
+                    self.log("! %s not in this image" % HC.SYMBOLS["frame_hist"])
+                    return True
+                w = self.read_words(a, HC.COUNTS["frame_hist"])
+                for line in (HC.decode_frame_hist(w) if w else ["! framestat read failed"]):
+                    self.log(line)
+            elif v == "GPUBUSY":
+                a = self.sym_addr(HC.SYMBOLS["gpu_busy"])
+                if a is None:
+                    self.log("! %s not in this image" % HC.SYMBOLS["gpu_busy"])
+                    return True
+                w = self.read_qwords(a, 8)
+                for line in (HC.decode_gpu_busy(w) if w else ["! gpubusy read failed"]):
+                    self.log(line)
+            else:
+                a = self.sym_addr(HC.SYMBOLS["a6xx_stats"])
+                if a is None:
+                    self.log("! %s not in this image" % HC.SYMBOLS["a6xx_stats"])
+                    return True
+                w = self.read_words(a, HC.COUNTS["a6xx_stats"])
+                for line in (HC.decode_a6xx_stats(w) if w else ["! a6xxstats read failed"]):
+                    self.log(line)
+        except Exception as exc:
+            self.log("! %s failed: %s" % (v, exc))
+        return True
 
     def send_sxnu1(self, verb: str, arg: str = "") -> bool:
         # "kdp" is a host-side shorthand, matching nabu_console.py: it is not a
@@ -337,9 +524,42 @@ class Mux:
             self.log("! %s" % exc)
             return False
         self.counters["sxnu1_tx"] += 1
+        self._pending = (verb.upper(), self.sxnu.seq, time.time())
         self.log("TX %s %s (seq=%d)" % (verb.upper(), arg, self.sxnu.seq))
         self._write_cdc(wire, "SXNU1")
         return True
+
+    def _resync_if_stuck(self) -> None:
+        """Re-sync the sequence after a command that never answered.
+
+        The device only advances state->last_seq when a request commits, while
+        this side advances for every attempt. One dropped or rejected frame
+        therefore leaves the two permanently out of step and every later command
+        is silently refused -- the failure looks like "commands stopped working"
+        with nothing in the log. nabu_console.py solves it by replaying HELLO,
+        which is read-only and re-reports both session and last_seq; this is the
+        same recovery, driven by a timeout instead of a per-command retry.
+        """
+        if not self._pending or not self.sxnu.hello_done:
+            return
+        verb, seq, at = self._pending
+        if verb == "HELLO":
+            return
+        if time.time() - at < self.reply_timeout:
+            return
+        self._pending = None
+        self.log("! no reply for %s (seq=%d) in %.0fs; resyncing with HELLO"
+                 % (verb, seq, self.reply_timeout))
+        # Do NOT roll the counter back by hand: HELLO's reply carries last_seq
+        # and note_reply adopts it, so the next build() is correct on its own.
+        # An earlier version subtracted one here as well, which double-counted
+        # and made the following command skip a number -- the device then
+        # refused it and the session stayed broken.
+        try:
+            wire = self.sxnu.build("HELLO")
+        except RuntimeError:
+            return
+        self._write_cdc(wire, "SXNU1")
 
     # -- reads -----------------------------------------------------------
     def _try_reopen(self) -> None:
@@ -355,19 +575,23 @@ class Mux:
             return
         with self.write_lock:
             try:
-                if self.serial.is_open:
+                if self.serial is not None and self.serial.is_open:
                     self.serial.close()
             except Exception:
                 pass
             try:
-                self.serial = serial.Serial(self.serial.port, 115200,
-                                            timeout=0.02, write_timeout=2.0)
-                self.log(">>> reopened %s" % self.serial.port)
+                self.serial = self._serial_mod.Serial(
+                    self.port, 115200, timeout=0.02, write_timeout=2.0)
+                self.log(">>> reopened %s" % self.port)
             except Exception:
-                pass
+                self.serial = None
 
     def _reader(self) -> None:
         while not self.stop_event.is_set():
+            if self.serial is None:
+                self.stop_event.wait(0.25)
+                self._try_reopen()
+                continue
             try:
                 data = self.serial.read(4096)
             except Exception as exc:
@@ -408,8 +632,10 @@ class Mux:
                 self.counters["kdp_rx"] += 1
                 kdp = extract_kdp_payload(payload)
                 if kdp is None:
+                    self.counters["kdp_unparsed"] = self.counters.get("kdp_unparsed", 0) + 1
                     if self.verbose:
-                        self.log("KDP frame %d B not IPv4/UDP, dropped" % len(payload))
+                        self.log("KDP frame %d B not IPv4/UDP, dropped: %s"
+                                 % (len(payload), payload[:24].hex()))
                     continue
                 with self.peer_lock:
                     peer = self.peer
@@ -445,7 +671,9 @@ class Mux:
             return
         if text.startswith("SXNU1R") or text.startswith("SXNU1"):
             self.counters["sxnu1_rx"] += 1
+            self._pending = None
             self.sxnu.note_reply(text)
+            self._replies.put(text)
             self.log("RX %s" % text)
             return
         # Everything else is kernel log. Echo it so the terminal is useful, and
@@ -485,32 +713,87 @@ class Mux:
 
     # -- command file ----------------------------------------------------
     def _commands(self) -> None:
+        """Consume appended lines, advancing the offset one line at a time.
+
+        Advancing to the file size before the loop dropped commands: a pseudo
+        command can block for its reply timeout, and anything queued behind it
+        was skipped while cmd_pos had already moved past it. Since the console
+        interface is "append and forget", a silently skipped line looks exactly
+        like a device that stopped answering.
+        """
         while not self.stop_event.is_set():
             try:
                 size = os.path.getsize(self.cmd_path)
             except OSError:
                 size = self.cmd_pos
-            if size > self.cmd_pos:
+            while size > self.cmd_pos:
                 try:
-                    with open(self.cmd_path, "r", encoding="utf-8", errors="replace") as f:
+                    with open(self.cmd_path, "rb") as f:
                         f.seek(self.cmd_pos)
-                        chunk = f.read(size - self.cmd_pos)
+                        raw = f.readline()
                 except OSError:
-                    chunk = ""
-                self.cmd_pos = size
-                for line in chunk.splitlines():
-                    line = line.strip()
-                    if not line:
+                    break
+                if not raw:
+                    break
+                self.cmd_pos += len(raw)
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if self.verbose:
+                    self.log(">>> dispatch: %s" % parts[0])
+                # One bad line must not stop the rest: the console contract is
+                # append-and-forget, and a pseudo-command can take seconds.
+                try:
+                    if self._dispatch_host_command(parts[0], " ".join(parts[1:])):
                         continue
-                    if not self.send_sxnu1(line.split()[0], " ".join(line.split()[1:])):
+                    if not self.send_sxnu1(parts[0], " ".join(parts[1:])):
                         self.log("! command dropped: %s" % line)
+                except Exception as exc:
+                    self.log("! %s raised: %s" % (parts[0], exc))
+            self._resync_if_stuck()
             self.stop_event.wait(0.2)
 
     # -- run -------------------------------------------------------------
-    def run(self) -> int:
-        self.log(">>> mux on %s  tag=%s" % (self.serial.port, self.tag))
+    def _open_port(self, wait_s: float, tries_gap: float = 0.2) -> bool:
+        """Wait for the port to appear, then open it.
+
+        This is the behaviour that makes the round possible: the console is
+        started before flashing, so it must survive a few tens of seconds with
+        no device at all. list_ports can also report a port a few hundred ms
+        before the driver finishes binding, so an immediate open can raise even
+        when the name is there -- hence the retry inside the window.
+        """
+        deadline = time.time() + wait_s
+        attempt = 0
+        last_note = -999.0
+        while True:
+            attempt += 1
+            try:
+                self.serial = self._serial_mod.Serial(
+                    self.port, 115200, timeout=0.02, write_timeout=2.0)
+                self.log(">>> CDC OPEN OK on %s (attempt %d)" % (self.port, attempt))
+                return True
+            except Exception as exc:
+                self.serial = None
+                if time.time() >= deadline:
+                    self.log(">>> CDC NOT FOUND on %s after %.0fs (%d attempts): %s"
+                             % (self.port, wait_s, attempt, exc))
+                    return False
+                el = wait_s - (deadline - time.time())
+                if el - last_note >= 2.0:
+                    last_note = el
+                    self.log(">>> waiting for %s (%.0fs, %d attempts)"
+                             % (self.port, el, attempt))
+                self.stop_event.wait(tries_gap)
+
+    def run(self, wait_s: float = 400.0) -> int:
+        self.log(">>> mux starting  tag=%s  port=%s" % (self.tag, self.port))
         self.log(">>> SXNU1: printf '<verb> [args]\\n' >> %s" % self.cmd_path)
         self.log(">>> KDP:   UDP %d (framing kdpf, bare-KDP in, Ethernet out)" % KDP_UDP_PORT)
+        if not self._open_port(wait_s):
+            self.close()
+            return 3
         threads = [
             threading.Thread(target=self._reader, name="cdc", daemon=True),
             threading.Thread(target=self._udp, name="udp", daemon=True),
@@ -524,9 +807,11 @@ class Mux:
                 time.sleep(0.5)
                 if time.time() - last_report >= 30:
                     last_report = time.time()
-                    self.log("STAT %s kdp_rx=%d kdp_tx=%d sxnu1_rx=%d sxnu1_tx=%d"
+                    self.log("STAT %s kdp_rx=%d kdp_tx=%d kdp_drop=%d sxnu1_rx=%d sxnu1_tx=%d"
                              % (self.deframer.stats(), self.counters["kdp_rx"],
-                                self.counters["kdp_tx"], self.counters["sxnu1_rx"],
+                                self.counters["kdp_tx"],
+                                self.counters.get("kdp_unparsed", 0),
+                                self.counters["sxnu1_rx"],
                                 self.counters["sxnu1_tx"]))
         except KeyboardInterrupt:
             self.log(">>> interrupted")
@@ -546,12 +831,19 @@ def main(argv=None) -> int:
     p.add_argument("--tag", default="live")
     p.add_argument("--out", default="E:/nabu/logs")
     p.add_argument("--udp-port", type=int, default=KDP_UDP_PORT)
+    p.add_argument("--wait", type=float, default=400.0,
+                   help="seconds to wait for the port (default 400, same as "
+                        "nabu_console.py: start the console before flashing)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--kernel", default=None,
+                   help="kernel.macho of the build on the board; enables the "
+                        "host-side pseudo-commands (framestat / gpubusy / "
+                        "a6xxstats), which need symbol addresses")
     a = p.parse_args(argv)
 
     KDP_UDP_PORT = a.udp_port
-    mux = Mux(a.port, a.tag, a.out, a.verbose)
-    return mux.run()
+    mux = Mux(a.port, a.tag, a.out, a.verbose, a.kernel)
+    return mux.run(a.wait)
 
 
 if __name__ == "__main__":
