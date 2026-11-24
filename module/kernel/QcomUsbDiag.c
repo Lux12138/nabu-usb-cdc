@@ -356,6 +356,24 @@ static const struct qud_read_range qud_read_whitelist[] = {
     { UINT64_C(0x0ae6b000), UINT64_C(0x0ae6c000), "intf1"  },
     { UINT64_C(0x0ae6c000), UINT64_C(0x0ae6d000), "intf2"  },
     { UINT64_C(0x02c90000), UINT64_C(0x02ca0000), "gpucc"  },
+    /* The GPU core window. The driver accesses exactly this range through
+     * ml_io_map (A640State::read -> maps_[NativeAdrenoA6xxGpu]
+     * -> getVirtualAddress() + offset), so a read here is the same operation
+     * the driver performs on every fence and every counter sample -- not a new
+     * kind of access.
+     *
+     * Why it is needed: the GPU's RBBM interrupt status and mask are the only
+     * way to answer "is the CP fence interrupt enabled at all". Every other
+     * route is closed. KDP's readmem cannot reach it (the window maps into the
+     * 0xfffffff8... IO region, which has no pmap backing for copyin, and
+     * `memory read` there returns "kdp read memory failed"); the 19.2 MHz job
+     * rows carry GPU-clock ticks but not the IRQ state; and a probe built into
+     * the driver would need exactly the rebuild this console is meant to
+     * avoid.
+     *
+     * The window is 256 KiB (windows_[0].bytes = 262144, verified against
+     * windows_[0].physical = 0x02c00000 on the board). Reading only. */
+    { UINT64_C(0x02c00000), UINT64_C(0x02c40000), "gpu"    },
     { UINT64_C(0x01050000), UINT64_C(0x01090000), "gcc"    },
     { UINT64_C(0x0af00000), UINT64_C(0x0af01000), "discc"  },
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000), "dwc3"   },
