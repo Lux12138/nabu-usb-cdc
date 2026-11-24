@@ -1,0 +1,56 @@
+# nabu · T54 交付 1/2：让 release/20.x 的 lldb 在 Linux 上也构建 kdp-remote 插件
+#
+# 基线分支：llvm/llvm-project `release/20.x`（2026-11-24 直读该分支 tip）
+# 性质：本补丁只改 1 个文件、净增 4 行；子文件 MacOSX-Kernel/CMakeLists.txt 经核对【实证】无需改动。
+#
+# --- 门控事实（直读原文）-----------------------------------------------
+# 父文件 lldb/source/Plugins/Process/CMakeLists.txt（release/20.x）第 12-17 行：
+#   12 elseif (CMAKE_SYSTEM_NAME MATCHES "Windows")
+#   13   add_subdirectory(Windows/Common)
+#   14 elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
+#   15   add_subdirectory(MacOSX-Kernel)
+#   16 endif()
+#   17 add_subdirectory(scripted)
+# => Linux 走第 1 个分支（Linux|Android），MacOSX-Kernel 子目录根本不被访问。
+#
+# 子文件 lldb/source/Plugins/Process/MacOSX-Kernel/CMakeLists.txt（release/20.x）：
+#   全文无平台门控，第 9 行直接 add_lldb_library(...)；
+#   LINK_LIBS 已含 lldbPluginDynamicLoaderDarwinKernel / lldbPluginDynamicLoaderStatic /
+#   lldbPluginProcessUtility（第 19-27 行附近）=> 无需补 LINK_LIBS。
+#   来源 URL（2026-11-24 实取）：
+#   - https://raw.githubusercontent.com/llvm/llvm-project/release/20.x/lldb/source/Plugins/Process/CMakeLists.txt
+#   - https://raw.githubusercontent.com/llvm/llvm-project/release/20.x/lldb/source/Plugins/Process/MacOSX-Kernel/CMakeLists.txt
+#
+# --- 改动说明 -----------------------------------------------------------
+# 把 Darwin 分支里的 add_subdirectory(MacOSX-Kernel) 移出条件，改成
+# 「Darwin 或 Linux/Android 才构建」。这样：
+#   - Linux（我们的目标）会访问子目录并生成 lldbPluginProcessMacOSXKernel；
+#   - macOS 行为不变；
+#   - Windows / FreeBSD / NetBSD / OpenBSD 行为不变（避免把可能编不过的
+#     Mach-O/KDP 代码强加给其它平台，这是比 T54 §3.2 方案 A「无条件移出」
+#     更收敛的最小等价改法）。
+#
+# 【实证】hunk 上下文与 release/20.x 原文逐行一致（直取该分支 raw 文件核对）。
+# 【实证】已在 release/20.x 真实单文件副本上实测：`git apply --check` 与 GNU patch
+#        （msys 2.8 / WSL 2.7.6）的 `-p1 --dry-run` 均干净通过（含逐 hunk 结果，
+#        见同目录 VERIFY.md）。仅本行以上的注释在复核后更新过，hunk 体未改动。
+#
+# --- 应用方式 -----------------------------------------------------------
+#   cd llvm-project   # tarball 解压根目录（或 git checkout release/20.x）
+#   git apply --check kdp-remote-linux.patch && git apply kdp-remote-linux.patch
+# 回滚：git apply -R kdp-remote-linux.patch
+
+--- a/lldb/source/Plugins/Process/CMakeLists.txt
++++ b/lldb/source/Plugins/Process/CMakeLists.txt
+@@ -12,8 +12,9 @@
+ elseif (CMAKE_SYSTEM_NAME MATCHES "Windows")
+   add_subdirectory(Windows/Common)
+-elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
+-  add_subdirectory(MacOSX-Kernel)
+ endif()
++if (CMAKE_SYSTEM_NAME MATCHES "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
++  add_subdirectory(MacOSX-Kernel)
++endif()
+ add_subdirectory(scripted)
+ add_subdirectory(gdb-remote)
+ add_subdirectory(Utility)

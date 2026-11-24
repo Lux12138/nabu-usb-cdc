@@ -8,9 +8,9 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ---
 
-## 现在的状态（2026-11-24 21:30）
+## 现在的状态（2026-11-24 23:50）
 
-**48 个设备端命令 + 15 条主机侧命令 + KDP 网络链路，全部真机验证。**
+**48 个设备端命令 + 15 条主机侧命令 + KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
 
 | 指标 | 状态 |
 |---|---|
@@ -22,9 +22,11 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 | panic 日志 | BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活 |
 | **`Debugger()` 进出** | **可进可出**（预置 ≥8 个 `'c'`，见下文）|
 | **KDP 远程调试** | **`CONNECT`/`READMEM`/`BREAKPOINT`/`DISCONNECT` 全部跑通**（见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)）|
-| 链路 | CDC 约 38–57 s 枚举，命令往返正常 |
+| **原生 lldb 直连** | **Linux 上 lldb 20.1.8 + Apple `kdp-remote`，已拿到符号化内核栈**（见下文）|
+| 链路 | **USB High Speed**（`DSTS.CONNECTSPD=0`，两次 boot 复现）|
+| CDC 吞吐 | **51.5 KB/s**（KDP 裸数据，`--poll 0.01`）；瓶颈 `DWC3_RX_BYTES=512` |
 
-**最新可用基线**：`hold/kb-165`（kernel `3a367af871a1202db7fe`，含 KDP 网络链路）。
+**最新可用基线**：`t134`（kernel `e68f924a4caae610`）。
 
 ### KDP 远程调试（新）
 
@@ -239,6 +241,66 @@ panic 路径 `kdp_rx_armed = 0`，`serial_getc()` 读的是**控制环**（只�
 
 ---
 
+## ★ 原生 lldb 直连（Linux / macOS 主机）
+
+`deliverables/lldb-kdp-linux-20261124/` 里是**在 Linux 上构建带 Apple `kdp-remote`
+插件的 lldb**，可以直接连这台设备，拿到完整符号化内核栈。
+
+**2026-11-24 23:48 已实测跑通。**
+
+### 为什么可行
+
+上游把 KDP 插件放在 `lldb/source/Plugins/Process/MacOSX-Kernel/`，父文件
+`CMakeLists.txt` 只在 **Darwin** 分支里 `add_subdirectory`。插件本身**没有任何
+平台门控**，依赖的模块在 Linux 都是活代码。把门控放宽到 `Linux|Android` 就能编。
+
+另有一处 Apple 遗留 UB：`ProcessKDP.cpp` 把 UDP 连接 `static_cast` 成
+`TCPSocket` 后调 `GetLocalPortNumber()`，macOS 靠内存布局恰好能用，Linux 上是 UB。
+
+### 三条命令
+
+```bash
+# 1) Windows：起网桥（注意 kdpf + kdp 模式，不是 serial/eth）
+cd kdp_net_bridge
+python kdp_net_bridge.py --port COM3 --cdc-framing kdpf --udp-mode kdp --poll 0.01 --verbose
+
+# 2) Linux：取 Windows 宿主 IP（WSL 里没有 ip 命令，resolv.conf 也不对）
+awk '$2=="00000000"{print $3; exit}' /proc/net/route   # 01B015AC -> 172.21.176.1（小端倒读）
+
+# 3) Linux：连
+cd ~/nabu-lldb/build/bin
+./lldb -o "target create <与板上一致的内核>" \
+       -o "process connect --plugin kdp-remote udp://172.21.176.1:41139"
+```
+
+### 实测输出（符号化内核栈）
+
+```
+Process 1 stopped
+* thread #1, stop reason = signal SIGSTOP
+    frame #0: DebuggerTrapWithState(db_op=DBOP_DEBUGGER,
+             db_message="qcom_usb_debug", ...) at debug.c:732:2
+    frame #1: DebuggerWithContext(message="qcom_usb_debug") at debug.c:912:3
+    frame #2: Debugger(message=<unavailable>) at debug.c:858:2
+    frame #3: control_handle_frame(...) at QcomXnuUsbDebug.c:2420:9
+```
+
+`QcomXnuUsbDebug.c:2420` 正是控制台 `DEBUGGER` verb 里调
+`Debugger("qcom_usb_debug")` 的那行 —— 栈和源码完全对上。
+
+### 三个必踩的坑
+
+| 坑 | 症状 |
+|---|---|
+| `--cdc-framing serial` | 网桥写了 N 字节，**设备零回应**。本板带 `nabu-kdp-net=1`，必须 `kdpf` |
+| `--udp-mode eth` | lldb 发的是 8 B 裸 KDP 包，`eth` 模式当以太网帧处理 → 丢弃。必须 `kdp` |
+| WSL 用 `nameserver` 当宿主 IP | `10.255.255.254` 是 DNS 代理，**UDP 打不通**。必须取 default gateway |
+
+完整手册（11 节 + 排错表 + 真机联调记录）：
+`deliverables/lldb-kdp-linux-20261124/T62-lldb-build-recipe.md`
+
+---
+
 ## panic 日志（方案 D）
 
 内核已有 4 MiB BSS 环；本仓库把它接到 UFS 预留区：
@@ -311,6 +373,8 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 | **`kdp_client/`** | **`kdp_cli.py`，走 UDP 或串口连 KDP** |
 | `patches/` | 内核/驱动补丁 |
 | `docs/KDP-NET-OVER-CDC.md` | **KDP 网络链路完整文档** |
+| **`deliverables/lldb-kdp-linux-20261124/`** | **Linux 上构建带 `kdp-remote` 的 lldb**（补丁 + VERIFY + T62 手册 + 构建脚本）|
+| **`deliverables/usb-sw-throughput-20261124/`** | **T59 软件侧提速补丁**（S1 多 TRB 环 + S2 事件预算）|
 | `docs/` | 详细文档、历史记录、备份说明 |
 
 ---

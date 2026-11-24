@@ -1,0 +1,118 @@
+# nabu · T54 交付 2/2：ProcessKDP 在 UDP 路径上的 UB 修复 + Linux 编译小修
+#
+# 基线分支：llvm/llvm-project `release/20.x`
+#   tip = 87f0227cb60147a26a1eeb4fb06e3b505e9c7261（2026-11-24 `git ls-remote`）
+#   各比对文件的字节数 / ETag / 抓取命令见同目录 VERIFY.md
+# 证据分级：核心修复点=【实证】（源码直读）；是否需要编译小修=【推断】（取决于传递包含，见下）
+#
+# --- 问题（T54 §2.3 / §4.2-2，本交付已逐行核实）--------------------------------
+# ProcessKDP.cpp 的 DoConnectRemote() 中（release/20.x 第 233-235 行，本次直取核对；
+# main tip 曾按 grep.app 交叉核对为 231-233）：
+#
+#   const TCPSocket &socket =
+#       static_cast<const TCPSocket &>(*conn_up->GetReadObject());
+#   const uint16_t reply_port = socket.GetLocalPortNumber();
+#
+# ConnectionFileDescriptor 对 `udp://` 连接返回的动态对象是 UDPSocket。
+# UDPSocket 与 TCPSocket 都直接继承 Socket；GetLocalPortNumber() 只在
+# TCPSocket 声明（lldb/include/lldb/Host/common/TCPSocket.h:27，release/20.x 直读），
+# Socket 基类没有该接口（lldb/include/lldb/Host/Socket.h 直读确认）。
+# 因此这是把 UDP 对象 static_cast 成 TCPSocket 后调其方法：Apple 工具链下
+# 「恰好能读到继承成员 m_socket」，Linux/clang 下属未定义行为。
+#
+# 已直读确认（release/20.x，字节数见 VERIFY.md）：
+# - lldb/include/lldb/Host/Socket.h
+#     class Socket : public IOObject（第 68 行）；
+#     NativeSocket GetNativeSocket() const { return m_socket; }（第 138 行，public、非虚）
+# - lldb/include/lldb/Host/SocketAddress.h
+#     static socklen_t GetMaxLength()（第 71 行）；uint16_t GetPort() const（第 83 行）；
+#     operator const struct sockaddr *() const（第 156 行）=> 可直接传给 ::getsockname()
+# - lldb/source/Host/common/TCPSocket.cpp：GetLocalPortNumber() 的实现就是
+#     SocketAddress sock_addr; socklen_t len = sock_addr.GetMaxLength();
+#     if (::getsockname(m_socket, sock_addr, &len) == 0) return sock_addr.GetPort();
+#   => 只依赖继承来的 m_socket，与具体 Socket 子类型无关。
+#
+# --- 修复方案（类型无关，TCP/UDP 均适用）------------------------------------
+# 不再做任何向下转型：用 Socket::GetNativeSocket()（public、非虚，Socket.h:138）
+# 拿到 fd，再对 fd 调 ::getsockname() 取本地端口；失败则 reply_port=0，
+# 与原逻辑「GetLocalPortNumber 返回 0」的失败语义一致（后续会走
+# "invalid reply port from UDP connection" 分支）。
+#
+# --- 编译小修（【推断】，若你的工具链已能过可删掉对应 hunk）------------------
+# 1) ProcessKDP.cpp 用了 usleep(100000)（DoConnectRemote 内重试等待，release/20.x 第 228 行），
+#    POSIX 需 <unistd.h>；Linux/glibc 通常经传递包含也能拿到，显式加上最稳。
+# 2) getsockname/socklen_t 需 <sys/socket.h>（POSIX）。
+# 3) CommunicationKDP.cpp 用 htons()（SendRequestConnect/SendRequestReattach，
+#    release/20.x 第 349/350/375 行），Linux 需 <arpa/inet.h>；macOS 靠传递包含。
+#    该文件头部直读确认当前没有它。
+#
+# --- hunk 形式与本机实测（2026-11-24）-----------------------------------------
+# 本补丁 hunk 由「同一改动的应用结果」经 GNU `diff -u` 反向生成，即标准
+# unified diff（3 行前导 + 3 行尾随上下文），而非手写上下文。原因：旧版
+# CommunicationKDP.cpp hunk 用 4 行前导 + 1 行尾随，git apply 接受，但
+# GNU patch（msys 自带 patch 与 Ubuntu 24.04 patch 2.7.6 双实现实测）
+# 报 `Hunk #1 FAILED at 10`；改成规范形式后两者均干净通过。
+# 改动后的文件内容与旧版应用结果逐字节一致（两文件均已比对）。
+# 实测命令与完整输出见 VERIFY.md。
+#
+# --- 应用方式 ---------------------------------------------------------------
+#   cd llvm-project        # tarball 解压根目录（或 git checkout release/20.x）
+#   git apply --check processkdp-ub-fix.patch && git apply processkdp-ub-fix.patch
+#   # 或：patch -p1 < processkdp-ub-fix.patch
+# 回滚：git apply -R processkdp-ub-fix.patch（或 patch -R -p1 < processkdp-ub-fix.patch）
+--- a/lldb/source/Plugins/Process/MacOSX-Kernel/ProcessKDP.cpp
++++ b/lldb/source/Plugins/Process/MacOSX-Kernel/ProcessKDP.cpp
+@@ -9,6 +9,11 @@
+ #include <cerrno>
+ #include <cstdlib>
+ 
++#if defined(__unix__) || defined(__APPLE__)
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
+ #include <memory>
+ #include <mutex>
+ 
+@@ -18,6 +23,8 @@
+ #include "lldb/Core/PluginManager.h"
+ #include "lldb/Host/ConnectionFileDescriptor.h"
+ #include "lldb/Host/Host.h"
++#include "lldb/Host/Socket.h"
++#include "lldb/Host/SocketAddress.h"
+ #include "lldb/Host/ThreadLauncher.h"
+ #include "lldb/Host/common/TCPSocket.h"
+ #include "lldb/Interpreter/CommandInterpreter.h"
+@@ -230,9 +237,16 @@
+   }
+ 
+   if (conn_up->IsConnected()) {
+-    const TCPSocket &socket =
+-        static_cast<const TCPSocket &>(*conn_up->GetReadObject());
+-    const uint16_t reply_port = socket.GetLocalPortNumber();
++    // nabu: 原实现把 UDP socket static_cast 成 TCPSocket 再调
++    // GetLocalPortNumber()（Linux 上为 UB）。改用通用 Socket 引用 +
++    // getsockname() 取本地端口，TCP/UDP 均适用，语义与原 TCPSocket 实现一致。
++    // （GetReadObject() 返回 IOObjectSP；连接对象必为 Socket，故向下转型良定义。）
++    const Socket &socket = static_cast<const Socket &>(*conn_up->GetReadObject());
++    uint16_t reply_port = 0;
++    SocketAddress sock_addr;
++    socklen_t sock_addr_len = sock_addr.GetMaxLength();
++    if (::getsockname(socket.GetNativeSocket(), sock_addr, &sock_addr_len) == 0)
++      reply_port = sock_addr.GetPort();
+ 
+     if (reply_port != 0) {
+       m_comm.SetConnection(std::move(conn_up));
+--- a/lldb/source/Plugins/Process/MacOSX-Kernel/CommunicationKDP.cpp
++++ b/lldb/source/Plugins/Process/MacOSX-Kernel/CommunicationKDP.cpp
+@@ -12,6 +12,10 @@
+ #include <climits>
+ #include <cstring>
+ 
++#if defined(__unix__) || defined(__APPLE__)
++#include <arpa/inet.h>
++#endif
++
+ #include "lldb/Core/DumpDataExtractor.h"
+ #include "lldb/Host/Host.h"
+ #include "lldb/Target/Process.h"
