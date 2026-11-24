@@ -188,6 +188,25 @@ def cmd_disconnect(sess, args, state):
     return 0
 
 
+def cmd_reboot(sess, args, state):
+    """KDP_HOSTREBOOT -- reset the board from the debugger.
+
+    This is the way out of a KDP session on arm64. DISCONNECT only clears the
+    session; kdp_debugger_loop() then goes round again and the kernel does not
+    resume (T39). HOSTREBOOT is handled inside kdp_connection_wait() by a direct
+    kdp_machine_reboot(), so the machine goes down instead.
+
+    No reply is expected -- the kernel is on its way out -- so "sent" is as far
+    as this command can confirm. Check with adb devices and the COM port list.
+    """
+    _ensure_session(sess, state, args.fresh)
+    sess.host_reboot()
+    clear_session()
+    print("[cli] HOSTREBOOT sent (no reply is expected; the board is resetting)")
+    print("[cli] confirm with: adb devices  /  COM3 gone")
+    return 0
+
+
 def cmd_version(sess, args, state):
     _ensure_session(sess, state, args.fresh)
     ver = sess.version()
@@ -391,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("connect", help="CONNECT, then query VERSION/HOSTINFO")
     sub.add_parser("reattach", help="KDP_REATTACH")
     sub.add_parser("disconnect", help="KDP_DISCONNECT and clear the session")
+    sub.add_parser("reboot", help="KDP_HOSTREBOOT: reset the board (the arm64 way out)")
     sub.add_parser("version", help="KDP_VERSION")
     sub.add_parser("hostinfo", help="KDP_HOSTINFO")
     sub.add_parser("maxbytes", help="KDP_MAXBYTES")
@@ -499,6 +519,7 @@ def main(argv=None) -> int:
         "connect": cmd_connect,
         "reattach": cmd_reattach,
         "disconnect": cmd_disconnect,
+        "reboot": cmd_reboot,
         "version": cmd_version,
         "hostinfo": cmd_hostinfo,
         "maxbytes": cmd_maxbytes,

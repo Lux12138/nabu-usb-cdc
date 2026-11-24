@@ -551,6 +551,22 @@ class KdpSession:
         self.connected = True
         return reply
 
+    def host_reboot(self) -> None:
+        """KDP_HOSTREBOOT: reset the board from the debugger.
+
+        kdp_udp.c handles this request inside kdp_connection_wait() by calling
+        kdp_machine_reboot() directly, with the comment "should not return!". So
+        this is the one way out of a KDP session on arm64, where DISCONNECT only
+        clears the session and the debugger loop goes round again (T39).
+
+        Sent as a bare header. No reply is expected and none arrives: the machine
+        is on its way down. The caller should treat "no reply" as success and
+        confirm with adb/COM3 rather than waiting for one.
+        """
+        # seq is irrelevant: kdp_udp.c checks request == KDP_HOSTREBOOT before
+        # it looks at anything else, then reboots without replying.
+        self._send_kdp(KDP_HOSTREBOOT, b"", self.seq)
+
     def disconnect(self) -> KdpReply:
         """KDP_DISCONNECT.  The kernel returns to kdp_connection_wait()."""
         reply = self._reply(KDP_DISCONNECT, b"")
