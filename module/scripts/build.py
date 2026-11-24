@@ -12,9 +12,9 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-UNITS = ('kernel/QcomXnuUsbDebug.c', 'kernel/QcomUsbScreenshot.c',
-         'usb/Dwc3.c', 'soc/QcomUsbQualify.c', 'soc/QcomUsbPrepare.c',
-         'soc/QcomUsbDmaDomain.c', 'soc/QcomUsbBypass.c')
+UNITS = ('kernel/QcomXnuUsbDebug.c', 'kernel/QcomKdpNet.c',
+         'kernel/QcomUsbScreenshot.c', 'usb/Dwc3.c', 'soc/QcomUsbQualify.c',
+         'soc/QcomUsbPrepare.c', 'soc/QcomUsbDmaDomain.c', 'soc/QcomUsbBypass.c')
 
 
 def compile_flags(record):
@@ -125,7 +125,9 @@ def main():
                    '_sysctlbyname', '_tasks', '_kernproc', '_proc_struct_size',
                    '_kern_stack_snapshot_with_reason', '_kernel_stackshot_buf', '_kernel_stackshot_buf_size',
                    '_kd_control_trace',
-                   '_panic'}
+                   '_panic',
+                   '_kdp_register_send_receive', '_kdp_register_link',
+                   '_kdp_set_ip_and_mac_addresses', '_kdp_en_send_pkt', '_z_crc32'}
         if external - allowed:
             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
         required = {'_qcom_usb_debug_' + s for s in

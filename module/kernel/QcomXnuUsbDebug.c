@@ -3160,6 +3160,37 @@ debugger_done:
         __atomic_store_n(&control_reboot_requested, 1u, __ATOMIC_RELEASE);
     }
 }
+/* The worker loop in bsd_init.c is the only thing that services a REBOOT
+ * request, and it stops as soon as the poll path moves phase out of ACTIVE.
+ * This helper is the fallback for that case: it runs on the receive path, which
+ * stays alive. A request still unarmed after the window below cannot be
+ * serviced any more, because a live worker handles it on its next 5 ms tick. */
+static void control_reboot_fallback(void)
+{
+    uint64_t frequency = 0, start, limit, settle, settleLimit;
+    if (!__atomic_load_n(&control_reboot_requested, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&control_reboot_armed, __ATOMIC_ACQUIRE))
+        return;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    if (!frequency) return;
+    start = counter();
+    limit = frequency / 8u;                  /* 125 ms */
+    while (counter() - start < limit) {
+        if (__atomic_load_n(&control_reboot_armed, __ATOMIC_ACQUIRE)) return;
+        if (!__atomic_load_n(&control_reboot_requested, __ATOMIC_ACQUIRE)) return;
+        __asm__ volatile("yield" ::: "memory");
+    }
+    if (!__atomic_load_n(&control_reboot_requested, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&control_reboot_armed, __ATOMIC_ACQUIRE))
+        return;
+    /* Let the controller put the acknowledged reply on the wire before the SoC
+     * leaves the bus. 1 ms; nothing depends on it surviving. */
+    __asm__ volatile("dsb sy" ::: "memory");
+    settle = counter();
+    settleLimit = frequency / 1000u;
+    while (counter() - settle < settleLimit) __asm__ volatile("yield" ::: "memory");
+    platform_smc_reset();
+}
 static void control_service(const uint8_t *bytes, size_t count, uint32_t generation,
                             const struct qcom_usb_debug_status *status)
 {
@@ -3184,6 +3215,9 @@ static void control_service(const uint8_t *bytes, size_t count, uint32_t generat
             (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
         }
     }
+    /* Serving the request here keeps REBOOT working after the worker loop has
+     * stopped; see the note above control_reboot_fallback(). */
+    control_reboot_fallback();
 }
 int qcom_usb_debug_control_start(void)
 {
@@ -3568,6 +3602,15 @@ qcom_usb_debug_serial_getc(void)
 /* One bounded drain of the DWC3 RX ring.  Master CPU only, same constraint as
  * dwc3_poll()/dwc3_read().  Shared by the worker and by the pe_serial receive
  * path so KDP does not have to wait for the next 5 ms worker tick. */
+
+/* nabu: optional KDP-over-CDC framing lives in QcomKdpNet.c.  Declared here so
+ * neither QcomXnuUsbDebug.h copy has to change.  With the boot-arg absent,
+ * route() returns the original pointer/length and active() stays 0. */
+void qcom_usb_debug_kdp_net_route(const uint8_t *in, size_t n, uint32_t generation,
+                                  const uint8_t **out, size_t *out_n);
+int qcom_usb_debug_kdp_net_try_attach(void);
+int qcom_usb_debug_kdp_net_active(void);
+
 static void
 serial_rx_drain(void)
 {
@@ -3577,6 +3620,8 @@ serial_rx_drain(void)
     struct qcom_usb_debug_status status = {0};
     uint32_t generation = 0;
     size_t rx_count = 0, text_count = 0;
+    size_t wire_count = rx_count;
+    const uint8_t *wire = rx;
     int observed = 0;
 
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return;
@@ -3591,8 +3636,12 @@ serial_rx_drain(void)
     release(flags);
     if (!observed) return;
 
-    for (size_t i = 0; i < rx_count; i++) {
-        uint8_t b = rx[i];
+    /* nabu: net mode extracts KDPF frames from this chunk; with the boot-arg
+     * off wire==rx and wire_count==rx_count, so routing below is unchanged. */
+    qcom_usb_debug_kdp_net_route(rx, rx_count, generation, &wire, &wire_count);
+
+    for (size_t i = 0; i < wire_count; i++) {
+        uint8_t b = wire[i];
         if (usb_serial_rx_kdp) {
             serial_rx_push(b);
             if (b == SERIAL_KDP_END) usb_serial_rx_kdp = 0;
@@ -3621,7 +3670,8 @@ serial_rx_drain(void)
      *
      * Guarded by kdp_rx_armed, which the DEBUGGER verb raises immediately before
      * the trap -- so normal operation, including the boot path, never sees this. */
-    if (rx_count != 0 && __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+    if (rx_count != 0 && !qcom_usb_debug_kdp_net_active() &&
+        __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
         for (size_t i = 0; i < rx_count; i++) {
             (void)kdp_rx_push(rx[i]);
         }
@@ -3653,6 +3703,8 @@ qcom_usb_debug_serial_poll(void)
 void qcom_usb_debug_poll(void)
 {
     serial_rx_drain();
+    /* nabu: idempotent, boot-arg gated, waits for phase ACTIVE. */
+    (void)qcom_usb_debug_kdp_net_try_attach();
     qud_dump_ufs_progress();   /* async UFS dump, outside the USB lock */
 }
 void qcom_usb_debug_panic_prepare(void)
