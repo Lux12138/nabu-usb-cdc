@@ -8,22 +8,45 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ---
 
-## 现在的状态（2026-11-23 21:30）
+## 现在的状态（2026-11-24 21:30）
 
-**48 个设备端命令 + 9 条主机侧命令，全部真机验证。**
+**48 个设备端命令 + 15 条主机侧命令 + KDP 网络链路，全部真机验证。**
 
 | 指标 | 状态 |
 |---|---|
 | 设备端 verb | **48** 个（`module/kernel/QcomUsbControl.h`）|
-| 主机侧命令 | **9** 条（读已导出数组，不需要内核改动）|
+| 主机侧命令 | **15** 条（读已导出数组，不需要内核改动）|
 | 内核日志 | 开机到复位连续，无需第二串口 |
 | 读内存 | 内核虚拟地址 + 物理地址/MMIO，带白名单防护 |
 | **写内存/寄存器** | `WRITE` / `WRITEPA` / `SYSREGW` **三条都做过值变化验证** |
 | panic 日志 | BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活 |
 | **`Debugger()` 进出** | **可进可出**（预置 ≥8 个 `'c'`，见下文）|
+| **KDP 远程调试** | **`CONNECT`/`READMEM`/`BREAKPOINT`/`DISCONNECT` 全部跑通**（见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)）|
 | 链路 | CDC 约 38–57 s 枚举，命令往返正常 |
 
-**最新可用基线**：`hold/kb-92-nop18`（kernel `e3cb7046d0f8eec1c6fa`，已打 NOP18 补丁）。
+**最新可用基线**：`hold/kb-165`（kernel `3a367af871a1202db7fe`，含 KDP 网络链路）。
+
+### KDP 远程调试（新）
+
+同一个 CDC 口，除了控制台还能跑 XNU 的 KDP 调试器：
+
+```bash
+tools/kdp.sh bridge            # 停控制台，起网桥（KDPF v1）
+tools/kdp.sh cli --fresh connect
+# CONNECT ok: error=NO_ERROR key=0x1337c0de seq=1
+```
+
+真机验证过：`CONNECT`、`VERSION`、`HOSTINFO`、`MAXBYTES`、`KERNELVERSION`、
+`READMEM`、`BREAKPOINT64_SET/REMOVE`、`DISCONNECT`、断线重连。
+
+**三个必须知道的前提：**
+
+1. **`--cdc-framing` 必须匹配设备侧**：本模块（`nabu-kdp-net=1`）用 `kdpf`，
+   旧 serial KDP 用 `serial`。用错时网桥在发帧、设备零回应，极难自查。
+2. **`debug=` 不能带 `0x200`**（`DB_KDP_GETC_ENA` 会让 `kdp_getc()` 逐字节吃掉帧）。
+3. **arm64 上 KDP 会话不能返回内核** —— 每次会话结束仍需断电重启。
+
+完整用法、帧格式、构建步骤见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)。
 
 > ### ⚠️ NOP18 是硬性步骤
 >
@@ -273,16 +296,21 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 
 | 路径 | 内容 |
 |---|---|
-| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 48 verb + 9 条主机侧命令 + KDP |
+| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 48 verb + 15 条主机侧命令 |
+| **`tools/kdp.sh`** | **KDP 一键切换**：`status`/`console`/`bridge`/`stop`/`cli` |
 | `tools/payload_swap_kernel.py` | 原地替换 payload 里的 kernel（保持 FAT 布局）|
 | `tools/payload_layout_check.py` | 校验 kernel 簇链是否为已知可启动的布局 |
 | `tools/pack_round.sh` | 打包入口（含 NOP18 与布局门）|
 | `tools/build_and_pack.sh` | 构建 + 打包全流程 |
 | `tools/pipeline.py` | 日志分析流水线 |
 | `tools/symtab.py` | 主机侧符号表（53k 符号）|
+| **`module/kernel/QcomKdpNet.c`** | **KDP over CDC 裸以太网帧（KDPF v1）** |
 | `module/kernel/` | 控制协议与 verb 实现（C）|
 | `module/tests/` | 命令解析单元测试 |
+| **`kdp_net_bridge/`** | **主机网桥：CDC ↔ UDP:41139** |
+| **`kdp_client/`** | **`kdp_cli.py`，走 UDP 或串口连 KDP** |
 | `patches/` | 内核/驱动补丁 |
+| `docs/KDP-NET-OVER-CDC.md` | **KDP 网络链路完整文档** |
 | `docs/` | 详细文档、历史记录、备份说明 |
 
 ---
