@@ -1,0 +1,264 @@
+--- a/module/kernel/QcomXnuUsbDebug.c	2026-11-24 23:03:06.000000000 +0800
++++ b/module/kernel/QcomXnuUsbDebug.c	2026-11-24 23:15:43.862000000 +0800
+@@ -117,6 +117,11 @@
+ static volatile unsigned int usb_busy;
+ static volatile unsigned int usb_diag_enabled, usb_diag_checkpoint, usb_diag_resetting, usb_diag_target;
+ static volatile unsigned int usb_diag_mode, usb_diag_polling;
++/* Software-throughput experiment gates (default = current behaviour).
++ * nabu-usb-s1=1 enables the multi-TRB IN ring; nabu-usb-s2=N sets the
++ * non-debugger event budget (clamped to 1..64). */
++static int usb_tx_ring;
++static unsigned int usb_sw_poll_budget = 8u;
+ static uint8_t usb_log_bytes[SOC_USB_LOG_BUFFER_BYTES];
+ static struct soc_usb_buffer usb_log_buffer = {
+     .data = usb_log_bytes, .capacity = sizeof(usb_log_bytes)
+@@ -777,6 +782,15 @@
+     if (!PE_parse_boot_argn("qcom-usb-debug", &enabled, sizeof(enabled)) || enabled != 1) {
+         native.status.phase = QCOM_USB_DEBUG_DISABLED; goto out;
+     }
++    /* Software-throughput experiment gates; with no boot-arg both keep the
++     * exact legacy path and the tree's existing poll budget. */
++    {
++        int sw_s1 = 0, sw_s2 = 0;
++        (void)PE_parse_boot_argn("nabu-usb-s1", &sw_s1, sizeof(sw_s1));
++        (void)PE_parse_boot_argn("nabu-usb-s2", &sw_s2, sizeof(sw_s2));
++        usb_tx_ring = sw_s1 == 1;
++        if (sw_s2 >= 1 && sw_s2 <= 64) usb_sw_poll_budget = (unsigned int)sw_s2;
++    }
+     native.status.phase = QCOM_USB_DEBUG_PREPARING;
+     diag_checkpoint(QCOM_USB_DEBUG_DIAG_AFTER_ACQUIRE);
+     if (dwc3_context_bytes() > sizeof(usb_context)) {
+@@ -1015,6 +1029,10 @@
+         fail(QCOM_USB_DEBUG_CORE_INIT_FAILED, ret); (void)restore_after_failure(); ret = 0; goto out;
+     }
+     native.core_initialized = 1;
++    if (usb_tx_ring) {
++        /* Opt-in multi-TRB IN ring: set before start, while nothing is active. */
++        (void)dwc3_set_in_ring(native.core, 1);
++    }
+     {
+         static const char banner[] = "QCOM XNU USB CDC ACM v1\n";
+         (void)backlog_write(banner, sizeof(banner) - 1);
+@@ -1095,7 +1113,8 @@
+      * ticks per 1 KiB packet. 8 lets one poll both retire the completions and
+      * start the next transfer, which is what makes the whole packet move in one
+      * tick. It stays far below the 256 clamp. */
+-    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ? 64u : 8u);
++    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ?
++                    64u : usb_sw_poll_budget);
+     native.status.poll_calls++;
+     native.status.last_poll_events = ret < 0 ? 0u : (uint32_t)ret;
+     buffer_status_owned();
+--- a/module/usb/Dwc3.c	2026-11-22 17:24:06.000000000 +0800
++++ b/module/usb/Dwc3.c	2026-11-24 23:15:13.829451200 +0800
+@@ -13,6 +13,12 @@
+ #define TRB_OFFSET 4096u
+ #define BUFFER_OFFSET 8192u
+ #define EP_BUFFER_BYTES 4096u
++/* Opt-in IN multi-TRB ring (nabu-usb-s1): eight 512 B slots carved from the
++ * existing EP_IN buffer, with their TRBs in the previously unused gap after
++ * the per-endpoint TRBs. The default path keeps one 4096 B TRB unchanged. */
++#define IN_RING 8u
++#define IN_SLOT_BYTES (EP_BUFFER_BYTES / IN_RING)
++#define IN_TRB_OFFSET (TRB_OFFSET + EP_COUNT * 64u)
+ #define TX_BYTES DWC3_TX_BYTES
+ #define COMMAND_POLLS 10000u
+ #define CONFIG_ACTION_MODIFY (2u << 30)
+@@ -33,6 +39,12 @@
+     uint32_t packet_size;
+     uint32_t resource[EP_COUNT];
+     uint8_t active[EP_COUNT];
++    /* Opt-in IN ring state; in_ring == 0 reproduces the single-TRB path. */
++    uint8_t in_ring, in_head, in_tail, in_count;
++    uint8_t in_active[IN_RING];
++    uint16_t in_len[IN_RING];
++    uint32_t in_fetch;       /* tx-ring index of the next byte to copy */
++    uint32_t in_outstanding; /* bytes copied into slots but not completed */
+     uint8_t tx[TX_BYTES], rx[DWC3_RX_BYTES], line_coding[7], control_reply[256];
+     uint16_t control_length;
+     uint8_t control_state, control_three_stage, configured, dtr;
+@@ -46,6 +58,9 @@
+ _Static_assert(sizeof(struct dwc3) <= DWC3_CONTEXT_BYTES,
+                "DWC3 context exceeds the public storage budget");
+ 
++static int ep_command(struct dwc3 *d, unsigned ep, uint32_t cmd,
++                      uint32_t p0, uint32_t p1, uint32_t p2);
++
+ static const uint8_t device_descriptor[] = {
+     18, 1, 0, 2, 2, 0, 0, 64, 0, 0, 0, 0,
+     0, 1, 1, 2, 3, 1
+@@ -119,6 +134,70 @@
+ {
+     return (struct dwc3_trb *)(void *)(d->dma_cpu + TRB_OFFSET + ep * 64u);
+ }
++/* Opt-in IN ring primitives; only reachable when d->in_ring is set. */
++static uint8_t *in_buffer(struct dwc3 *d, unsigned slot)
++{
++    return buffer(d, EP_IN) + slot * IN_SLOT_BYTES;
++}
++static struct dwc3_trb *in_trb(struct dwc3 *d, unsigned slot)
++{
++    return (struct dwc3_trb *)(void *)(d->dma_cpu + IN_TRB_OFFSET + slot * 64u);
++}
++static void in_reset(struct dwc3 *d)
++{
++    unsigned slot;
++    for (slot = 0; slot < IN_RING; ++slot) d->in_active[slot] = 0;
++    d->in_head = d->in_tail = d->in_count = 0;
++    d->in_fetch = d->tx_tail;
++    d->in_outstanding = 0;
++    d->zlp_pending = 0;
++}
++static int in_transfer(struct dwc3 *d, unsigned slot, unsigned bytes)
++{
++    struct dwc3_trb *t = in_trb(d, slot);
++    uint64_t data_dma = d->dma_device + BUFFER_OFFSET + EP_IN * EP_BUFFER_BYTES +
++                        slot * IN_SLOT_BYTES;
++    uint64_t trb_dma = d->dma_device + IN_TRB_OFFSET + slot * 64u;
++    if (bytes > IN_SLOT_BYTES || d->in_active[slot]) return -5;
++    t->bpl = (uint32_t)data_dma;
++    t->bph = (uint32_t)(data_dma >> 32);
++    t->size = bytes;
++    t->ctrl = DWC3_TRBCTL_NORMAL | DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_LST |
++              DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_IOC;
++    sync(d, in_buffer(d, slot), IN_SLOT_BYTES, DWC3_TO_DEVICE);
++    sync(d, t, 64, DWC3_TO_DEVICE);
++    if (ep_command(d, EP_IN, DWC3_DEPCMD_STARTTRANSFER,
++                   (uint32_t)(trb_dma >> 32), (uint32_t)trb_dma, 0)) return -4;
++    d->in_active[slot] = 1;
++    d->in_len[slot] = (uint16_t)bytes;
++    return 0;
++}
++static int in_complete(struct dwc3 *d, unsigned status)
++{
++    struct dwc3_trb *t;
++    unsigned slot = d->in_head, len;
++    uint32_t residual;
++    /* Endpoints complete in issue order; the head slot is the next one. */
++    if (!d->in_count || !d->in_active[slot]) return -8;
++    t = in_trb(d, slot);
++    sync(d, t, 64, DWC3_FROM_DEVICE);
++    residual = t->size & DWC3_TRB_SIZE_MASK;
++    len = d->in_len[slot];
++    d->in_active[slot] = 0;
++    d->in_head = (d->in_head + 1u) % IN_RING;
++    d->in_count--;
++    if (status & DEPEVT_STATUS_BUSERR) return -8;
++    if (DWC3_TRB_SIZE_TRBSTS(t->size) != DWC3_TRBSTS_OK) return -8;
++    /* In-order accounting assumes each slot is sent whole. A partial transfer
++     * would re-open ordering between slots, so treat it as a controller fault
++     * instead of corrupting the byte stream. */
++    if (residual) return -8;
++    d->tx_tail = (d->tx_tail + len) % TX_BYTES;
++    d->tx_used -= len;
++    d->in_outstanding -= len;
++    d->zlp_pending = len != 0 && (len % d->packet_size) == 0;
++    return 0;
++}
+ static void rx_reset(struct dwc3 *d)
+ {
+     zero(d->rx, sizeof(d->rx));
+@@ -384,7 +463,32 @@
+     /* Keep one bulk-OUT transfer armed. Completed bytes are copied into the
+      * finite RX ring by handle_event before this function rearms it. */
+     if (!d->active[EP_OUT] && transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
+-    if (!d->dtr || d->active[EP_IN]) return 0;
++    if (!d->dtr) return 0;
++    if (d->in_ring) {
++        /* Keep up to IN_RING slots in flight; the controller drains them in
++         * order while software refills from the 16 KiB tx ring. */
++        while (d->in_count < IN_RING && d->tx_used > d->in_outstanding) {
++            uint32_t copyable = d->tx_used - d->in_outstanding;
++            unsigned slot = d->in_tail;
++            n = copyable < IN_SLOT_BYTES ? copyable : IN_SLOT_BYTES;
++            for (i = 0; i < n; i++) in_buffer(d, slot)[i] = d->tx[(d->in_fetch + i) % TX_BYTES];
++            d->in_fetch = (d->in_fetch + n) % TX_BYTES;
++            d->in_outstanding += n;
++            if (in_transfer(d, slot, n)) return -4;
++            /* Accounting stays at the tail until completion, exactly like the
++             * single-TRB path; residual handling happens in in_complete(). */
++            d->in_tail = (d->in_tail + 1u) % IN_RING;
++            d->in_count++;
++        }
++        if (!d->tx_used && d->zlp_pending && !d->in_count) {
++            unsigned slot = d->in_tail;
++            if (in_transfer(d, slot, 0)) return -4;
++            d->in_tail = (d->in_tail + 1u) % IN_RING;
++            d->in_count++;
++        }
++        return 0;
++    }
++    if (d->active[EP_IN]) return 0;
+     n = d->tx_used < EP_BUFFER_BYTES ? d->tx_used : EP_BUFFER_BYTES;
+     if (!n && !d->zlp_pending) return 0;
+     for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = d->tx[(d->tx_tail + i) % TX_BYTES];
+@@ -399,7 +503,12 @@
+     if (event == DWC3_DEVT_USBRST || event == DWC3_DEVT_DISCONN) {
+         d->configured = d->dtr = d->zlp_pending = 0;
+         rx_reset(d);
+-        if (end_noncontrol(d)) return -4;
++        if (d->in_ring) {
++            /* Bus reset flushes every endpoint; drop ring state instead of
++             * issuing one ENDTRANSFER per slot. */
++            if (end_transfer(d, EP_NOTIFY)) return -4;
++            in_reset(d);
++        } else if (end_noncontrol(d)) return -4;
+         /* EP0 SETUP/STATUS have special hardware rules; only an active DATA
+          * transfer needs ENDTRANSFER before resetting the control state. */
+         if (d->control_state == CTRL_IN_ACTIVE && end_transfer(d, 1)) return -4;
+@@ -441,6 +550,7 @@
+         trace(d, DWC3_TRACE_BAD_EVENT, event, 1); return 0;
+     }
+     if (type == DWC3_DEPEVT_XFERCOMPLETE) {
++        if (d->in_ring && ep == EP_IN) return in_complete(d, status);
+         if (!d->active[ep]) return 0;
+         sync(d, trb(d, ep), 64, DWC3_FROM_DEVICE);
+         residual = trb(d, ep)->size & DWC3_TRB_SIZE_MASK;
+@@ -584,6 +694,18 @@
+     if (ret) { d->failed = ret; return ret; }
+     return (int)done;
+ }
++int dwc3_set_in_ring(struct dwc3 *d, int enable)
++{
++    if (!d || !d->initialized || d->running) return -1;
++    if (d->in_count) return -1;   /* never reconfigure mid-flight */
++    if (!enable) {
++        d->in_ring = 0;
++        return 0;
++    }
++    in_reset(d);
++    d->in_ring = 1;
++    return 0;
++}
+ size_t dwc3_queue(struct dwc3 *d, const void *bytes, size_t count)
+ {
+     const uint8_t *p = bytes;
+@@ -628,6 +750,7 @@
+     s->rx_pending = d->rx_used; s->rx_generation = d->rx_generation;
+     s->rx_overflow = d->rx_overflow;
+     for (ep = 0; ep < EP_COUNT; ep++) if (d->active[ep]) s->active_endpoints |= 1u << ep;
++    if (d->in_ring && d->in_count) s->active_endpoints |= 1u << EP_IN;
+ }
+ int dwc3_stop(struct dwc3 *d)
+ {
+@@ -638,6 +761,7 @@
+     for (ep = 0; ep < EP_COUNT; ep++) {
+         if (ep < 2 && d->control_state != CTRL_IN_ACTIVE && d->control_state != CTRL_OUT_ACTIVE)
+             continue;
++        if (ep == EP_IN && d->in_ring) { in_reset(d); continue; }
+         if (end_transfer(d, ep)) return -4;
+     }
+     wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0);
+--- a/module/usb/Dwc3.h	2026-11-22 17:24:06.000000000 +0800
++++ b/module/usb/Dwc3.h	2026-11-24 23:15:13.842140300 +0800
+@@ -61,6 +61,10 @@
+ /* Each poll is bounded to min(budget, 256) events. Call from one CPU only;
+  * no interrupts, allocation, scheduler, EFI or platform-library calls occur. */
+ int dwc3_poll(struct dwc3 *dev, unsigned int budget);
++/* Opt-in multi-TRB IN ring (8 x 512 B slots). Default off keeps the original
++ * single-TRB path; must be set after dwc3_init() and before dwc3_start().
++ * Returns 0, or -1 when the instance is absent, running or still draining. */
++int dwc3_set_in_ring(struct dwc3 *dev, int enable);
+ /* Nonblocking ring; accepts early messages before the host opens the port. */
+ size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
+ /* Nonblocking bulk-OUT receive ring. The caller must serialize this with poll
