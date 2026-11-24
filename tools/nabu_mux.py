@@ -249,8 +249,17 @@ class Sxnu1:
             return
         if session != self.session:
             return
+        # self.seq must hold "the last seq the device committed". build() adds
+        # one, so this stores `seq` VERBATIM. An earlier version stored seq+1
+        # here while build() also added one: every successful command advanced
+        # the counter by two, the next request skipped a number, and the device
+        # silently refused it (QcomUsbControl.h:516 -- a frame whose seq is not
+        # last_seq+1 is dropped without a reply). The failure looked exactly
+        # like "the device stopped answering", which cost a whole round of
+        # debugging in kdr6v: PING went out as seq=4 while the device expected
+        # 3, so the zero reply proved nothing about the wire.
         if seq >= self.seq:
-            self.seq = (seq + 1) & 0xFFFFFFFF
+            self.seq = seq
 
 
 # --------------------------------------------------------------------------

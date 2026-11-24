@@ -3607,6 +3607,40 @@ qcom_usb_debug_serial_getc(void)
     return c;
 }
 
+/* nabu (0023): hand the wire back to the SXNU1 console after a host resume.
+ *
+ * kdp_rx_armed was documented as "only ever set (never cleared), which is fine,
+ * because the kernel is in the debugger from then on". That premise died once
+ * resume started working: the kernel returns to normal operation with the flag
+ * still set, so control_service() is never called again and the console stays
+ * dead for the rest of the boot (measured on kdr6v/kdr6w/kdr6x -- HELLO went
+ * out with seq 0, which cannot be a sequence rejection, and still got no reply
+ * while the kernel was printing megabytes of spawn logs).
+ *
+ * Clearing the flag is only half of it: the KDP ring may hold the tail of a
+ * frame, and kdp_unserialize_packet() may be parked mid-frame. A lone 0xFB is
+ * the documented unconditional resync for the latter (see KDPPUSH above: in
+ * DS_READING it returns to DS_WAITSTART, in DS_WAITSTART it is ignored), so
+ * push one, then drop everything.
+ *
+ * Called from debug.c after the debugger has fully unwound. Calling it earlier
+ * would feed leftover KDP bytes to control_service() while the parser is still
+ * in the debugger's stack frame -- that is the _control_handle_frame+0x593c
+ * four-level panic recorded at the control_service() call site below. */
+void
+nabu_kdp_release_wire(void)
+{
+    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
+        return;
+    (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
+    while (kdp_rx_used != 0) {
+        uint8_t drop;
+        if (!kdp_rx_pop(&drop))
+            break;
+    }
+    __atomic_store_n(&kdp_rx_armed, 0u, __ATOMIC_RELEASE);
+}
+
 /* One bounded drain of the DWC3 RX ring.  Master CPU only, same constraint as
  * dwc3_poll()/dwc3_read().  Shared by the worker and by the pe_serial receive
  * path so KDP does not have to wait for the next 5 ms worker tick. */
