@@ -13,7 +13,19 @@
 #define SXNU_CONTROL_FRAME_BYTES 128u
 #define SXNU_CONTROL_LINE_BYTES 127u
 #define SXNU_CONTROL_REPLY_BYTES 512u
-#define SXNU_CONTROL_WORK_BYTES 256u
+/* How many bytes one drain moves from the controller into the consumers.
+ *
+ * This was 256, and 256 was the throughput ceiling -- not the USB link. The
+ * link negotiates High Speed (DSTS.CONNECTSPD reads 0 on this board, twice
+ * reproduced; 4.096 MB/s at the current descriptor's single 512-byte
+ * transaction per microframe), yet a 1 KiB KDP reply needed four drains, and
+ * one drain is one worker tick. Measured 13.4 ms per 1 KiB packet = 2.7 ticks
+ * per packet = 51.5 KB/s.
+ *
+ * At 1024 a whole KDP max_bytes packet moves in one drain. Both consumers size
+ * their staging buffer from this constant (rx[]/text[] in QcomXnuUsbDebug.c,
+ * net_pass[] in QcomKdpNet.c), so they follow automatically. */
+#define SXNU_CONTROL_WORK_BYTES 1024u
 #define SXNU_CONTROL_SESSION_HEX 16u
 #define SXNU_CONTROL_SEQ_HEX 8u
 #define SXNU_CONTROL_CRC_HEX 8u

@@ -242,7 +242,10 @@ test_reply_and_budget(void)
     uint64_t parsed_crc;
 
     assert(SXNU_CONTROL_FRAME_BYTES == 128u && SXNU_CONTROL_REPLY_BYTES == 512u);
-    assert(SXNU_CONTROL_WORK_BYTES == 256u);
+    /* Grown from 256 so one KDP max_bytes packet fits inside a single drain.
+     * The assertion is here to keep the drain-time staging buffers (rx[]/text[]
+     * in QcomXnuUsbDebug.c, net_pass[] in QcomKdpNet.c) in step with it. */
+    assert(SXNU_CONTROL_WORK_BYTES == 1024u);
     sxnu_control_writer_init(&writer, reply, sizeof(reply));
     assert(sxnu_control_reply_start(&writer, UINT64_C(0x1122334455667788), 3u,
                                     SXNU_CONTROL_VERB_STATUS, "OK"));

@@ -1084,10 +1084,18 @@ static int poll_owned(void)
      *
      * 64 is still bounded (dwc3_poll clamps at 256) and every event it handles
      * is the same work a single event was: rearm an endpoint or copy a
-     * completed transfer. Outside the debugger budget stays at 1, where the
-     * worker's 5 ms tick provides the pacing and a large budget would just add
-     * latency under the USB lock. */
-    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ? 64u : 1u);
+     * completed transfer.
+     *
+     * Outside the debugger the budget used to be 1, on the theory that the 5 ms
+     * tick paced the worker and a larger budget only added latency under the USB
+     * lock. That was wrong in a way the throughput measurement showed: a 1 KiB
+     * reply is one tx chunk but arrives as several IN transfers, and with
+     * budget=1 a single poll retires one event, so the next pump() still saw
+     * active[EP_IN] set and had to wait for the following tick. Measured 2.7
+     * ticks per 1 KiB packet. 8 lets one poll both retire the completions and
+     * start the next transfer, which is what makes the whole packet move in one
+     * tick. It stays far below the 256 clamp. */
+    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ? 64u : 8u);
     native.status.poll_calls++;
     native.status.last_poll_events = ret < 0 ? 0u : (uint32_t)ret;
     buffer_status_owned();
