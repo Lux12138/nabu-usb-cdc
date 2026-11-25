@@ -265,7 +265,42 @@ qud_diag_read_phys_anno(uint64_t pa, void *dst, size_t len, int anno)
         text[at++] = '\n';
         (void)qcom_usb_debug_write(text, at);
     }
-    memcpy(dst, (const void *)(va + off), len);
+    /* nabu 2026-11-25 (§43): volatile element-wise copy, not memcpy.
+     *
+     * memcpy on device memory has no volatile semantics: the compiler is free
+     * to vectorise it (ldp/ldnp/ldr q), split it, or hoist it above the dsb, and
+     * GPU registers require strictly 32-bit accesses -- a wide load reads the
+     * neighbouring register and splices a value that was never in the hardware.
+     * Measured: `readpa 0x02c000e0 4` reported 0xc2e3d013 while the driver's own
+     * mapping returned the correct 0x13d0e3c2 for the same physical address, and
+     * four rounds of kernel-side reasoning were built on that bogus value.
+     *
+     * Copy by the widest naturally aligned type that does not straddle the
+     * request, reading each unit through a volatile pointer so the compiler
+     * cannot merge or reorder them. `len` is at most QUD_DIAG_CHUNK and the
+     * whitelist keeps ranges inside one device window, so this stays cheap.
+     *
+     * ⚠️ BOTH pointers must be alignment-checked. The first version only checked
+     * `src` and then stored through `*(uint32_t *)out`; `dst` is a byte array on
+     * the caller's stack (QcomUsbDiag.c:694 `uint8_t scratch[QUD_DIAG_CHUNK]`),
+     * which has no alignment guarantee, so an unaligned 32-bit store took an
+     * alignment fault on arm64 and wedged the USB worker mid-boot (kdpr12).
+     * Fall back to byte access unless both sides are aligned. */
+    {
+        uintptr_t src = va + off;
+        uintptr_t dsta = (uintptr_t)dst;
+        size_t left = len;
+        __asm__ volatile("dsb sy" ::: "memory");
+        while (left) {
+            if (!(src & 3u) && !(dsta & 3u) && left >= 4u) {
+                *(volatile uint32_t *)dsta = *(volatile uint32_t *)src;
+                src += 4u; dsta += 4u; left -= 4u;
+            } else {
+                *(volatile uint8_t *)dsta = *(volatile uint8_t *)src;
+                src += 1u; dsta += 1u; left -= 1u;
+            }
+        }
+    }
     __asm__ volatile("dsb sy" ::: "memory");
     /* XNU never calls ml_io_unmap: device mappings from ml_io_map are
        permanent (all XNU callers keep them). Unmapping panics vm_map_delete

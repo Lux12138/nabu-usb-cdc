@@ -655,6 +655,43 @@ class KdpSession:
         return self._read_chunked(KDP_READPHYSMEM64, address, length,
                                   tail=struct.pack("<H", lcpu & 0xFFFF))
 
+    def _write_chunked(self, verb: int, address: int, data: bytes,
+                       tail: bytes = b"") -> int:
+        """Write `data` in MAX_KDP_DATA_SIZE chunks.  Returns bytes accepted.
+
+        A chunk that the kernel rejects leaves the remaining bytes unwritten;
+        the returned count tells the caller exactly how far it got, which is
+        what a hot patch needs to report (a half-applied patch is a reboot).
+        """
+        offset = 0
+        while offset < len(data):
+            n = min(MAX_KDP_DATA_SIZE, len(data) - offset)
+            chunk = data[offset:offset + n]
+            body = (struct.pack("<Q", (address + offset) & 0xFFFFFFFFFFFFFFFF)
+                    + struct.pack("<I", n) + tail + chunk)
+            reply = self._reply(verb, body)
+            if reply.error != KDPERR_NO_ERROR:
+                raise KdpProtocolError(
+                    f"{REQUEST_NAMES.get(verb, verb)} error at "
+                    f"0x{address + offset:x}: {reply.error_name}"
+                )
+            offset += n
+        return offset
+
+    def writemem64(self, address: int, data: bytes) -> int:
+        """KDP_WRITEMEM64 (64-bit virtual address).
+
+        The kernel's handler runs `flush_dcache64` + `invalidate_icache64`
+        after every fragment (see MEMORY §179), so patched instructions take
+        effect immediately without a reboot.
+        """
+        return self._write_chunked(KDP_WRITEMEM64, address, bytes(data))
+
+    def writephys64(self, address: int, data: bytes, lcpu: int = 0) -> int:
+        """KDP_WRITEPHYSMEM64 (64-bit physical address)."""
+        return self._write_chunked(KDP_WRITEPHYSMEM64, address, bytes(data),
+                                   tail=struct.pack("<H", lcpu & 0xFFFF))
+
     # -- registers -------------------------------------------------------
     def readregs(self, cpu: int = 0, flavor: int = ARM_THREAD_STATE64) -> dict:
         """KDP_READREGS.  Returns a dict for AArch64 thread state."""
@@ -676,6 +713,31 @@ class KdpSession:
             regs.update({f"x{i}": x[i] for i in range(29)})
             return regs
         return {"flavor": flavor, "raw": data}
+
+    def writeregs(self, regs: dict, cpu: int = 0,
+                  flavor: int = ARM_THREAD_STATE64) -> None:
+        """KDP_WRITEREGS.  Accepts the dict shape readregs() returns."""
+        if flavor != ARM_THREAD_STATE64:
+            raise KdpProtocolError("writeregs only supports ARM_THREAD_STATE64")
+        x = list(regs.get("x", [0] * 29))
+        if len(x) != 29:
+            raise KdpProtocolError(f"x[] must have 29 entries, got {len(x)}")
+        blob = struct.pack("<29Q", *[v & 0xFFFFFFFFFFFFFFFF for v in x])
+        blob += struct.pack("<4Q",
+                            regs.get("fp", 0) & 0xFFFFFFFFFFFFFFFF,
+                            regs.get("lr", 0) & 0xFFFFFFFFFFFFFFFF,
+                            regs.get("sp", 0) & 0xFFFFFFFFFFFFFFFF,
+                            regs.get("pc", 0) & 0xFFFFFFFFFFFFFFFF)
+        blob += struct.pack("<2I", regs.get("cpsr", 0) & 0xFFFFFFFF,
+                            regs.get("flags", 0) & 0xFFFFFFFF)
+        if len(blob) != ARM_THREAD_STATE64_SIZE:
+            raise KdpProtocolError(
+                f"THREAD_STATE64 packing produced {len(blob)}, "
+                f"expected {ARM_THREAD_STATE64_SIZE}")
+        body = struct.pack("<II", cpu & 0xFFFFFFFF, flavor & 0xFFFFFFFF) + blob
+        reply = self._reply(KDP_WRITEREGS, body)
+        if reply.error != KDPERR_NO_ERROR:
+            raise KdpProtocolError(f"WRITEREGS error: {reply.error_name}")
 
     # -- execution control ----------------------------------------------
     def resume(self, cpu_mask: int = 0xFFFFFFFF) -> KdpReply:

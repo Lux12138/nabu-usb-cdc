@@ -144,6 +144,15 @@ static volatile unsigned int control_reboot_taken, control_reboot_armed;
 static volatile uint32_t control_rejected, control_reply_count, control_failures;
 static volatile uint32_t control_reboot_seq, control_reboot_generation;
 static volatile uint64_t control_reboot_session;
+/* T80: an ack that could not be queued is not the same as a request the parser
+ * rejected. Count both separately so STATUS can distinguish "HELLO answered,
+ * REBOOT silent" (rl=) from a sequence rejection (rej=). */
+static volatile uint32_t control_reply_lost;
+/* T80: KDP teardown state. kdp_gen_* track the bus generation the armed session
+ * started on; kdp_empty_drains counts consecutive drain calls that returned no
+ * bytes while armed. Both feed the optional channel-death degrade. */
+static volatile uint32_t kdp_release_resyncs, kdp_death_count, kdp_generation_changes;
+static uint32_t kdp_gen_seen, kdp_gen_valid, kdp_empty_drains;
 
 static void platform_smc_reset(void) __attribute__((noreturn));
 /* PSCI SYSTEM_RESET for the control REBOOT path. reboot_kernel() stalls
@@ -1247,7 +1256,15 @@ static size_t control_reply_status(char *reply, size_t capacity,
         !sxnu_control_writer_text(&writer, " gen=") ||
         !sxnu_control_writer_decimal(&writer, status->rx_generation) ||
         !sxnu_control_writer_text(&writer, " rej=") ||
-        !sxnu_control_writer_decimal(&writer, status->control_rejected)) return 0;
+        !sxnu_control_writer_decimal(&writer, status->control_rejected) ||
+        !sxnu_control_writer_text(&writer, " rl=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&control_reply_lost, __ATOMIC_RELAXED)) ||
+        !sxnu_control_writer_text(&writer, " krs=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_release_resyncs, __ATOMIC_RELAXED)) ||
+        !sxnu_control_writer_text(&writer, " kdd=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_death_count, __ATOMIC_RELAXED)) ||
+        !sxnu_control_writer_text(&writer, " kgen=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_generation_changes, __ATOMIC_RELAXED))) return 0;
     return sxnu_control_reply_finish(&writer);
 }
 static size_t control_reply_reboot(char *reply, size_t capacity,
@@ -2415,7 +2432,12 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             reply_bytes = sxnu_control_reply_finish(&writer);
         }
         /* Arm only now: the trap is next, so the byte storms that would have
-         * consumed the ring (keyboard poll, video console poll) cannot run. */
+         * consumed the ring (keyboard poll, video console poll) cannot run.
+         * T80: remember which bus generation this session belongs to; the
+         * drain-time channel-death check compares later generations against it. */
+        kdp_gen_seen = generation;
+        kdp_gen_valid = 1;
+        kdp_empty_drains = 0;
         __atomic_store_n(&kdp_rx_armed, 1u, __ATOMIC_RELEASE);
         Debugger("qcom_usb_debug");
 debugger_done:
@@ -3153,6 +3175,14 @@ debugger_done:
         return;
     }
     queued = control_reply_queue(reply, reply_bytes) == reply_bytes;
+    /* T80: an ack lost to a full TX ring is not a parser rejection. Count it so
+     * STATUS can tell the two apart (rl= vs rej=). Behaviour is unchanged: the
+     * REBOOT path is fire-and-forget by design -- the reset happens even when
+     * the OK frame never reaches the wire (measured 2026-11-25: REBOOT seq=9
+     * unanswered, device in recovery at +5 min), so there is nothing to retry
+     * here. */
+    if (!queued)
+        (void)__atomic_add_fetch(&control_reply_lost, 1u, __ATOMIC_RELAXED);
     if (!queued || !sxnu_control_commit(&usb_control_context.state, frame, accepted)) {
         (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
         return;
@@ -3607,6 +3637,94 @@ qcom_usb_debug_serial_getc(void)
     return c;
 }
 
+/* ---- T80: deterministic KDP session teardown --------------------------------
+ *
+ * Both mechanisms are opt-in through boot-args. With neither present the code
+ * below takes exactly the pre-T80 path, so an unmodified boot-arg set behaves
+ * bit-for-bit as before:
+ *
+ *   nabu-kdp-release-resync=1   release_wire() leaves one 0xFB in kdp_rx
+ *   nabu-kdp-death-reset=<sec>  degrade an armed session after <sec> of RX
+ *                               silence, or at once on a bus generation change
+ *                               (0/absent = off, recommended 60)
+ */
+
+static uint32_t
+kdp_release_resync_enabled(void)
+{
+    static uint32_t cached = 0;      /* 0 = unevaluated, 1 = off, 2 = on */
+    uint32_t value = 0;
+    if (!cached)
+        cached = (PE_parse_boot_argn("nabu-kdp-release-resync", &value, sizeof(value)) &&
+                  value == 1) ? 2u : 1u;
+    return cached - 1u;
+}
+
+static uint32_t
+kdp_death_reset_seconds(void)
+{
+    static uint32_t cached = 0;      /* 0 = unevaluated; stored as seconds + 1 */
+    uint32_t seconds = 0;
+    if (!cached) {
+        if (PE_parse_boot_argn("nabu-kdp-death-reset", &seconds, sizeof(seconds)) && seconds) {
+            if (seconds > 3600u) seconds = 3600u;
+            cached = seconds + 1u;
+        } else {
+            cached = 1u;
+        }
+    }
+    return cached - 1u;
+}
+
+/* Evaluate the channel-death criteria. Called from serial_rx_drain(), where
+ * generation and rx_count were just observed under the USB lock. Returns 1
+ * only while armed and only when nabu-kdp-death-reset is non-zero. */
+static uint32_t
+kdp_channel_death_check(uint32_t generation, uint32_t rx_count)
+{
+    uint32_t seconds;
+    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
+    seconds = kdp_death_reset_seconds();
+    if (!seconds) return 0;
+    if (!kdp_gen_valid) {
+        kdp_gen_seen = generation;
+        kdp_gen_valid = 1;
+    } else if (generation != kdp_gen_seen) {
+        /* Bus reset / re-enumeration: whichever peer owned this session is gone.
+         * A half frame from before the reset cannot be completed by bytes from
+         * after it, so the session must not stay armed. */
+        (void)__atomic_add_fetch(&kdp_generation_changes, 1u, __ATOMIC_RELAXED);
+        return 1;
+    }
+    if (rx_count != 0) {
+        kdp_empty_drains = 0;
+        return 0;
+    }
+    /* No bytes since the previous drain. The 5 ms worker tick is the slowest
+     * cadence this counter sees (the debugger poll is ~3 ms), so 200 drains
+     * per requested second is a conservative lower bound on elapsed time. */
+    if (++kdp_empty_drains >= seconds * 200u) return 1;
+    return 0;
+}
+
+/* Tear the armed session down: drop residual ring bytes, optionally leave the
+ * 0xFB resync for the next entry, then clear the latch. usb_serial_rx_kdp is
+ * cleared too -- a half frame left open when the peer vanished would otherwise
+ * keep swallowing later console text into usb_serial_rx. */
+static void
+kdp_channel_degrade(void)
+{
+    while (kdp_rx_used != 0) {
+        uint8_t drop;
+        if (!kdp_rx_pop(&drop)) break;
+    }
+    if (kdp_release_resync_enabled())
+        (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
+    usb_serial_rx_kdp = 0;
+    __atomic_store_n(&kdp_rx_armed, 0u, __ATOMIC_RELEASE);
+    (void)__atomic_add_fetch(&kdp_death_count, 1u, __ATOMIC_RELAXED);
+}
+
 /* nabu (0023): hand the wire back to the SXNU1 console after a host resume.
  *
  * kdp_rx_armed was documented as "only ever set (never cleared), which is fine,
@@ -3620,8 +3738,15 @@ qcom_usb_debug_serial_getc(void)
  * Clearing the flag is only half of it: the KDP ring may hold the tail of a
  * frame, and kdp_unserialize_packet() may be parked mid-frame. A lone 0xFB is
  * the documented unconditional resync for the latter (see KDPPUSH above: in
- * DS_READING it returns to DS_WAITSTART, in DS_WAITSTART it is ignored), so
- * push one, then drop everything.
+ * DS_READING it returns to DS_WAITSTART, in DS_WAITSTART it is ignored).
+ *
+ * The historical code pushed 0xFB and then drained the whole ring in the same
+ * function, so the byte it claimed to inject was thrown away before any
+ * consumer could see it -- the resync was dead code and a half frame survived
+ * into the next session. T80 keeps the push but does NOT drain it when
+ * nabu-kdp-release-resync=1: the next DEBUGGER verb arms the ring again and
+ * kdp_getc() reads the 0xFB first, resetting dsState before the fresh CONNECT.
+ * Default (boot-arg absent) keeps the old push-and-drain, i.e. no change.
  *
  * Called from debug.c after the debugger has fully unwound. Calling it earlier
  * would feed leftover KDP bytes to control_service() while the parser is still
@@ -3632,11 +3757,21 @@ nabu_kdp_release_wire(void)
 {
     if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
         return;
-    (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
-    while (kdp_rx_used != 0) {
-        uint8_t drop;
-        if (!kdp_rx_pop(&drop))
-            break;
+    if (kdp_release_resync_enabled()) {
+        while (kdp_rx_used != 0) {
+            uint8_t drop;
+            if (!kdp_rx_pop(&drop))
+                break;
+        }
+        (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
+        (void)__atomic_add_fetch(&kdp_release_resyncs, 1u, __ATOMIC_RELAXED);
+    } else {
+        (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
+        while (kdp_rx_used != 0) {
+            uint8_t drop;
+            if (!kdp_rx_pop(&drop))
+                break;
+        }
     }
     __atomic_store_n(&kdp_rx_armed, 0u, __ATOMIC_RELEASE);
 }
@@ -3665,6 +3800,7 @@ serial_rx_drain(void)
     size_t wire_count = rx_count;
     const uint8_t *wire = rx;
     int observed = 0;
+    int suppress_control = 0;
 
     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return;
     (void)poll_owned();
@@ -3677,6 +3813,16 @@ serial_rx_drain(void)
     }
     release(flags);
     if (!observed) return;
+
+    /* T80: optional channel-death degrade (nabu-kdp-death-reset). Evaluated
+     * before any routing, so the chunk that carries the death signal is never
+     * handed to control_service(). After the degrade the ring is empty and the
+     * latch is clear, so the armed guards below simply take their normal
+     * disarmed paths on this and every later chunk. */
+    if (kdp_channel_death_check(generation, (uint32_t)rx_count)) {
+        kdp_channel_degrade();
+        suppress_control = 1;
+    }
 
     /* nabu: net mode extracts KDPF frames from this chunk; with the boot-arg
      * off wire==rx and wire_count==rx_count, so routing below is unchanged. */
@@ -3728,11 +3874,12 @@ serial_rx_drain(void)
          *
          * The console ring above keeps its copy of every byte, so nothing that
          * used to work stops working; the control parser simply must not see
-         * traffic that belongs to the debugger. Note that kdp_rx_armed is only
-         * ever set (never cleared), so this suppression lasts for the rest of
-         * the boot once a DEBUGGER verb has run -- which is fine, because the
-         * kernel is in the debugger from then on. */
-        if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
+         * traffic that belongs to the debugger. kdp_rx_armed is cleared by
+         * nabu_kdp_release_wire() on a clean resume and by the T80
+         * channel-death degrade above, so the suppression ends there and not
+         * (as originally assumed) at the end of the boot. suppress_control
+         * covers exactly the chunk that triggered a degrade. */
+        if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) && !suppress_control)
             control_service(text, text_count, generation, &status);
     }
 }

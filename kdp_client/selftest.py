@@ -33,6 +33,9 @@ from kdp_proto import (
     KDP_READREGS,
     KDP_RESUMECPUS,
     KDP_VERSION_VERB,
+    KDP_WRITEMEM64,
+    KDP_WRITEPHYSMEM64,
+    KDP_WRITEREGS,
     KDPERR_NO_ERROR,
     MAX_KDP_DATA_SIZE,
     KdpSession,
@@ -63,6 +66,7 @@ class FakeKernel:
         self.saved_reply = None
         self.requests_seen = []        # (request, seq) in arrival order
         self.breakpoints = set()
+        self.written_thread_state = None
         self.drop_requests = drop_requests
         self.exception_pending = False
         self.exception_acks = 0
@@ -182,12 +186,24 @@ class FakeKernel:
             return self._read_memory(self.vmem, body)
         if req == KDP_READPHYSMEM64:
             return self._read_memory(self.pmem, body)
+        if req == KDP_WRITEMEM64:
+            return self._write_memory(self.vmem, body)
+        if req == KDP_WRITEPHYSMEM64:
+            return self._write_memory(self.pmem, body)
         if req == KDP_READREGS:
             cpu, flavor = struct.unpack_from("<II", body, 0)
             if flavor != kdp_proto.ARM_THREAD_STATE64:
                 return struct.pack("<I", kdp_proto.KDPERR_BADFLAVOR)
             state = self._fake_thread_state(cpu)
             return struct.pack("<I", KDPERR_NO_ERROR) + state
+        if req == KDP_WRITEREGS:
+            cpu, flavor = struct.unpack_from("<II", body, 0)
+            if flavor != kdp_proto.ARM_THREAD_STATE64:
+                return struct.pack("<I", kdp_proto.KDPERR_BADFLAVOR)
+            if len(body) - 8 < ARM_THREAD_STATE64_SIZE:
+                return struct.pack("<I", kdp_proto.KDPERR_BADFLAVOR)
+            self.written_thread_state = bytes(body[8:8 + ARM_THREAD_STATE64_SIZE])
+            return struct.pack("<I", KDPERR_NO_ERROR)
         if req == KDP_BREAKPOINT64_SET:
             addr = struct.unpack_from("<Q", body, 0)[0]
             if addr in self.breakpoints:
@@ -209,6 +225,21 @@ class FakeKernel:
             self.exception_seq = 0
             self.conn_seq = 0
             return b""
+        return struct.pack("<I", KDPERR_NO_ERROR)
+
+    def _write_memory(self, mem: bytearray, body: bytes) -> bytes:
+        addr, nbytes = struct.unpack_from("<QI", body, 0)
+        if nbytes > MAX_KDP_DATA_SIZE:
+            return struct.pack("<I", kdp_proto.KDPERR_BAD_NBYTES)
+        addr &= 0xFFFFFFFFFFFFFFFF
+        data = body[12:12 + nbytes]
+        if len(data) != nbytes:
+            return struct.pack("<I", kdp_proto.KDPERR_BAD_NBYTES)
+        if addr + nbytes > len(mem):
+            # Like the real kdp_machine_vm_write, a fault leaves the bytes
+            # unwritten and still reports NO_ERROR.
+            return struct.pack("<I", KDPERR_NO_ERROR)
+        mem[addr:addr + nbytes] = data
         return struct.pack("<I", KDPERR_NO_ERROR)
 
     def _read_memory(self, mem: bytearray, body: bytes) -> bytes:
@@ -401,6 +432,63 @@ def test_readphys() -> None:
     assert data == bytes(k.pmem[0x10000:0x10000 + 2048])
 
 
+def test_writemem_roundtrip() -> None:
+    """The hot patch path: write, then read back what the kernel stored."""
+    k = FakeKernel()
+    s = _make_session(k)
+    s.connect()
+    addr = 0x2000
+    payload = bytes.fromhex("1f2003d5" "c0035fd6")   # nop ; ret
+    n = s.writemem64(addr, payload)
+    assert n == len(payload), f"wrote {n} of {len(payload)}"
+    assert bytes(k.vmem[addr:addr + len(payload)]) == payload
+    # One CONNECT + one WRITEMEM64.
+    assert [req for req, _ in k.requests_seen] == [KDP_CONNECT, KDP_WRITEMEM64]
+    # And it reads back through the normal read path.
+    assert s.readmem64(addr, len(payload)) == payload
+
+
+def test_writemem_fragmented() -> None:
+    """Longer than MAX_KDP_DATA_SIZE must be split, in order, no gaps."""
+    k = FakeKernel()
+    s = _make_session(k)
+    s.connect()
+    total = MAX_KDP_DATA_SIZE * 2 + 100
+    payload = bytes((i * 3 + 5) & 0xFF for i in range(total))
+    n = s.writemem64(0x4000, payload)
+    assert n == total
+    assert bytes(k.vmem[0x4000:0x4000 + total]) == payload, "fragmented write mismatched"
+    writes = [req for req, _ in k.requests_seen if req == KDP_WRITEMEM64]
+    assert len(writes) == 3, f"expected 3 fragments, got {len(writes)}"
+
+
+def test_writemem_rejects_oversize() -> None:
+    """A single fragment above MAX_KDP_DATA_SIZE must be refused by the mock,
+    proving our chunker never sends one."""
+    k = FakeKernel()
+    s = _make_session(k)
+    s.connect()
+    # 2 * MAX + 1 forces a final 1-byte fragment; none may exceed the limit.
+    payload = b"\xAA" * (MAX_KDP_DATA_SIZE * 2 + 1)
+    s.writemem64(0x8000, payload)
+    assert bytes(k.vmem[0x8000:0x8000 + len(payload)]) == payload
+
+
+def test_writeregs_roundtrip() -> None:
+    k = FakeKernel()
+    s = _make_session(k)
+    s.connect()
+    regs = s.readregs(cpu=0, flavor=kdp_proto.ARM_THREAD_STATE64)
+    regs["pc"] = 0xDEADBEEF
+    regs["sp"] = 0xCAFEBABE
+    s.writeregs(regs, cpu=0, flavor=kdp_proto.ARM_THREAD_STATE64)
+    assert k.written_thread_state is not None
+    pc = struct.unpack_from("<Q", k.written_thread_state, 29 * 8 + 24)[0]
+    sp = struct.unpack_from("<Q", k.written_thread_state, 29 * 8 + 16)[0]
+    assert pc == 0xDEADBEEF, f"pc roundtrip failed: 0x{pc:x}"
+    assert sp == 0xCAFEBABE, f"sp roundtrip failed: 0x{sp:x}"
+
+
 def test_async_exception() -> None:
     k = FakeKernel()
     s = _make_session(k)
@@ -540,6 +628,10 @@ TESTS = [
     test_connect_and_seq,
     test_fragmented_read,
     test_readphys,
+    test_writemem_roundtrip,
+    test_writemem_fragmented,
+    test_writemem_rejects_oversize,
+    test_writeregs_roundtrip,
     test_async_exception,
     test_retransmit,
     test_readregs,

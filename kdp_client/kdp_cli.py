@@ -276,6 +276,85 @@ def cmd_readphys(sess, args, state):
     return 0
 
 
+def cmd_writemem(sess, args, state):
+    """KDP_WRITEMEM64.  The kernel flushes D-cache and invalidates I-cache
+    after every fragment (MEMORY §179), so patched instructions run at once."""
+    _ensure_session(sess, state, args.fresh)
+    addr = parse_int(args.addr)
+    if args.hexdata:
+        data = bytes.fromhex(args.hexdata.replace(" ", "").replace("_", ""))
+    else:
+        with open(args.file, "rb") as f:
+            data = f.read()
+    if not data:
+        print("[cli] writemem: empty payload", file=sys.stderr)
+        return 2
+    n = sess.writemem64(addr, data)
+    print(f"wrote {n} byte(s) to 0x{addr:x}")
+    save_session(_state_from(sess))
+    return 0
+
+
+def cmd_patch(sess, args, state):
+    """Read the original bytes, save them, then write the patch.
+
+    Reading first is not optional: kdp_machine_vm_read does no cache
+    maintenance, so a read *after* the write can return stale data.  The
+    backup file is what makes the patch reversible without a reboot.
+    """
+    _ensure_session(sess, state, args.fresh)
+    addr = parse_int(args.addr)
+    if args.hexdata:
+        new = bytes.fromhex(args.hexdata.replace(" ", "").replace("_", ""))
+    else:
+        with open(args.file, "rb") as f:
+            new = f.read()
+    if not new:
+        print("[cli] patch: empty payload", file=sys.stderr)
+        return 2
+    old = sess.readmem64(addr, len(new))
+    if args.save:
+        with open(args.save, "wb") as f:
+            f.write(old)
+        print(f"saved {len(old)} original byte(s) to {args.save}")
+    print(f"old @ 0x{addr:x}: {old.hex()}")
+    print(f"new @ 0x{addr:x}: {new.hex()}")
+    if args.dry_run:
+        print("(dry run: nothing written)")
+        save_session(_state_from(sess))
+        return 0
+    n = sess.writemem64(addr, new)
+    print(f"wrote {n} byte(s) to 0x{addr:x} (flush_dcache + invalidate_icache done in-kernel)")
+    save_session(_state_from(sess))
+    return 0
+
+
+def cmd_writeregs(sess, args, state):
+    _ensure_session(sess, state, args.fresh)
+    regs = sess.readregs(cpu=args.cpu, flavor=args.flavor)
+    if "x" not in regs:
+        print("[cli] writeregs: unsupported flavor", file=sys.stderr)
+        return 2
+    if args.pc is not None:
+        regs["pc"] = parse_int(args.pc)
+    if args.sp is not None:
+        regs["sp"] = parse_int(args.sp)
+    if args.lr is not None:
+        regs["lr"] = parse_int(args.lr)
+    for item in args.set or []:
+        name, _, value = item.partition("=")
+        key = name.strip().lower()
+        if not key:
+            print(f"[cli] writeregs: bad --set {item!r}", file=sys.stderr)
+            return 2
+        regs[key] = parse_int(value.strip())
+    sess.writeregs(regs, cpu=args.cpu, flavor=args.flavor)
+    print(f"wrote thread state for cpu {args.cpu} "
+          f"(pc=0x{regs['pc']:016x} sp=0x{regs['sp']:016x})")
+    save_session(_state_from(sess))
+    return 0
+
+
 def cmd_readregs(sess, args, state):
     _ensure_session(sess, state, args.fresh)
     regs = sess.readregs(cpu=args.cpu, flavor=args.flavor)
@@ -434,6 +513,40 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--flavor", type=int, default=ARM_THREAD_STATE64,
                     help="register flavor (default 6 = ARM_THREAD_STATE64)")
 
+    def add_write_src(sp):
+        g = sp.add_mutually_exclusive_group(required=True)
+        g.add_argument("--hexdata", help="payload as hex, e.g. 1f2003d5")
+        g.add_argument("--file", help="read payload from this file")
+
+    sp = sub.add_parser("writemem",
+                        help="KDP_WRITEMEM64 (flushes D-cache + invalidates I-cache)")
+    sp.add_argument("addr", help="address (hex or decimal)")
+    add_write_src(sp)
+    sp.add_argument("--fresh", action="store_true",
+                    help="ignore the persisted session and force a new CONNECT")
+
+    sp = sub.add_parser("patch",
+                        help="read original, save it, then write (hot patch)")
+    sp.add_argument("addr", help="address (hex or decimal)")
+    add_write_src(sp)
+    sp.add_argument("--save", help="write the original bytes here for rollback")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show old/new but write nothing")
+    sp.add_argument("--fresh", action="store_true",
+                    help="ignore the persisted session and force a new CONNECT")
+
+    sp = sub.add_parser("writeregs", help="KDP_WRITEREGS (AArch64 thread state)")
+    sp.add_argument("--cpu", type=int, default=0, help="CPU number (default 0)")
+    sp.add_argument("--flavor", type=int, default=ARM_THREAD_STATE64,
+                    help="register flavor (default 6 = ARM_THREAD_STATE64)")
+    sp.add_argument("--pc", help="program counter (hex or decimal)")
+    sp.add_argument("--sp", help="stack pointer (hex or decimal)")
+    sp.add_argument("--lr", help="link register (hex or decimal)")
+    sp.add_argument("--set", action="append", metavar="REG=VAL",
+                    help="set one register, repeatable (x0=.., x1=.., cpsr=..)")
+    sp.add_argument("--fresh", action="store_true",
+                    help="ignore the persisted session and force a new CONNECT")
+
     sp = sub.add_parser("resume", help="KDP_RESUMECPUS")
     sp.add_argument("--mask", type=lambda s: parse_int(s), default=0xFFFFFFFF,
                     help="CPU mask (default 0xffffffff)")
@@ -527,6 +640,9 @@ def main(argv=None) -> int:
         "readmem": cmd_readmem,
         "readphys": cmd_readphys,
         "readregs": cmd_readregs,
+        "writemem": cmd_writemem,
+        "writeregs": cmd_writeregs,
+        "patch": cmd_patch,
         "resume": cmd_resume,
         "suspend": cmd_suspend,
         "bpadd": cmd_bpadd,

@@ -8,7 +8,7 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ---
 
-## 现在的状态（2026-11-24 23:50）
+## 现在的状态（2026-11-25 16:00）
 
 **48 个设备端命令 + 15 条主机侧命令 + KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
 
@@ -46,9 +46,39 @@ tools/kdp.sh cli --fresh connect
 1. **`--cdc-framing` 必须匹配设备侧**：本模块（`nabu-kdp-net=1`）用 `kdpf`，
    旧 serial KDP 用 `serial`。用错时网桥在发帧、设备零回应，极难自查。
 2. **`debug=` 不能带 `0x200`**（`DB_KDP_GETC_ENA` 会让 `kdp_getc()` 逐字节吃掉帧）。
-3. **arm64 上 KDP 会话不能返回内核** —— 每次会话结束仍需断电重启。
+3. **KDP 会话可以干净返回内核**（0022+0023 已实证）——
+   用 **stdin 异步喂 lldb 命令**，不要用 `-o/--batch`：
+   ```bash
+   printf 'target create <kernel>\nprocess connect --plugin kdp-remote udp://<host>:41139\nprocess continue\nquit\n' | lldb
+   ```
+   `-o/--batch` 会被 Driver 同步驱动（`Driver.cpp:546-547`），
+   `process continue` 走 `ResumeSynchronous()->WaitForProcessToStop(nullopt)` 无限等；
+   stdin 路径实测 **5 秒**返回、`lldb exit=0`，不要 `kill -9`。
 
 完整用法、帧格式、构建步骤见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)。
+
+### T80：KDP 会话清理（半死状态可软件恢复）
+
+**问题**：调试端死亡（`kill -9 lldb` / 进程退出）时，设备侧 `kdp_rx_armed` 永久卡 1，
+SXNU1 控制台沉默，历史上只能断电。根因有两条：
+- `release_wire()` 里 `0xFB` resync push 之后被同函数立刻 drain 丢弃，是死代码；
+- CDC 断开/调试端死亡时没有任何转移把 `kdp_rx_armed` 清 0。
+
+**T80（P0-2 修复，`module/kernel/QcomXnuUsbDebug.c`）**：
+- `nabu-kdp-release-resync=1`（默认关）：保留 `0xFB` 给下一次 DEBUGGER 入口首读；
+- `nabu-kdp-death-reset=<秒>`（默认关）：armed 期间检测到 bus generation 变化，
+  或连续 N 秒空 drain 就降级——清 KDP 环、清 `usb_serial_rx_kdp`、清 `kdp_rx_armed`。
+
+**真机验证（2026-11-25）**：开启 `nabu-kdp-death-reset=10`，模拟调试端死亡
+（lldb 连上后不发 continue 直接退出）→ 10 秒内 `kdp_rx_armed` 从 1 变 0，
+控制台 `HELLO OK` 恢复，**无需断电**。
+
+**⚠️ 构建纪律**：改 `module/kernel/QcomXnuUsbDebug.c` 后，
+`_build_inner.sh` **不会**重编 `libQcomXnuUsbDebug.a`。
+必须先 `python3 /mnt/e/nabu/tmp/relink_cache.py`，再按
+`build-report.json` 里的 clang 命令重编 `.o`，并用 **`/usr/bin/llvm-ar`**
+（不是 GNU `ar`）替换归档成员 + `ar s` 重建索引。
+判据：`grep -aq nabu-kdp-death-reset kernel.macho` 必须命中。
 
 > ### ⚠️ NOP18 是硬性步骤
 >
