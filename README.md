@@ -1,7 +1,7 @@
 # nabu USB CDC 控制台
 
 Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
-主机看到一个 USB CDC 串口：实时读内核日志，同时反向发控制命令。
+主机看到两个 USB CDC 串口：`COM5` 反向发 SXNU1 控制命令并读回复，`COM6` 实时读内核日志 / KDPF 帧。
 
 目标板：Xiaomi Pad 5 · SoC SM8150 · XNU 17.7.11 (iPadOS 21H461)
 代码仓库：[Lux12138/nabu-usb-cdc](https://github.com/Lux12138/nabu-usb-cdc)
@@ -10,7 +10,7 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ## 现在的状态（2026-11-26 21:15）
 
-**双 CDC 通道 + 51 个设备端命令 + KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
+**双 CDC 通道 + 64 个设备端 verb（枚举实数）+ KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
 
 > ★ **双通道（2026-11-26 新增）**：主机同时看到 `COM5`（MI_00，控制口：SXNU1 verb + 回复）
 > 和 `COM6`（MI_02，数据口：内核日志 + KDPF）。**两个口都完整可用**。
@@ -20,26 +20,26 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 | 指标 | 状态 |
 |---|---|
-| 设备端 verb | **51** 个（`module/kernel/QcomUsbControl.h`；新增 FGREAD/GPIOGET/PIPE1STAT 等）|
-| 主机侧命令 | **15** 条（读已导出数组，不需要内核改动）|
+| 设备端 verb | **64** 个（`QcomUsbControl.h` 枚举实数，含 FEAT 门控项；下表列常用 50）|
+| 主机侧命令 | **9** 条（读已导出数组，不需要内核改动）|
 | 内核日志 | 开机到复位连续，无需第二串口 |
 | 读内存 | 内核虚拟地址 + 物理地址/MMIO，带白名单防护 |
 | **写内存/寄存器** | `WRITE` / `WRITEPA` / `SYSREGW` **三条都做过值变化验证** |
-| panic 日志 | BSS 环 → UFS，`PANICSTR` 从介质读回，跨断电重启存活 |
-| **`Debugger()` 进出** | **可进可出**（预置 ≥8 个 `'c'`，见下文）|
+| panic 日志 | BSS 环 → UFS，`PANICSTR` 从介质读回（历史结论；dual 包未重测跨断电） |
+| **FGREAD** | **2026-11-26 板上实测** `soc=29 v=3779.531mV ma=81 chg=1 ph=3`（`nabu-fg=1`）|
 | **KDP 远程调试** | **`CONNECT`/`READMEM`/`BREAKPOINT`/`DISCONNECT` 全部跑通**（见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)）|
 | **原生 lldb 直连** | **Linux 上 lldb 20.1.8 + Apple `kdp-remote`，已拿到符号化内核栈**（见下文）|
 | 链路 | **USB High Speed**（`DSTS.CONNECTSPD=0`，两次 boot 复现）|
-| CDC 吞吐 | **51.5 KB/s**（KDP 裸数据，`--poll 0.01`）；瓶颈 `DWC3_RX_BYTES=512` |
+| CDC 吞吐 | 历史单口实测 51.5 KB/s（KDP 裸数据，`--poll 0.01`）；双口后未重测 |
 
-**最新可用基线**：`t134`（kernel `e68f924a4caae610`）。
+**最新可用基线**：`hold/dual`（kernel `bd744408bcd577df`，payload `7977503c028e86a7`，2026-11-26 双口实测）。
 
 ### KDP 远程调试（新）
 
 同一个 CDC 口，除了控制台还能跑 XNU 的 KDP 调试器：
 
 ```bash
-tools/kdp.sh bridge            # 停控制台，起网桥（KDPF v1）
+tools/kdp.sh bridge            # 停控制台，起网桥（KDPF v1）；双口包用 PORT=COM5 且须另开 COM6
 tools/kdp.sh cli --fresh connect
 # CONNECT ok: error=NO_ERROR key=0x1337c0de seq=1
 ```
@@ -55,11 +55,12 @@ tools/kdp.sh cli --fresh connect
 3. **KDP 会话可以干净返回内核**（0022+0023 已实证）——
    用 **stdin 异步喂 lldb 命令**，不要用 `-o/--batch`：
    ```bash
-   printf 'target create <kernel>\nprocess connect --plugin kdp-remote udp://<host>:41139\nprocess continue\nquit\n' | lldb
+   # lldb 必须后台运行：process continue 后它会等下一次停止事件，
+   # 绝不能前台 wait，更不能 kill -9 / timeout / detach。
+   ( printf 'target create <kernel>\nprocess connect --plugin kdp-remote udp://<host>:41139\nprocess continue\n'
+   ) | ./lldb > /tmp/lldb.log 2>&1 &
+   # 10 秒轮询：判据是「COM5 控制台恢复 + 日志 mtime 前进」，不是 lldb 退出。
    ```
-   `-o/--batch` 会被 Driver 同步驱动（`Driver.cpp:546-547`），
-   `process continue` 走 `ResumeSynchronous()->WaitForProcessToStop(nullopt)` 无限等；
-   stdin 路径实测 **5 秒**返回、`lldb exit=0`，不要 `kill -9`。
 
 完整用法、帧格式、构建步骤见 [`docs/KDP-NET-OVER-CDC.md`](docs/KDP-NET-OVER-CDC.md)。
 
@@ -92,8 +93,9 @@ SXNU1 控制台沉默，历史上只能断电。根因有两条：
 > `python3 /e/nabu/tools/_nop18_l800.py`。它把签名 `6100005408214439` 后面的
 > `cbnz`（`a8000037`）改成 `nop`（`1f2003d5`）。
 >
-> **没打这个补丁的内核会在 `disk1s1` 挂载阶段卡死，日志只出 6 行 `nabu:`。**
-> 2026-11-23 一晚上有 6 轮构建因此白跑。
+> **J8 红线：构建包必须打这个补丁。** 历史上漏打的包多次在 `disk1s1` 挂载阶段卡死
+> （只出 6 行 `nabu:`，2026-11-23 一晚 6 轮白跑）；近期也有漏打仍挂载成功的个例，
+> 但不能据此跳过 —— 门禁是强制的。
 >
 > 验证：
 > ```
@@ -161,14 +163,15 @@ bash /e/nabu/tmp/pack_round.sh <新包名> [基线包名]
 ```bash
 # 终端 1：控制台（务必在刷机前启动）
 cd tools
-python -u nabu_console.py --tag run1 --out /path/to/logs \
-  --wait 300 --deadline 900 --kernel /path/to/kernel.macho
+python -u nabu_mux.py --tag run1 --out /path/to/logs \
+  --wait 300 --kernel /path/to/kernel.macho
+# 双口包（nabu-cdc-second-port=2）加 --port COM5，并另开一个程序持续 open COM6（否则看不到日志）
 
 # 终端 2：刷机
 bash go_round_next.sh <包名>
 ```
 
-控制台每 2 秒扫描端口，发现 COM3 后打开，日志写入 `<tag>-com.bin`，
+控制台每 2 秒扫描端口，默认发现 COM3 后打开（双口包用 `--port COM5`），日志写入 `<tag>-com.bin`，
 命令写入 `<tag>-cmd.txt`（**只追加，勿截断**）。
 
 ### 4. 发命令
@@ -188,7 +191,7 @@ vmstat
 
 ---
 
-## 设备端命令（48 个 verb）
+## 设备端命令（常用 50 个；枚举共 64）
 
 | 类别 | 命令 |
 |---|---|
@@ -252,60 +255,14 @@ read  0xfffffff00c0f5a70 4      → 01000000   (gate 已开)
 
 ---
 
-## KDP 调试器：进得去也出得来
+## KDP 调试器：正确进入与退出
 
-**两种场景，退出方式完全不同**：
+**控制台裸 `kdp` 进入**（不是 `kdp enter <payload>`，那是旧 bridge 语法）。
+进入后 SXNU1 沉默属正常，KDP 期间禁止发 verb（J17）。
 
-| 场景 | 退出方式 | 为什么 |
-|---|---|---|
-| **未 CONNECT** | **预置的裸 `'c'`（≥8 个）** | 走 `kdp_getc()` 循环，事后发的字节要经 `serial_rx_drain()`，被 `acquire()` 的 `cpu_number() != master_cpu` 挡住 |
-| **已 CONNECT** | **`kdp resume`**（`KDP_RESUMECPUS` 请求）| 走 KDP 协议，不经过 `kdp_getc()` |
-
-### 进入 + 退出（一条命令）
-
-```
-kdp enter 6363636363636363
-```
-
-即 `DEBUGGER 6363636363636363`。模块回复会给出三个关键字段：
-
-```
-DEBUGGER OK state=entering queued=8 pending=8 ovf=0
-```
-
-`queued=8 pending=8 ovf=0` = 8 个字节全部进环、零丢失。
-
-### 日志判据
-
-**成功**（kb-94 实测）：
-
-```
-Using serial KDP.
-Waiting for remote debugger connection.
-Options.....    Type
-------------    ----
-continue....    'c'
-reboot......    'r'
-Continuing...                      ← 'c' 生效，Debugger() 返回
-NabuGPU: state=starting step=0     ← 内核继续跑
-```
-
-**8 个是实测有效量**：2 个不够（kb-93 用 `6363` 失败）。
-
-### 两个坑
-
-1. **`kdp resume` 在未 CONNECT 时不生效** —— 它发的是裸字节，同样被 `acquire()` 挡住。
-   控制台现在会直接报错并打印正确命令。
-2. **`'r'` 走不通** —— `kdp_machine_reboot()` 传 `kPEPanicRestartCPU = 4`，
-   而模块的 halt 钩子只认 `CONTROL_PE_RESTART_CPU = 1`，其余返回 `-1` 后空转。
-   要让 `'r'` 通，只需让钩子也接受 `type == 4`（只改模块）。**尚未做。**
-
-### panic 之后仍然出不来
-
-panic 路径 `kdp_rx_armed = 0`，`serial_getc()` 读的是**控制环**（只有 SXNU1 文本），
-而且我们无法在 panic 前预置字节。**只能断电**，除非改 XNU。
-
----
+退出：**唯一正确的放行方式是 lldb `process continue`**（J24/J30）：
+后台运行 + 10 秒轮询「COM5 控制台恢复 + 日志 mtime 前进」；
+绝不前台等、绝不 `kill -9` / `timeout` / `detach`。详见项目纪律 §0.B。
 
 ## ★ 原生 lldb 直连（Linux / macOS 主机）
 
@@ -424,7 +381,8 @@ available(4) + dropped(4) + total_lo(4) + total_hi(4)。
 
 | 路径 | 内容 |
 |---|---|
-| `tools/nabu_console.py` | **唯一控制台**：日志采集 + 48 verb + 15 条主机侧命令 |
+| `tools/nabu_mux.py` | **主用控制台**：SXNU1 日志 + KDP 同进程；`--port` 指定 COM3/COM5 |
+| `tools/nabu_console.py` | 旧控制台（48 verb 时代的单口工具）|
 | **`tools/kdp.sh`** | **KDP 一键切换**：`status`/`console`/`bridge`/`stop`/`cli` |
 | `tools/payload_swap_kernel.py` | 原地替换 payload 里的 kernel（保持 FAT 布局）|
 | `tools/payload_layout_check.py` | 校验 kernel 簇链是否为已知可启动的布局 |
