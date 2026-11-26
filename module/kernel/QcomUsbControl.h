@@ -83,6 +83,39 @@ enum sxnu_control_verb {
     SXNU_CONTROL_VERB_PANICTRIG, /* PANICTRIG <key> -> panic on purpose (gated)   */
     SXNU_CONTROL_VERB_STACKSHOT, /* STACKSHOT -> capture all thread stacks in-kernel */
     SXNU_CONTROL_VERB_KDBG,      /* KDBG -> kdebug control state, no sysctl lock */
+    SXNU_CONTROL_VERB_PIPE1STAT, /* PIPE1STAT -> pipe1 dtr/ring/active state */
+    /* Bus primitives. Reads only. Gated behind nabu-verbs-bus=1; while the
+     * boot-arg is absent they answer "ERR disabled" and do nothing else.
+     * I2CREAD/SPIREAD answer "ERR notavail": a GENI transfer needs clocks,
+     * pinmux and a protocol engine that this port has not brought up yet (see
+     * QcomUsbBusPrims.c header). The verbs stay so host scripts get an answer
+     * instead of a timeout. */
+    SXNU_CONTROL_VERB_I2CREAD,   /* I2CREAD <addr> <reg> <len> -> not built yet  */
+    SXNU_CONTROL_VERB_SPIREAD,   /* SPIREAD <cs> <reg> <len> -> not built yet   */
+    SXNU_CONTROL_VERB_GPIOGET,   /* GPIOGET <index> -> TLMM cfg/io words         */
+    SXNU_CONTROL_VERB_GPIODIR,   /* GPIODIR <index> -> same block, direction use */
+    SXNU_CONTROL_VERB_SYSREGSCAN,/* SYSREGSCAN <start> <count> -> batch MRS       */
+    SXNU_CONTROL_VERB_GICSNAP,   /* GICSNAP -> distributor / redistributor words */
+    /* T142 trace ring + telemetry store. TRACEON/TRACEREAD/TRACECLEAR
+     * sample console health into a private ring; TELDUMP/TELREAD are the
+     * NABUTEL1 skeleton (weak native_ufs_tel_* exports, unsupported until
+     * the storage driver provides them). Both default off behind
+     * nabu-trace=1 / nabu-tel=1. */
+    SXNU_CONTROL_VERB_TRACEON,   /* TRACEON <ms> <mask> -> start sampling       */
+    SXNU_CONTROL_VERB_TRACEREAD, /* TRACEREAD [start] [count] -> ring window    */
+    SXNU_CONTROL_VERB_TRACECLEAR,/* TRACECLEAR -> drop the ring                 */
+    SXNU_CONTROL_VERB_TELDUMP,   /* TELDUMP <hexpa> <hexlen> <tag> -> tel store */
+    SXNU_CONTROL_VERB_TELREAD,   /* TELREAD <relblock> [@off] -> tel store      */
+    /* T144 fuel gauge (T91 P1).  Read-only FG probe over the SPMI layer; the
+     * verb answers ERR disabled while nabu-fg=1 is absent and never touches a
+     * register then.  The transport keeps its own gate (nabu-spmi=1). */
+    SXNU_CONTROL_VERB_FGREAD,    /* FGREAD [design_mah] -> SOC/V/I/status       */
+    /* T140 forensics verbs. Parsed unconditionally, but each handler refuses
+     * unless nabu-verbs-forensics=1: with the boot-arg off they are rejected
+     * exactly like an unknown verb (no reply, no sequence advance). */
+    SXNU_CONTROL_VERB_DEVTREE,    /* DEVTREE [path] [max] -> DT nodes             */
+    SXNU_CONTROL_VERB_FBRAW,      /* FBRAW <pa|gop> <off> <len> [chunk] [raw]     */
+    SXNU_CONTROL_VERB_NABULOGRING,/* NABULOGRING [slot] [hexoff] [hexlen]         */
     SXNU_CONTROL_VERB_LAST        /* sentinel: one past the last verb */
 };
 
@@ -325,6 +358,71 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
     if (bytes == 7u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'S' &&
         text[3] == 'R' && text[4] == 'E' && text[5] == 'G' && text[6] == 'W')
         return SXNU_CONTROL_VERB_SYSREGW;
+    if (bytes == 9u && text[0] == 'P' && text[1] == 'I' && text[2] == 'P' &&
+        text[3] == 'E' && text[4] == '1' && text[5] == 'S' && text[6] == 'T' &&
+        text[7] == 'A' && text[8] == 'T')
+        return SXNU_CONTROL_VERB_PIPE1STAT;
+    /* Bus primitives. Lengths overlap with existing verbs only where the
+     * characters differ, and every comparison is explicit, so order is
+     * irrelevant; they sit at the end to keep the diff readable. */
+    if (bytes == 7u && text[0] == 'I' && text[1] == '2' && text[2] == 'C' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'A' && text[6] == 'D')
+        return SXNU_CONTROL_VERB_I2CREAD;
+    if (bytes == 7u && text[0] == 'S' && text[1] == 'P' && text[2] == 'I' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'A' && text[6] == 'D')
+        return SXNU_CONTROL_VERB_SPIREAD;
+    if (bytes == 7u && text[0] == 'G' && text[1] == 'P' && text[2] == 'I' &&
+        text[3] == 'O' && text[4] == 'G' && text[5] == 'E' && text[6] == 'T')
+        return SXNU_CONTROL_VERB_GPIOGET;
+    if (bytes == 7u && text[0] == 'G' && text[1] == 'P' && text[2] == 'I' &&
+        text[3] == 'O' && text[4] == 'D' && text[5] == 'I' && text[6] == 'R')
+        return SXNU_CONTROL_VERB_GPIODIR;
+    if (bytes == 10u && text[0] == 'S' && text[1] == 'Y' && text[2] == 'S' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'G' && text[6] == 'S' &&
+        text[7] == 'C' && text[8] == 'A' && text[9] == 'N')
+        return SXNU_CONTROL_VERB_SYSREGSCAN;
+    if (bytes == 7u && text[0] == 'G' && text[1] == 'I' && text[2] == 'C' &&
+        text[3] == 'S' && text[4] == 'N' && text[5] == 'A' && text[6] == 'P')
+        return SXNU_CONTROL_VERB_GICSNAP;
+    /* T142: trace/telemetry verbs. Lengths are distinct from every
+     * existing verb (TRACEON 7, TRACEREAD 9, TRACECLEAR 10, TELDUMP 7,
+     * TELREAD 7) and every comparison is explicit. */
+    if (bytes == 7u && text[0] == 'T' && text[1] == 'R' && text[2] == 'A' &&
+        text[3] == 'C' && text[4] == 'E' && text[5] == 'O' && text[6] == 'N')
+        return SXNU_CONTROL_VERB_TRACEON;
+    if (bytes == 9u && text[0] == 'T' && text[1] == 'R' && text[2] == 'A' &&
+        text[3] == 'C' && text[4] == 'E' && text[5] == 'R' && text[6] == 'E' &&
+        text[7] == 'A' && text[8] == 'D')
+        return SXNU_CONTROL_VERB_TRACEREAD;
+    if (bytes == 10u && text[0] == 'T' && text[1] == 'R' && text[2] == 'A' &&
+        text[3] == 'C' && text[4] == 'E' && text[5] == 'C' && text[6] == 'L' &&
+        text[7] == 'E' && text[8] == 'A' && text[9] == 'R')
+        return SXNU_CONTROL_VERB_TRACECLEAR;
+    if (bytes == 7u && text[0] == 'T' && text[1] == 'E' && text[2] == 'L' &&
+        text[3] == 'D' && text[4] == 'U' && text[5] == 'M' && text[6] == 'P')
+        return SXNU_CONTROL_VERB_TELDUMP;
+    if (bytes == 7u && text[0] == 'T' && text[1] == 'E' && text[2] == 'L' &&
+        text[3] == 'R' && text[4] == 'E' && text[5] == 'A' && text[6] == 'D')
+        return SXNU_CONTROL_VERB_TELREAD;
+    /* T144: FGREAD is 6 characters; every comparison here is explicit, so its
+     * position at the end of the parser only keeps the diff readable. */
+    if (bytes == 6u && text[0] == 'F' && text[1] == 'G' && text[2] == 'R' &&
+        text[3] == 'E' && text[4] == 'A' && text[5] == 'D')
+        return SXNU_CONTROL_VERB_FGREAD;
+    /* T140 forensics verbs. */
+    /* T162: DEVTREE is 7 characters. The previous length test compared six
+     * ("DEVTRE"), so the real wire token never matched, parse returned INVALID,
+     * and the frame was rejected before the forensics gate or handler ran. */
+    if (bytes == 7u && text[0] == 'D' && text[1] == 'E' && text[2] == 'V' &&
+        text[3] == 'T' && text[4] == 'R' && text[5] == 'E' && text[6] == 'E')
+        return SXNU_CONTROL_VERB_DEVTREE;
+    if (bytes == 5u && text[0] == 'F' && text[1] == 'B' && text[2] == 'R' &&
+        text[3] == 'A' && text[4] == 'W')
+        return SXNU_CONTROL_VERB_FBRAW;
+    if (bytes == 11u && text[0] == 'N' && text[1] == 'A' && text[2] == 'B' &&
+        text[3] == 'U' && text[4] == 'L' && text[5] == 'O' && text[6] == 'G' &&
+        text[7] == 'R' && text[8] == 'I' && text[9] == 'N' && text[10] == 'G')
+        return SXNU_CONTROL_VERB_NABULOGRING;
     return SXNU_CONTROL_VERB_INVALID;
 }
 
@@ -353,6 +451,7 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_PANICTRIG: return "PANICTRIG";
     case SXNU_CONTROL_VERB_STACKSHOT: return "STACKSHOT";
     case SXNU_CONTROL_VERB_KDBG: return "KDBG";
+    case SXNU_CONTROL_VERB_PIPE1STAT: return "PIPE1STAT";
     case SXNU_CONTROL_VERB_DUMLIST: return "DUMLIST";
     case SXNU_CONTROL_VERB_UPTIME: return "UPTIME";
     case SXNU_CONTROL_VERB_RDBLK: return "RDBLK";
@@ -380,6 +479,21 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
     case SXNU_CONTROL_VERB_BKPLIST: return "BKPLIST";
     case SXNU_CONTROL_VERB_SYSREG: return "SYSREG";
     case SXNU_CONTROL_VERB_SYSREGW: return "SYSREGW";
+    case SXNU_CONTROL_VERB_I2CREAD: return "I2CREAD";
+    case SXNU_CONTROL_VERB_SPIREAD: return "SPIREAD";
+    case SXNU_CONTROL_VERB_GPIOGET: return "GPIOGET";
+    case SXNU_CONTROL_VERB_GPIODIR: return "GPIODIR";
+    case SXNU_CONTROL_VERB_SYSREGSCAN: return "SYSREGSCAN";
+    case SXNU_CONTROL_VERB_GICSNAP: return "GICSNAP";
+    case SXNU_CONTROL_VERB_TRACEON: return "TRACEON";
+    case SXNU_CONTROL_VERB_TRACEREAD: return "TRACEREAD";
+    case SXNU_CONTROL_VERB_TRACECLEAR: return "TRACECLEAR";
+    case SXNU_CONTROL_VERB_TELDUMP: return "TELDUMP";
+    case SXNU_CONTROL_VERB_TELREAD: return "TELREAD";
+    case SXNU_CONTROL_VERB_FGREAD: return "FGREAD";
+    case SXNU_CONTROL_VERB_DEVTREE: return "DEVTREE";
+    case SXNU_CONTROL_VERB_FBRAW: return "FBRAW";
+    case SXNU_CONTROL_VERB_NABULOGRING: return "NABULOGRING";
     default: return "";
     }
 }
