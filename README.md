@@ -39,7 +39,11 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 同一个 CDC 口，除了控制台还能跑 XNU 的 KDP 调试器：
 
 ```bash
-tools/kdp.sh bridge            # 停控制台，起网桥（KDPF v1）；双口包用 PORT=COM5 且须另开 COM6
+tools/kdp.sh bridge            # 停控制台，起网桥（KDPF v1）
+# ★ 双口（nabu-cdc-second-port=2, nabu-kdp-net=1）KDP 实际走 pipe1（COM6）：
+#   com_discover.py 先发现 console/log 口（不要写死 COM5/COM6）
+#   mux --port <console> 发裸 kdp → 停 mux → kdp_net_bridge --port <log> --cdc-framing kdpf --udp-mode kdp
+#   判据：桥日志出现 CDC->UDP KDP 12 B (hdr=...dec03713) = 0x1337c0de
 tools/kdp.sh cli --fresh connect
 # CONNECT ok: error=NO_ERROR key=0x1337c0de seq=1
 ```
@@ -316,6 +320,8 @@ Process 1 stopped
 | 坑 | 症状 |
 |---|---|
 | `--cdc-framing serial` | 网桥写了 N 字节，**设备零回应**。本板带 `nabu-kdp-net=1`，必须 `kdpf` |
+| **双口写死 COM5/COM6** | 端口是 Windows 随机分配的；用 `com_discover.py` 按 `role=` 自动发现。`kdp-net=1` 时 KDP 走 pipe1（log 口）|
+| `--udp-mode eth` | 远端仓库 README 明确要求 **`kdp`**；本地旧 `docs/KDP-NET-OVER-CDC.md` 写 `eth` 是过时的 |
 | `--udp-mode eth` | lldb 发的是 8 B 裸 KDP 包，`eth` 模式当以太网帧处理 → 丢弃。必须 `kdp` |
 | WSL 用 `nameserver` 当宿主 IP | `10.255.255.254` 是 DNS 代理，**UDP 打不通**。必须取 default gateway |
 
