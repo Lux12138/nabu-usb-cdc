@@ -1198,6 +1198,17 @@ int qcom_usb_debug_init(void)
     if (usb_diag_mode >= 201u && usb_diag_mode <= 203u) diag_reset(12);
     diag_checkpoint(QCOM_USB_DEBUG_DIAG_ENUM_DONE);
     native.status.phase = QCOM_USB_DEBUG_ACTIVE;
+    /* T175: one identity line per port, printed once after enumeration.  The
+     * console line always appears; the log/KDP line only exists when the second
+     * pipe is enabled.  Both use the historical output channel, and a full or
+     * absent ring cannot block startup. */
+    {
+        static const char port_console[] = "NABU PORT role=console if=0\n";
+        static const char port_log[] = "NABU PORT role=log if=1\n";
+        (void)qcom_usb_debug_write(port_console, sizeof(port_console) - 1u);
+        if (cdc_second_port)
+            (void)qcom_usb_debug_write(port_log, sizeof(port_log) - 1u);
+    }
     ret = 1;
 out:
     buffer_status_owned();
@@ -1312,18 +1323,19 @@ static void control_rotate_session_owned(void)
                              usb_control_context.state.generation);
     sxnu_control_parser_reset(&usb_control_context.parser);
 }
-static size_t control_reply_queue(const char *reply, size_t bytes)
+static size_t control_reply_queue(const char *reply, size_t bytes, unsigned int pipe)
 {
     uint8_t wire[SXNU_CONTROL_REPLY_BYTES + 1u];
     uint64_t flags;
     int queued = 0;
-    if (!reply || !bytes || bytes > SXNU_CONTROL_REPLY_BYTES || !acquire(&flags)) return 0;
+    if (!reply || !bytes || bytes > SXNU_CONTROL_REPLY_BYTES ||
+        (pipe != 0u && pipe != 1u) || !acquire(&flags)) return 0;
     if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
         backlog_drain_owned();
-        if (DWC3_TX_BYTES - dwc3_queued(native.core) >= bytes + 1u) {
+        if (dwc3_tx_free_pipe(native.core, pipe) >= bytes + 1u) {
             wire[0] = (uint8_t)'\n';
             bytes_copy(wire + 1u, reply, bytes);
-            if (dwc3_queue(native.core, wire, bytes + 1u) == bytes + 1u) queued = 1;
+            if (dwc3_queue_pipe(native.core, pipe, wire, bytes + 1u) == bytes + 1u) queued = 1;
         }
     }
     release(flags);
@@ -1331,7 +1343,8 @@ static size_t control_reply_queue(const char *reply, size_t bytes)
     return queued ? bytes : 0;
 }
 static size_t control_reply_hello(char *reply, size_t capacity,
-                                  const struct sxnu_control_frame *frame)
+                                  const struct sxnu_control_frame *frame,
+                                  unsigned int pipe)
 {
     struct sxnu_control_writer writer;
     sxnu_control_writer_init(&writer, reply, capacity);
@@ -1343,8 +1356,42 @@ static size_t control_reply_hello(char *reply, size_t capacity,
         !sxnu_control_writer_text(&writer, " last_seq=") ||
         !sxnu_control_writer_hex(&writer, usb_control_context.state.last_seq,
                                  SXNU_CONTROL_SEQ_HEX) ||
-        !sxnu_control_writer_text(&writer, " control=1")) return 0;
+        !sxnu_control_writer_text(&writer, " control=1") ||
+        !sxnu_control_writer_text(&writer, " role=") ||
+        !sxnu_control_writer_decimal(&writer, pipe)) return 0;
     return sxnu_control_reply_finish(&writer);
+}
+
+/* T175: identify the log/KDP port.  serial_rx_drain() routes pipe 1 bytes to
+ * the KDP detectors only, so a HELLO sent there would never be answered and a
+ * host could not tell the two COM ports apart.  This mirror answers a
+ * session==0/seq==0 HELLO on pipe 1 with the same read-only body as the console
+ * reply plus role=1.  It keeps its own parser instance and never touches
+ * usb_control_context.parser/state, so pipe-0 sequencing is unaffected. */
+static void control_pipe1_hello_scan(const uint8_t *bytes, size_t count)
+{
+    /* Persistent across chunks: a HELLO split by the USB transfer boundary is
+     * still recognised, exactly like the console parser in
+     * usb_control_context.parser.  Zero-initialised in .bss. */
+    static struct sxnu_control_parser parser;
+    struct sxnu_control_frame frame;
+    char line[SXNU_CONTROL_FRAME_BYTES];
+    char reply[SXNU_CONTROL_REPLY_BYTES];
+    size_t line_bytes = 0;
+    size_t reply_bytes;
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        uint8_t b = bytes[i];
+        int complete = sxnu_control_parser_feed(&parser, b, line,
+                                                 sizeof(line), &line_bytes);
+        if (complete <= 0) continue;
+        if (!sxnu_control_parse(line, line_bytes, &frame)) continue;
+        if (frame.verb != SXNU_CONTROL_VERB_HELLO ||
+            frame.session != 0u || frame.seq != 0u) continue;
+        reply_bytes = control_reply_hello(reply, sizeof(reply), &frame, 1u);
+        if (reply_bytes) (void)control_reply_queue(reply, reply_bytes, 1u);
+    }
 }
 static size_t control_reply_ping(char *reply, size_t capacity,
                                  const struct sxnu_control_frame *frame,
@@ -1895,7 +1942,7 @@ qud_dt_thread_dispatch(char *reply, size_t capacity,
 
 static void control_handle_frame(const struct sxnu_control_frame *frame,
                                  const struct qcom_usb_debug_status *status,
-                                 uint32_t generation)
+                                 uint32_t generation, unsigned int pipe)
 {
     enum sxnu_control_verb accepted = sxnu_control_accept(&usb_control_context.state, frame);
     char reply[SXNU_CONTROL_REPLY_BYTES];
@@ -1927,7 +1974,7 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
     }
     switch (accepted) {
     case SXNU_CONTROL_VERB_HELLO:
-        reply_bytes = control_reply_hello(reply, sizeof(reply), frame);
+        reply_bytes = control_reply_hello(reply, sizeof(reply), frame, pipe);
         break;
     case SXNU_CONTROL_VERB_PING:
         reply_bytes = control_reply_ping(reply, sizeof(reply), frame, status);
@@ -4526,7 +4573,7 @@ debugger_done:
         (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
         return;
     }
-    queued = control_reply_queue(reply, reply_bytes) == reply_bytes;
+    queued = control_reply_queue(reply, reply_bytes, pipe) == reply_bytes;
     /* T80: an ack lost to a full TX ring is not a parser rejection. Count it so
      * STATUS can tell the two apart (rl= vs rej=). Behaviour is unchanged: the
      * REBOOT path is fire-and-forget by design -- the reset happens even when
@@ -4582,7 +4629,8 @@ static void control_reboot_fallback(void)
     platform_smc_reset();
 }
 static void control_service(const uint8_t *bytes, size_t count, uint32_t generation,
-                            const struct qcom_usb_debug_status *status)
+                            const struct qcom_usb_debug_status *status,
+                            unsigned int pipe)
 {
     size_t i;
     if (!__atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE)) return;
@@ -4598,7 +4646,7 @@ static void control_service(const uint8_t *bytes, size_t count, uint32_t generat
         if (complete > 0) {
             struct sxnu_control_frame frame;
             if (sxnu_control_parse(line, line_bytes, &frame))
-                control_handle_frame(&frame, status, generation);
+                control_handle_frame(&frame, status, generation, pipe);
             else
                 (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
         } else if (complete < 0) {
@@ -4693,7 +4741,7 @@ void qcom_usb_debug_control_reboot_failed(int result)
         sxnu_control_writer_text(&writer, " state=reboot result=") &&
         sxnu_control_writer_signed(&writer, result)) {
         size_t bytes = sxnu_control_reply_finish(&writer);
-        if (bytes) (void)control_reply_queue(reply, bytes);
+        if (bytes) (void)control_reply_queue(reply, bytes, 0u);
     }
 }
 int qcom_usb_debug_wait_drained(unsigned int timeout_ms)
@@ -5287,6 +5335,14 @@ serial_rx_drain(void)
         }
     }
 
+    /* T175: answer a HELLO that arrives on the log/KDP pipe (role=1) without
+     * touching pipe-0 parser/session state.  Skipped while a KDP session owns
+     * either pipe, so a live session never sees a stray console line. */
+    if (rx1_count != 0 && cdc_second_port && !qcom_usb_debug_kdp_net_active() &&
+        !__atomic_load_n(&kdp_rx_armed1, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
+        control_pipe1_hello_scan(rx1, rx1_count);
+
     /* T131: pipe 1 is the dedicated KDP data interface.  Bytes the host sends
      * there never touch the SXNU1 parser or the console ring.  Net mode feeds
      * the same KDPF scanner as the shared stream; serial-KDP mode pushes into
@@ -5340,7 +5396,7 @@ serial_rx_drain(void)
          * (as originally assumed) at the end of the boot. suppress_control
          * covers exactly the chunk that triggered a degrade. */
         if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) && !suppress_control)
-            control_service(text, text_count, generation, &status);
+            control_service(text, text_count, generation, &status, 0u);
     }
 }
 

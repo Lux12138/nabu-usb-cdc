@@ -806,6 +806,12 @@ size_t dwc3_queued_pipe(const struct dwc3 *d, unsigned int pipe)
     return d->second_port ? d->tx2_used : 0;
 }
 size_t dwc3_queued(const struct dwc3 *d) { return d ? d->tx_used : 0; }
+size_t dwc3_tx_free_pipe(const struct dwc3 *d, unsigned int pipe)
+{
+    if (!d) return 0;
+    if (pipe == 0) return DWC3_TX_BYTES - (d->tx_used > DWC3_TX_BYTES ? DWC3_TX_BYTES : d->tx_used);
+    return d->second_port ? PIPE1_TX_BYTES - (d->tx2_used > PIPE1_TX_BYTES ? PIPE1_TX_BYTES : d->tx2_used) : 0;
+}
 uint64_t dwc3_dropped(const struct dwc3 *d) { return d ? d->dropped : 0; }
 size_t dwc3_rx_pending_pipe(const struct dwc3 *d, unsigned int pipe)
 {

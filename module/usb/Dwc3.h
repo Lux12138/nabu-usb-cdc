@@ -79,6 +79,8 @@ size_t dwc3_read_pipe(struct dwc3 *dev, unsigned int pipe, void *bytes, size_t c
 int dwc3_ready(const struct dwc3 *dev);
 size_t dwc3_queued(const struct dwc3 *dev);
 size_t dwc3_queued_pipe(const struct dwc3 *dev, unsigned int pipe);
+/* Free TX bytes in the selected pipe's ring (0 while pipe 1 is disabled). */
+size_t dwc3_tx_free_pipe(const struct dwc3 *dev, unsigned int pipe);
 uint64_t dwc3_dropped(const struct dwc3 *dev);
 size_t dwc3_rx_pending(const struct dwc3 *dev);
 size_t dwc3_rx_pending_pipe(const struct dwc3 *dev, unsigned int pipe);
