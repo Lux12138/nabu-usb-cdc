@@ -7,6 +7,7 @@ static unsigned provider_state;
 static qcom_usb_screenshot_capture provider;
 static void *provider_cookie;
 static struct qcom_usb_framebuffer fixed;
+static unsigned fixed_valid; /* a fixed-framebuffer provider owns `fixed` */
 static struct qcom_usb_screenshot_info image;
 static uint32_t cursor, pixel_cursor, peek_bytes, next_pixel;
 static unsigned ready;
@@ -54,7 +55,15 @@ int qcom_usb_debug_register_framebuffer(const struct qcom_usb_framebuffer *fb)
         !__atomic_compare_exchange_n(&provider_state, &expected, 1u,
         0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
     fixed = *fb; provider = copy_fixed; provider_cookie = &fixed;
+    fixed_valid = 1;
     __atomic_store_n(&provider_state, 2u, __ATOMIC_RELEASE);
+    return 1;
+}
+int qcom_usb_shot_framebuffer(struct qcom_usb_framebuffer *out)
+{
+    if (!out || __atomic_load_n(&provider_state, __ATOMIC_ACQUIRE) != 2u ||
+        !fixed_valid) return 0;
+    *out = fixed;
     return 1;
 }
 static uint32_t run_length(uint32_t at)

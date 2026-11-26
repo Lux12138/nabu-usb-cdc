@@ -38,6 +38,11 @@ int qcom_usb_debug_register_screenshot(qcom_usb_screenshot_capture capture, void
  * Concurrent display writes can produce tearing; custom provider may freeze.
  */
 int qcom_usb_debug_register_framebuffer(const struct qcom_usb_framebuffer *framebuffer);
+/* T140 FBRAW: copy out the fixed framebuffer description registered above.
+ * Returns 0 when no fixed provider is registered (a custom screenshot
+ * provider does not carry one). The pixels mapping stays owned by the
+ * provider; the copy only exposes geometry and the CPU address. */
+int qcom_usb_shot_framebuffer(struct qcom_usb_framebuffer *out);
 #ifdef __cplusplus
 }
 #endif

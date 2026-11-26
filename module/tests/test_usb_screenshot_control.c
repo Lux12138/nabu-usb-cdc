@@ -4,6 +4,7 @@
 #include "../include/QcomXnuUsbDebug.h"
 #include "kernel/QcomUsbScreenshot.h"
 #include "kernel/QcomUsbControl.h"
+#include "control_handler_stubs.h" /* QUD_DIAG_* macros and qud prototypes */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,12 +39,15 @@ static int capture(void *cookie, uint8_t *rgb, size_t capacity, uint32_t *w, uin
 }
 static void send_request(enum sxnu_control_verb verb, uint32_t seq)
 {
-    const struct sxnu_control_frame frame = {7, seq, 0, verb};
+    const struct sxnu_control_frame frame = {7, seq, 0, verb, NULL, 0};
     struct qcom_usb_debug_status status = {0};
     control_handle_frame(&frame, &status, 1);
 }
 int main(void)
 {
+    /* The extracted slice defines control_reboot_fallback for control_service,
+     * which is outside the slice; reference it so -Wunused-function stays off. */
+    (void)&control_reboot_fallback;
     sxnu_control_state_reset(&usb_control_context.state, 7, 1);
     assert(qcom_usb_debug_register_screenshot(capture, 0));
     blocked = 1; send_request(SXNU_CONTROL_VERB_SCREENSHOT, 1);

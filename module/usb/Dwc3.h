@@ -8,15 +8,19 @@
 #define DWC3_DMA_BYTES 32768u
 #define DWC3_DMA_ALIGNMENT 4096u
 #define DWC3_CONTEXT_ALIGNMENT 8u
-#define DWC3_CONTEXT_BYTES 20480u
+/* T131: the optional second pipe adds a 4 KiB TX ring and a 4 KiB RX ring. */
+#define DWC3_CONTEXT_BYTES 32768u
 #define DWC3_TX_BYTES 16384u
 #define DWC3_RX_BYTES 512u
 
 /* Copied at init; no SoC configuration, OS headers or platform IDs here.
- * Each string must contain 1..31 printable ASCII characters. */
+ * Each string must contain 1..31 printable ASCII characters.  options is
+ * zero for the historical single-function device. */
+#define DWC3_ID_OPTION_SECOND_PORT 0x1u
 struct dwc3_identity {
     uint16_t vid, pid;
     const char *manufacturer, *product, *serial;
+    uint32_t options;
 };
 
 enum dwc3_sync_direction {
@@ -61,18 +65,29 @@ int dwc3_start(struct dwc3 *dev);
 /* Each poll is bounded to min(budget, 256) events. Call from one CPU only;
  * no interrupts, allocation, scheduler, EFI or platform-library calls occur. */
 int dwc3_poll(struct dwc3 *dev, unsigned int budget);
-/* Nonblocking ring; accepts early messages before the host opens the port. */
+/* Nonblocking ring; accepts early messages before the host opens the port.
+ * pipe 0 is the console function.  Pipe 1 exists only when the identity set
+ * DWC3_ID_OPTION_SECOND_PORT; it carries KDP raw bytes and returns 0 for both
+ * directions while that option is clear. */
 size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
+size_t dwc3_queue_pipe(struct dwc3 *dev, unsigned int pipe, const void *bytes, size_t count);
 /* Nonblocking bulk-OUT receive ring. The caller must serialize this with poll
  * on the same CPU. A device reset/disconnect clears pending RX bytes and
  * advances rx_generation so a protocol parser can invalidate its state. */
 size_t dwc3_read(struct dwc3 *dev, void *bytes, size_t count);
+size_t dwc3_read_pipe(struct dwc3 *dev, unsigned int pipe, void *bytes, size_t count);
 int dwc3_ready(const struct dwc3 *dev);
 size_t dwc3_queued(const struct dwc3 *dev);
+size_t dwc3_queued_pipe(const struct dwc3 *dev, unsigned int pipe);
 uint64_t dwc3_dropped(const struct dwc3 *dev);
 size_t dwc3_rx_pending(const struct dwc3 *dev);
+size_t dwc3_rx_pending_pipe(const struct dwc3 *dev, unsigned int pipe);
 uint64_t dwc3_rx_overflow(const struct dwc3 *dev);
+uint64_t dwc3_rx_overflow_pipe(const struct dwc3 *dev, unsigned int pipe);
 uint32_t dwc3_rx_generation(const struct dwc3 *dev);
+/* T131 DMA arena layout, exported for host conformance tests. */
+size_t dwc3_ep_buffer_size(unsigned int ep);
+size_t dwc3_ep_buffer_offset(unsigned int ep);
 struct dwc3_snapshot {
     uint32_t events, commands, last_event, event_offset;
     uint32_t snpsid, gctl, dcfg, dctl, dsts, event_count, enabled_endpoints;

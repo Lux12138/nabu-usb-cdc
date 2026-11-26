@@ -283,4 +283,12 @@ def open_serial(url: str, baudrate: int = 115200, poll_timeout: float = 0.05,
         ) from exc
 
     port = serial.serial_for_url(url, baudrate=baudrate, timeout=poll_timeout)
+    # T143: usbser.sys forwards nothing until DTR is asserted, so a KDP port that
+    # is opened without it looks dead.  setRtsDtr is best-effort: socket://
+    # bridges have no modem lines and pyserial raises there.
+    try:
+        port.dtr = True
+        port.rts = True
+    except Exception:
+        pass
     return SerialTransport(port, poll_timeout=poll_timeout, verbose=verbose)

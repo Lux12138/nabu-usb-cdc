@@ -8,7 +8,7 @@
 /* A register/DMA model supplies completion events rather than a real PHY.
  * These tests check USB-visible descriptors and host request sequencing. */
 _Alignas(4096) static uint8_t dma[DWC3_DMA_BYTES];
-_Alignas(8) static uint8_t context[20480];
+_Alignas(8) static uint8_t context[DWC3_CONTEXT_BYTES];
 static uint32_t regs[0xd000 / 4], producer;
 static unsigned syncs, from_syncs, delays, writes, last_in_fifo;
 static void *last_from_pointer;
@@ -30,7 +30,7 @@ static void write32(void *c, uint32_t reg, uint32_t value)
         if (value & DWC3_DCTL_RUN_STOP) regs[DWC3_DSTS / 4] &= ~DWC3_DSTS_DEVCTRLHLT;
         else regs[DWC3_DSTS / 4] |= DWC3_DSTS_DEVCTRLHLT;
     }
-    if (reg >= DWC3_DEPCMD(0) && reg <= DWC3_DEPCMD(5) && (reg & 15) == 12) {
+    if (reg >= DWC3_DEPCMD(0) && reg <= DWC3_DEPCMD(9) && (reg & 15) == 12) {
         assert((regs[DWC3_GUSB2PHYCFG(0) / 4] & ((1u << 6) | (1u << 8))) == 0);
         if (timeout_commands) return;
         unsigned ep = (reg - DWC3_DEPCMD(0)) / 16;
@@ -42,7 +42,7 @@ static void write32(void *c, uint32_t reg, uint32_t value)
             assert(trb_bus == dma_bus + 4096 + ep * 64);
             const struct dwc3_trb *t = (void *)(dma + 4096 + ep * 64);
             uint64_t data_bus = (uint64_t)t->bph << 32 | t->bpl;
-            assert(data_bus == dma_bus + 8192 + ep * 4096);
+            assert(data_bus == dma_bus + dwc3_ep_buffer_offset(ep));
             regs[reg / 4] |= 1u << 16;
         }
         if (cmd == DWC3_DEPCMD_SETEPCONFIG && ep == 5)
@@ -61,7 +61,10 @@ static void dma_sync(void *c, void *p, size_t n, enum dwc3_sync_direction dir)
 static void barrier(void *c) { (void)c; }
 static const struct dwc3_platform platform = {0, read32, write32, delay, dma_sync, barrier, 0};
 static struct dwc3 *dev = (void *)context;
-static const struct dwc3_identity identity = {0x1209, 0x316d, "Core test", "USB debug", "GenericDwc3"};
+static const struct dwc3_identity identity = {0x1209, 0x316d, "Core test", "USB debug", "GenericDwc3", 0};
+static const struct dwc3_identity identity_dual = {
+    0x1209, 0x316d, "Core test", "USB debug", "GenericDwc3", DWC3_ID_OPTION_SECOND_PORT
+};
 static struct dwc3_trb *eptrb(unsigned ep) { return (void *)(dma + 4096 + ep * 64); }
 static void event(uint32_t e)
 {
@@ -120,9 +123,115 @@ static void descriptor_tests(void)
     assert(!dwc3_descriptor(dev, 3, 99, 0, &n) && n == 0);
     puts("PASS: one CDC ACM function, functional descriptors, endpoint sizes and exact serial");
 }
+/* T131: default-off byte equivalence plus the optional composite dual-CDC
+ * descriptor set and its second pipe's data path. */
+static const uint8_t expect_config_fs[67] = {
+    9, 2, 67, 0, 2, 1, 0, 0x80, 50,
+    9, 4, 0, 0, 1, 2, 2, 1, 0,
+    5, 0x24, 0, 0x10, 1,
+    5, 0x24, 1, 0, 1,
+    4, 0x24, 2, 2,
+    5, 0x24, 6, 0, 1,
+    7, 5, 0x81, 3, 16, 0, 10,
+    9, 4, 1, 0, 2, 0x0a, 0, 0, 0,
+    7, 5, 0x02, 2, 64, 0, 0,
+    7, 5, 0x82, 2, 64, 0, 0
+};
+static void dual_port_tests(void)
+{
+    size_t n, offset;
+    const uint8_t *p;
+    unsigned interfaces = 0, endpoints = 0, iads = 0, unions = 0, acms = 0;
+    unsigned char ep_seen[256] = {0};
+
+    /* The previous main-path init intentionally failed (stuck command), which
+     * leaves the context uninitialized.  Restore a clean single-function core
+     * before asserting the default enumeration bytes. */
+    timeout_commands = 0;
+    assert(dwc3_init(context, sizeof(context), &platform, &identity,
+                     dma, dma_bus, sizeof(dma)) == 0);
+    /* Default-off guard: the enumeration bytes are exactly the historical ones. */
+    p = dwc3_descriptor(dev, 2, 0, 1, &n);
+    assert(n == sizeof(expect_config_fs));
+    assert(!memcmp(p, expect_config_fs, n));
+    /* Pipe 1 is inert while the identity option is clear. */
+    assert(dwc3_queue_pipe(dev, 1, "x", 1) == 0);
+    assert(dwc3_queued_pipe(dev, 1) == 0);
+    assert(dwc3_rx_pending_pipe(dev, 1) == 0);
+    {
+        uint8_t tmp[4];
+        assert(dwc3_read_pipe(dev, 1, tmp, sizeof(tmp)) == 0);
+    }
+
+    timeout_commands = 0;
+    regs[DWC3_GHWPARAMS3 / 4] = (10u << 12) | (5u << 18);
+    assert(dwc3_stop(dev) == 0);
+    assert(dwc3_init(context, sizeof(context), &platform, &identity_dual,
+                     dma, dma_bus, sizeof(dma)) == 0);
+    assert(dwc3_start(dev) == 0);
+
+    p = dwc3_descriptor(dev, 1, 0, 0, &n);
+    assert(n == 18 && p[4] == 0xef && p[5] == 2 && p[6] == 1);
+    p = dwc3_descriptor(dev, 6, 0, 0, &n);
+    assert(n == 10 && p[4] == 0xef && p[5] == 2 && p[6] == 1);
+    p = dwc3_descriptor(dev, 2, 0, 0, &n);
+    assert(n == 141 && p[2] == 141 && p[4] == 4);
+    for (offset = 0; offset < n; offset += p[offset]) {
+        assert(p[offset] >= 2 && offset + p[offset] <= n);
+        if (p[offset + 1] == 0x0b) {
+            iads++;
+            assert(p[offset] == 8);
+        }
+        if (p[offset + 1] == 4) {
+            interfaces++;
+            assert(p[offset + 3] == 0);
+            if (p[offset + 5] == 2) assert(p[offset + 2] == interfaces - 1);
+            else assert(p[offset + 5] == 0x0a);
+        }
+        if (p[offset + 1] == 5) {
+            endpoints++;
+            assert(!ep_seen[p[offset + 2]]);
+            ep_seen[p[offset + 2]] = 1;
+            assert((p[offset + 4] == 0 && p[offset + 5] == 2) ||
+                   (p[offset + 4] == 64 && p[offset + 5] == 0) ||
+                   (p[offset + 4] == 16 && p[offset + 5] == 0));
+        }
+        if (p[offset + 1] == 0x24 && p[offset + 2] == 6) {
+            unions++;
+            assert(p[offset + 3] == 2u * (unions - 1) && p[offset + 4] == 2u * unions - 1);
+        }
+        if (p[offset + 1] == 0x24 && p[offset + 2] == 2) acms++;
+    }
+    assert(offset == n && interfaces == 4 && endpoints == 6 && iads == 2 &&
+           unions == 2 && acms == 2);
+    assert(ep_seen[0x81] && ep_seen[0x02] && ep_seen[0x82] &&
+           ep_seen[0x83] && ep_seen[0x04] && ep_seen[0x84]);
+
+    event(1u | (DWC3_DEVT_USBRST << 8));
+    event(1u | (DWC3_DEVT_CONNECTDONE << 8));
+    assert(dwc3_poll(dev, 32) == 2);
+    setup(0, 9, 1, 0, 0); status_in(DWC3_TRBCTL_CONTROL_STATUS2);
+    setup(0x21, 0x22, 1, 2, 0); status_in(DWC3_TRBCTL_CONTROL_STATUS2);
+    assert(dwc3_ready(dev));
+    assert(eptrb(8)->size == dwc3_ep_buffer_size(8));
+    assert(dwc3_queue_pipe(dev, 1, "KDPFRAME", 9) == 9);
+    assert(dwc3_poll(dev, 32) == 0 && eptrb(9)->size == 9);
+    complete(9, 0);
+    assert(dwc3_queued_pipe(dev, 1) == 0);
+    {
+        static const char kdp[] = "\xfa\x01\x02\xfb";
+        uint8_t got[8];
+        memcpy(dma + dwc3_ep_buffer_offset(8), kdp, sizeof(kdp) - 1);
+        complete(8, (unsigned)(dwc3_ep_buffer_size(8) - (sizeof(kdp) - 1)));
+        assert(dwc3_rx_pending_pipe(dev, 1) == sizeof(kdp) - 1);
+        assert(dwc3_read_pipe(dev, 1, got, sizeof(got)) == sizeof(kdp) - 1);
+        assert(!memcmp(got, kdp, sizeof(kdp) - 1));
+    }
+    puts("PASS: T131 default single-function bytes unchanged; dual composite descriptors and pipe 1 data path");
+}
 int main(void)
 {
-    assert(sizeof(context) == 20480);
+    assert(sizeof(context) == DWC3_CONTEXT_BYTES);
     assert(dwc3_context_bytes() < sizeof(context));
     assert(dwc3_context_bytes() <= sizeof(context));
     assert(dwc3_init(context, sizeof(context), &platform, &identity, dma + 1, dma_bus, sizeof(dma)) == -1);
@@ -154,7 +263,7 @@ int main(void)
         _Alignas(8) static uint8_t other_context[DWC3_CONTEXT_BYTES];
         struct dwc3_platform other_platform = platform;
         char serial_text[] = "IndependentCore";
-        struct dwc3_identity other_id = {0x1234, 0x5678, "Other platform", "Other CDC", serial_text};
+        struct dwc3_identity other_id = {0x1234, 0x5678, "Other platform", "Other CDC", serial_text, 0};
         const uint8_t *desc;
         size_t length;
         other_platform.cookie = other_dma;
@@ -180,7 +289,7 @@ int main(void)
     assert(eptrb(0)->size == 8 && !dwc3_ready(dev));
     setup(0x80, 6, 0x0100, 0, 18);
     not_ready(1, DEPEVT_STATUS_CONTROL_DATA);
-    assert(eptrb(1)->size == 18 && dma[8192 + 4096] == 18);
+    assert(eptrb(1)->size == 18 && dma[dwc3_ep_buffer_offset(1)] == 18);
     complete(1, 0); not_ready(0, DEPEVT_STATUS_CONTROL_STATUS);
     assert((eptrb(0)->ctrl & (63u << 4)) == DWC3_TRBCTL_CONTROL_STATUS3);
     complete(0, 0);
@@ -195,10 +304,11 @@ int main(void)
         static const char first_rx[] = "SXNU1 partial\r\n";
         uint8_t received[32];
         unsigned before_from = from_syncs;
-        memcpy(dma + 8192 + 4 * 4096, first_rx, sizeof(first_rx) - 1);
-        complete(4, 4096u - (sizeof(first_rx) - 1));
+        memcpy(dma + dwc3_ep_buffer_offset(4), first_rx, sizeof(first_rx) - 1);
+        complete(4, (unsigned)(dwc3_ep_buffer_size(4) - (sizeof(first_rx) - 1)));
         assert(from_syncs > before_from);
-        assert(last_from_pointer == dma + 8192 + 4 * 4096 && last_from_bytes == 4096u);
+        assert(last_from_pointer == dma + dwc3_ep_buffer_offset(4) &&
+               last_from_bytes == dwc3_ep_buffer_size(4));
         assert(dwc3_rx_pending(dev) == sizeof(first_rx) - 1);
         assert(dwc3_read(dev, received, 4) == 4 && !memcmp(received, "SXNU", 4));
         assert(dwc3_rx_pending(dev) == sizeof(first_rx) - 1 - 4);
@@ -211,15 +321,15 @@ int main(void)
         uint8_t overflow[600];
         uint8_t drained[DWC3_RX_BYTES + 1];
         memset(overflow, 'R', sizeof(overflow));
-        memcpy(dma + 8192 + 4 * 4096, overflow, sizeof(overflow));
-        complete(4, 4096u - sizeof(overflow));
+        memcpy(dma + dwc3_ep_buffer_offset(4), overflow, sizeof(overflow));
+        complete(4, (unsigned)(dwc3_ep_buffer_size(4) - sizeof(overflow)));
         assert(dwc3_rx_pending(dev) == DWC3_RX_BYTES);
         assert(dwc3_rx_overflow(dev) == sizeof(overflow) - DWC3_RX_BYTES);
         assert(dwc3_read(dev, drained, sizeof(drained)) == DWC3_RX_BYTES);
         assert(drained[0] == 'R' && drained[DWC3_RX_BYTES - 1] == 'R');
         assert(dwc3_rx_pending(dev) == 0);
     }
-    assert(eptrb(5)->size == 10 && !memcmp(dma + 8192 + 5 * 4096, "early log\n", 10));
+    assert(eptrb(5)->size == 10 && !memcmp(dma + dwc3_ep_buffer_offset(5), "early log\n", 10));
     assert(dwc3_queued(dev) == 10);
     complete(5, 0); assert(dwc3_queued(dev) == 0);
     puts("PASS: reset/connect, bounded event budget, GET_DESCRIPTOR, 3-stage and 2-stage control, DTR, queued early log");
@@ -235,7 +345,7 @@ int main(void)
     not_ready(0, DEPEVT_STATUS_CONTROL_DATA); memcpy(dma + 8192, "1234567", 7); complete(0, 57);
     status_in(DWC3_TRBCTL_CONTROL_STATUS3);
     setup(0xa1, 0x21, 0, 0, 7); not_ready(1, DEPEVT_STATUS_CONTROL_DATA);
-    assert(!memcmp(dma + 8192 + 4096, "1234567", 7));
+    assert(!memcmp(dma + dwc3_ep_buffer_offset(1), "1234567", 7));
     complete(1, 0); not_ready(0, DEPEVT_STATUS_CONTROL_STATUS); complete(0, 0);
     puts("PASS: invalid CDC interface rejection and exact 7-byte line-coding OUT/IN");
     assert(dwc3_queue(dev, payload, sizeof(payload)) == 512);
@@ -251,8 +361,8 @@ int main(void)
     assert(dwc3_queue(dev, "reset log\n", 10) == 10);
     {
         static const char stale[] = "stale RX";
-        memcpy(dma + 8192 + 4 * 4096, stale, sizeof(stale) - 1);
-        complete(4, 4096u - (sizeof(stale) - 1));
+        memcpy(dma + dwc3_ep_buffer_offset(4), stale, sizeof(stale) - 1);
+        complete(4, (unsigned)(dwc3_ep_buffer_size(4) - (sizeof(stale) - 1)));
         assert(dwc3_rx_pending(dev) == sizeof(stale) - 1);
     }
     assert(dwc3_poll(dev, 32) == 0);
@@ -317,5 +427,6 @@ int main(void)
     assert(delays == before_timeout + 10000 && regs[DWC3_DEVTEN / 4] == 0 && regs[DWC3_DALEPENA / 4] == 0);
     assert(regs[DWC3_GUSB2PHYCFG(0) / 4] == ((1u << 6) | (1u << 8)));
     puts("PASS: unknown core refuses before writes; stuck command exits within 10000 one-microsecond polls");
+    dual_port_tests();
     return 0;
 }

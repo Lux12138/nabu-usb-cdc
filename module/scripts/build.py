@@ -14,10 +14,12 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 UNITS = ('kernel/QcomXnuUsbDebug.c', 'kernel/QcomKdpNet.c',
          'kernel/QcomUsbScreenshot.c', 'usb/Dwc3.c', 'soc/QcomUsbQualify.c',
-         'soc/QcomUsbPrepare.c', 'soc/QcomUsbDmaDomain.c', 'soc/QcomUsbBypass.c')
+         'soc/QcomUsbPrepare.c', 'soc/QcomUsbDmaDomain.c', 'soc/QcomUsbBypass.c',
+         # T140 DEVTREE provider: the IOKit device-tree walk needs C++.
+         'kernel/QcomUsbDTDebug.cpp')
 
 
-def compile_flags(record):
+def compile_flags(record, cpp=False):
     args = record['arguments']
     if not isinstance(args, list) or not args or not all(isinstance(a, str) for a in args):
         raise ValueError('record must contain an arguments array')
@@ -51,6 +53,37 @@ def compile_flags(record):
             continue
         flags.append(a)
         i += 1
+    if cpp:
+        # The reference record forces C (-xc); a .cpp unit compiles as C++ with
+        # the same standard the kernel's own C++ units use (-xc++ -std=gnu++2b).
+        if '-xc' in flags:
+            k = flags.index('-xc')
+            flags[k:k + 1] = ['-xc++', '-std=gnu++2b']
+        else:
+            flags = ['-xc++', '-std=gnu++2b'] + flags
+        # A .cpp unit that includes <libkern/libkern.h> reaches sys/cdefs.h, which
+        # includes <sys/_symbol_aliasing.h>.  That header lives in the fakeroot's
+        # usr/include, and the reference record only lists usr/local/include, so
+        # derive usr/include from whatever fakeroot the record points at instead
+        # of hard-coding a path.
+        want = '.cache/fakeroot/usr/local/include'
+        for i, f in enumerate(flags):
+            if want not in f:
+                continue
+            root = f.split(want, 1)[0]
+            inc = root + '.cache/fakeroot/usr/include'
+            if inc in flags:
+                break
+            # Headers arrive as the pair '-I', '<path>', so the new directory has
+            # to be inserted as a pair too: inserting the path alone leaves the
+            # original '-I' bound to it and turns the original path into a bare
+            # input file ("cannot specify -o when generating multiple output
+            # files").
+            if i > 0 and flags[i - 1] == '-I':
+                flags[i - 1:i + 1] = ['-I', inc, '-I', f]
+            else:
+                flags.insert(i, inc)
+            break
     return flags, cwd
 
 
@@ -90,7 +123,12 @@ def main():
     try:
         for unit in UNITS:
             obj = out / (Path(unit).stem + '.o')
-            command = flags + defines + ['-Wno-switch-default', '-c', str(ROOT / unit), '-o', str(obj)]
+            # T140: a .cpp unit must be compiled as C++ (-xc++ -std=gnu++2b) and
+            # needs the fakeroot's usr/include for sys/_symbol_aliasing.h; both
+            # live in compile_flags() behind its cpp argument, so pass it here or
+            # the .cpp is silently compiled as C ("unknown type name 'class'").
+            unit_flags, _ = compile_flags(record, cpp=unit.endswith('.cpp'))
+            command = unit_flags + defines + ['-Wno-switch-default', '-c', str(ROOT / unit), '-o', str(obj)]
             report['commands'].append(command)
             with (out / (obj.stem + '.log')).open('wb') as log:
                 subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -119,7 +157,36 @@ def main():
                    '_native_legacy_transfer', '_native_legacy_surfaces',
                    '_native_legacy_direct', '_native_legacy_validation',
                    '_native_ufs_dpu_smmu', '_native_ufs_dpu_state',
+                   # T142 telemetry store: weak exports the storage driver adds for
+                   # T103 4.2. Declared weak_import, so a build without them links and
+                   # the TELDUMP/TELREAD verbs answer unsupported at run time.
+                   '_native_ufs_tel_open', '_native_ufs_tel_read',
+                   '_native_ufs_tel_write', '_native_ufs_tel_sync',
+                   # T150: DEVTREE off-console thread needs these XNU imports
+                   '_IOLog', '_kernel_thread_start', '_thread_deallocate',
+                   '_thread_terminate_self',
+                   # T144 fuel gauge: weak imports of the l738-device SPMI layer
+                   # (drivers/NabuSpmi).  A kernel without it links, and FGREAD
+                   # answers ERR nosp mi at run time.
+                   '_nabu_spmi_init', '_nabu_spmi_enabled',
+                   '_nabu_spmi_apid_for',
+                   '_nabu_spmi_ext_readl', '_nabu_spmi_ext_read',
                    '_Debugger',
+                   # T141 bus primitives: SYSREGSCAN's expected-fault claim.
+                   # ml_expect_fault_pc_begin/end are the XNU API that lets an
+                   # undefined MRS be claimed instead of panicking, and
+                   # ml_set_interrupts_enabled brackets the armed window.
+                   '_ml_expect_fault_pc_begin', '_ml_expect_fault_end',
+                   '_ml_set_interrupts_enabled',
+                   # T140 DEVTREE: the IOKit device-tree walk (QcomUsbDTDebug.cpp)
+                   # uses the registry API directly -- IORegistryEntry::fromPath on the
+                   # gIODTPlane, OSData/OSSymbol metaClass for safeMetaCast, and the
+                   # gIODT*Key globals for compatible/device_type/model properties.
+                   '__ZN15IORegistryEntry8fromPathEPKcPK15IORegistryPlanePcPiPS_',
+                   '__ZN15IORegistryEntry9metaClassE',
+                   '__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass',
+                   '__ZN6OSData9metaClassE', '__ZN8OSSymbol9metaClassE',
+                   '_gIODTPlane', '_gIODTCompatibleKey', '_gIODTModelKey', '_gIODTTypeKey',
                    '_gPhysBase', '_real_phys_size', '_cpu_ttep',
                    '_gPanicBase', '_gPanicSize',
                    '_sysctlbyname', '_tasks', '_kernproc', '_proc_struct_size',

@@ -5,6 +5,7 @@
 #include "QcomXnuUsbDebug.h"
 #include "QcomUsbBuffer.h"
 #include "QcomUsbControl.h"
+#include "QcomUsbForensics.h" /* T140: pure parsing/planning for the forensics verbs */
 #include "QcomUsbScreenshot.h"
 #include "../usb/Dwc3.h"
 #include "../soc/QcomUsbQualify.h"
@@ -44,6 +45,15 @@ extern void Debugger(const char *message) __attribute__((weak_import));
 
 /* Arbitrary kernel memory access for the diagnostics verbs; QcomUsbDiag.c. */
 #include "QcomUsbDiag.c"
+/* Read-only bus primitives (TLMM GPIO, GIC snapshot) and the SYSREGSCAN
+ * batch reader. Both are gated behind nabu-verbs-bus=1. Included rather than
+ * added to build.py UNITS so the archive keeps one translation unit and the
+ * new code compiles under exactly the same recipe flags as the console. */
+#include "QcomUsbBusPrims.c"
+#include "QcomUsbSysregScan.c"
+/* T144: PM8150B Gen4 fuel gauge probe (T91 P1).  Read-only, nabu-fg=1 gated,
+ * same weak-import transport discipline as the buttons. */
+#include "QcomFuelGauge.c"
 
 /* The real panic(), deliberately NOT the osfmk/kern/debug.h macro: that header
  * is kernel-private and its panic() appends the call site, which would put
@@ -52,15 +62,95 @@ extern void Debugger(const char *message) __attribute__((weak_import));
 /* panic is already a macro in the kernel headers this file pulls in, so the
  * declaration has to escape it with parentheses. Same for the call site. */
 extern void (panic)(const char *format, ...) __attribute__((noreturn));
+/* T140 forensics verbs: device-tree walk (kernel/QcomUsbDTDebug.cpp) and the
+ * live NABULOG window geometry (kernel/QcomUsbDiag.c). Explicit declarations
+ * keep the new call sites out of the implicit-declaration warning list. */
+extern int native_dt_explore(const char *path, char *out, size_t cap,
+                             size_t *used, const char **why,
+                             uint32_t max_entries, int *truncated);
+extern int qud_nabulog_open(uint64_t *first, uint64_t *blocks, const char **why);
+
+/* T150 DEVTREE off-console execution (boot-arg nabu-dt-thread=1, default off).
+ *
+ * T149 measured every DEVTREE producing no reply at all while the rest of the
+ * console stayed healthy. The walk is the only code on that path that enters
+ * the IORegistry, and its locks can sleep; running it synchronously on the
+ * console worker turns a slow/wedged registry operation into console silence.
+ * With this gate on, the handler snapshots the request, a one-shot kernel
+ * thread performs the walk, and the handler answers with the cached dump or an
+ * explicit ERR (busy/slow/nothread) after a bounded wait.
+ *
+ * Prototypes mirror kern/sched_prim.h / kern/thread.h, which stay hidden from
+ * this translation unit's header set; IOLog comes from iokit/Kernel/IOLib.cpp.
+ */
+typedef void (*qud_dt_thread_fn)(void *, unsigned int);
+extern int kernel_thread_start(qud_dt_thread_fn continuation, void *parameter,
+                               void **new_thread);
+extern void thread_deallocate(void *thread);
+extern void thread_terminate_self(void);
+extern void IOLog(const char *format, ...);
+
+/* Shared job slot: the console handler fills it and starts the walker; the
+ * walker publishes the result. state: 0 idle, 1 running, 2 done, 3 failed.
+ * The handler only overwrites a slot that is not running. */
+struct qud_dt_job {
+    char path[64];
+    uint32_t max_entries;
+    char body[384];
+    size_t used;
+    const char *why;
+    int truncated;
+    uint32_t state;
+    uint64_t submit_tick;
+};
+static struct qud_dt_job qud_dt_job;
+static int qud_dt_gate = -1;            /* -1 unevaluated, 0 off, 1 on */
+
+static int
+qud_dt_thread_enabled(void)
+{
+    if (qud_dt_gate < 0) {
+        int v = 0;
+        (void)PE_parse_boot_argn("nabu-dt-thread", &v, sizeof(v));
+        qud_dt_gate = (v == 1) ? 1 : 0;
+    }
+    return qud_dt_gate == 1;
+}
 
 /* Defined far below (the KDP reply gate), but PANICTRIG needs it before the call
  * to make sure the panic message can still leave. */
 void qcom_usb_debug_kdp_tx_mode(int on);
 
+/* T131: the optional KDP transport module (QcomKdpNet.c) is linked after this
+ * file, and its active flag decides which CDC data interface carries KDP. */
+int qcom_usb_debug_kdp_net_active(void);
+/* T143: qcom_usb_debug_write() consults the KDP reply transmit gate far above
+ * the definition further down.  T131 added the call without a prototype and
+ * clang-24 rejects it as an implicit declaration; the required real compile
+ * caught it.  Declaration only -- no behaviour change. */
+int qcom_usb_debug_kdp_tx_active(void);
+
 /* kb-17u KDP ring state. Declared up here because qcom_usb_debug_write()
  * (which runs from kprintf) and the DEBUGGER verb both consult them
  * long before the ring implementation further down. */
 static volatile uint32_t kdp_rx_armed;
+/* T143: pipe 1 (the second CDC data interface) owns an independent KDP latch.
+ * kdp_rx_armed stays the pipe-0/console latch, so raising or clearing one can
+ * never change the other. */
+static volatile uint32_t kdp_rx_armed1;
+/* T143: a Debugger() call is on the stack, from either pipe.  Serialises trap
+ * entry so a frame arriving while a session is unwinding cannot nest a second
+ * Debugger() (XNU's CPUDEBUGGERCOUNT guard would spin). */
+static volatile uint32_t kdp_trap_active;
+/* T143: true while either pipe owns a KDP session.  Only the controller-level
+ * effects (poll budget, io_failed latch, diag flush window, serial input
+ * routing) look at this; per-pipe flags stay authoritative everywhere else. */
+static uint32_t
+kdp_session_active(void)
+{
+    return __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&kdp_rx_armed1, __ATOMIC_ACQUIRE);
+}
 /* kb-32: the shared bounded DWC3 RX drain, defined far below. The KDP input
  * predicates call it while armed so a request sent after CONNECT is seen. */
 static void serial_rx_drain(void);
@@ -107,6 +197,13 @@ static volatile uint32_t kdp_tx_mode;
 #define COUNTER_MAX_FREQUENCY UINT64_C(1000000000)
 #define CONTROL_PE_RESTART_CPU 1u
 
+/* T142 trace-ring gates.  Tentative declarations here because
+ * qcom_usb_debug_init() assigns them; the definitions live in the trace
+ * block further down so tests/check.py's extracted control-handler window
+ * is a complete translation unit.  0 = boot-arg absent = verbs refuse. */
+static int qud_trace_bootarg_gate;
+static int qud_tel_bootarg_gate;
+
 /* The platform callback ABI is unchanged from Darwin22 IOPlatformExpert.h.
  * Only the control opt-in may atomically install into this NULL global. */
 extern int (*PE_halt_restart)(unsigned int);
@@ -115,6 +212,19 @@ static uint8_t usb_dma[DWC3_DMA_BYTES] __attribute__((aligned(DWC3_DMA_ALIGNMENT
 static uint8_t usb_tables[QUSB_DOMAIN_PT_BYTES] __attribute__((aligned(PAGE_BYTES)));
 static uint8_t usb_context[NATIVE_CONTEXT_BYTES] __attribute__((aligned(DWC3_CONTEXT_ALIGNMENT)));
 static volatile unsigned int usb_busy;
+/* T131: nabu-cdc-second-port=1 asks the DWC3 core for the composite dual-CDC
+ * descriptors and endpoints.  Default off keeps the single-function device and
+ * every existing code path exactly as before. */
+static unsigned int cdc_second_port;
+/* T143: nabu-cdc-second-port=2 adds "pipe 1 activates KDP by itself" on top of
+ * the =1 dual-interface behaviour.  0/absent and 1 keep the historical path,
+ * so the boot-arg string itself costs zero extra command-line bytes. */
+static unsigned int kdp_pipe1_mode;
+/* Volatile like usb_serial_rx_kdp: the worker and a keyboard poll can both
+ * reach the drain, and the detector state must not be cached across them. */
+static volatile uint32_t kdp_pipe1_in_frame;    /* inside 0xFA..0xFB */
+static volatile uint32_t kdp_pipe1_arm_pending; /* complete frame waits for trap */
+static volatile uint32_t kdp_pipe1_enters, kdp_pipe1_stray;
 static volatile unsigned int usb_diag_enabled, usb_diag_checkpoint, usb_diag_resetting, usb_diag_target;
 static volatile unsigned int usb_diag_mode, usb_diag_polling;
 static uint8_t usb_log_bytes[SOC_USB_LOG_BUFFER_BYTES];
@@ -139,6 +249,10 @@ static struct {
     uint64_t seed;
 } usb_control_context;
 static volatile unsigned int control_started, control_enabled;
+/* T140: DEVTREE / FBRAW / NABULOGRING are parsed always but only execute
+ * behind this boot-arg. Default off; with it off the handler rejects them
+ * exactly like an unknown verb (counted, no reply, sequence untouched). */
+static unsigned usb_forensics_verbs;
 static volatile unsigned int control_hook_owned, control_reboot_requested;
 static volatile unsigned int control_reboot_taken, control_reboot_armed;
 static volatile uint32_t control_rejected, control_reply_count, control_failures;
@@ -754,9 +868,16 @@ int qcom_usb_debug_init(void)
     QUSB_DOMAIN_RESULT domain_result;
     QUSB_INHERITED inherited;
     struct dwc3_platform platform;
-    static const struct dwc3_identity identity = {
-        QUD_USB_VID, QUD_USB_PID, "UniXNU", QUD_USB_PRODUCT, QUD_USB_SERIAL
+    struct dwc3_identity identity = {
+        QUD_USB_VID, QUD_USB_PID, "UniXNU", QUD_USB_PRODUCT, QUD_USB_SERIAL, 0u
     };
+    int second_port = 0;
+    /* T131: default off.  Parsed before the identity is handed to dwc3_init so
+     * the descriptor set the host sees is decided by this single boot-arg. */
+    (void)PE_parse_boot_argn("nabu-cdc-second-port", &second_port, sizeof(second_port));
+    cdc_second_port = second_port >= 1;
+    kdp_pipe1_mode = second_port >= 2;
+    identity.options = cdc_second_port ? DWC3_ID_OPTION_SECOND_PORT : 0u;
     if (native.status.phase == QCOM_USB_DEBUG_NOT_INITIALIZED) {
         int diagnostic = 0;
         if (QUD_PSCI_SMC_RESET &&
@@ -785,6 +906,20 @@ int qcom_usb_debug_init(void)
     }
     if (!PE_parse_boot_argn("qcom-usb-debug", &enabled, sizeof(enabled)) || enabled != 1) {
         native.status.phase = QCOM_USB_DEBUG_DISABLED; goto out;
+    }
+    {
+        int forensics = 0;
+        (void)PE_parse_boot_argn("nabu-verbs-forensics", &forensics, sizeof(forensics));
+        usb_forensics_verbs = forensics == 1;
+    }
+    /* T142: optional trace ring / telemetry store.  Parsed only on the
+     * enabled path; both gates stay 0 (refuse) without their boot-arg. */
+    {
+        int trace_gate = 0, tel_gate = 0;
+        (void)PE_parse_boot_argn("nabu-trace", &trace_gate, sizeof(trace_gate));
+        (void)PE_parse_boot_argn("nabu-tel", &tel_gate, sizeof(tel_gate));
+        qud_trace_bootarg_gate = trace_gate == 1;
+        qud_tel_bootarg_gate = tel_gate == 1;
     }
     native.status.phase = QCOM_USB_DEBUG_PREPARING;
     diag_checkpoint(QCOM_USB_DEBUG_DIAG_AFTER_ACQUIRE);
@@ -1104,7 +1239,7 @@ static int poll_owned(void)
      * ticks per 1 KiB packet. 8 lets one poll both retire the completions and
      * start the next transfer, which is what makes the whole packet move in one
      * tick. It stays far below the 256 clamp. */
-    ret = dwc3_poll(native.core, __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) ? 64u : 8u);
+    ret = dwc3_poll(native.core, kdp_session_active() ? 64u : 8u);
     native.status.poll_calls++;
     native.status.last_poll_events = ret < 0 ? 0u : (uint32_t)ret;
     buffer_status_owned();
@@ -1134,7 +1269,7 @@ static int poll_owned(void)
          * error, skip the latch, and report failure to this one caller only.
          * Outside the debugger the old behaviour stays -- a real controller
          * fault must still stop the worker instead of polling a dead core. */
-        if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+        if (!kdp_session_active()) {
             native.status.phase = QCOM_USB_DEBUG_IO_FAILED;
         } else {
             /* io_failed is just as one-way as phase, and it is the other half
@@ -1264,7 +1399,26 @@ static size_t control_reply_status(char *reply, size_t capacity,
         !sxnu_control_writer_text(&writer, " kdd=") ||
         !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_death_count, __ATOMIC_RELAXED)) ||
         !sxnu_control_writer_text(&writer, " kgen=") ||
-        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_generation_changes, __ATOMIC_RELAXED))) return 0;
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_generation_changes, __ATOMIC_RELAXED)) ||
+        !sxnu_control_writer_text(&writer, " kp1=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_pipe1_enters, __ATOMIC_RELAXED)) ||
+        !sxnu_control_writer_text(&writer, " kp1d=") ||
+        !sxnu_control_writer_decimal(&writer, __atomic_load_n(&kdp_pipe1_stray, __ATOMIC_RELAXED))) return 0;
+    /* T150: DEVTREE job visibility, appended only when the new gate is on so
+     * the default-off STATUS reply stays byte-for-byte identical. */
+    if (qud_dt_thread_enabled()) {
+        uint64_t now = counter();
+        uint32_t ms = 0;
+        if (qud_dt_job.submit_tick && now > qud_dt_job.submit_tick &&
+            native.status.counter_frequency)
+            ms = (uint32_t)((now - qud_dt_job.submit_tick) * 1000u /
+                            native.status.counter_frequency);
+        (void)sxnu_control_writer_text(&writer, " dt=");
+        (void)sxnu_control_writer_decimal(&writer,
+            __atomic_load_n(&qud_dt_job.state, __ATOMIC_RELAXED));
+        (void)sxnu_control_writer_text(&writer, " dtms=");
+        (void)sxnu_control_writer_decimal(&writer, ms);
+    }
     return sxnu_control_reply_finish(&writer);
 }
 static size_t control_reply_reboot(char *reply, size_t capacity,
@@ -1310,6 +1464,435 @@ control_args_hex(const uint8_t *text, size_t bytes, uint64_t *value)
     return sxnu_control_parse_hex(text, bytes, value);
 }
 
+
+/* T142-trace: begin */
+/* ---- T142: periodic trace ring and telemetry-store verbs ------------------
+ *
+ * TRACEON/TRACEREAD/TRACECLEAR sample this console's own health into a
+ * private ring, so a crash leaves a time-ordered tail even when no operator
+ * was watching the port.  TELDUMP/TELREAD are the interface skeleton for the
+ * NABUTEL1 store designed in T103: they call the weak native_ufs_tel_*
+ * exports the storage driver is expected to add (PLAN.md 4.2).  Until those
+ * exports exist both answer state=unsupported -- nothing is guessed and no
+ * medium is written.
+ *
+ * Where the memory lives: qud_trace_ring is kernel BSS, 512 records x 16
+ * bytes = 8 KiB fixed at link time.  No allocation, no scheduler, no
+ * interrupt dependency; the only writer is the USB worker tick, so the ring
+ * cannot fail in a way that disturbs the console.
+ *
+ * Default off: every verb refuses with state=disabled unless nabu-trace=1
+ * (ring) or nabu-tel=1 (store).  With the boot-args absent nothing is sampled,
+ * written or cleared, so this patch is inert on a device that does not opt in.
+ *
+ * Record layout (16 bytes, little-endian):
+ *   ts   8B  CNTVCT_EL0 ticks -- the same base UPTIME reports; monotonic
+ *   type 4B  QUD_TRACE_TYPE_*
+ *   arg  4B  class-specific scalar
+ *
+ * Event classes (TRACEON mask bits):
+ *   0x1 tick      one record per interval; arg = poll_calls
+ *   0x2 pressure  buffer/backlog pressure changes only; arg = overflow|rxo<<16
+ *   0x4 control   control-reject count changes only; arg = control_rejected
+ *   0x8 error     phase/error changes only; arg = error|phase<<16
+ * The change-only classes keep a quiet console from filling the ring with
+ * identical rows; an event is still recorded at the next interval boundary.
+ */
+#define QUD_TRACE_RECORDS_MAX   512u
+#define QUD_TRACE_READ_MAX      10u
+#define QUD_TRACE_TYPES         UINT32_C(0xf)
+#define QUD_TRACE_INTERVAL_MAX  60000u
+
+#define QUD_TRACE_TYPE_TICK      UINT32_C(0x1)
+#define QUD_TRACE_TYPE_PRESSURE  UINT32_C(0x2)
+#define QUD_TRACE_TYPE_CONTROL   UINT32_C(0x4)
+#define QUD_TRACE_TYPE_ERROR     UINT32_C(0x8)
+
+struct qud_trace_rec {
+    uint64_t ts;
+    uint32_t type;
+    uint32_t arg;
+};
+_Static_assert(sizeof(struct qud_trace_rec) == 16u,
+               "trace record must stay 16 bytes");
+
+static struct qud_trace_rec qud_trace_ring[QUD_TRACE_RECORDS_MAX];
+static uint64_t qud_trace_total;      /* records appended since clear */
+static uint32_t qud_trace_head;       /* next write slot (monotonic) */
+static uint32_t qud_trace_dropped;    /* records lost to overwrite */
+static uint32_t qud_trace_mask;       /* enabled event types */
+static uint32_t qud_trace_interval_ms;
+static uint64_t qud_trace_last_ts;    /* monotonic guard */
+static uint32_t qud_trace_last_pressure;
+static uint32_t qud_trace_last_control;
+static uint32_t qud_trace_last_error;
+static uint64_t qud_trace_next_at;    /* worker-only: next sample deadline */
+static uint32_t qud_trace_armed;      /* worker-only: deadline is set */
+
+/* Gate definitions live here (not beside the tentative declarations at the
+ * top of the file) so tests/check.py's extracted control-handler window is a
+ * complete translation unit. */
+static int qud_trace_bootarg_gate = 0;
+static int qud_tel_bootarg_gate = 0;
+
+/* Weak exports the storage driver adds for T103 section 4.2.  Declared here,
+ * inside the extracted window, so a host build of this file links with them
+ * undefined and the verbs report unsupported instead of failing to build. */
+extern int native_ufs_tel_open(uint64_t *first_lba, uint64_t *blocks, const char **why)
+    __attribute__((weak_import));
+extern int native_ufs_tel_read(uint64_t rel, uint32_t blocks, void *dst)
+    __attribute__((weak_import));
+extern int native_ufs_tel_write(uint64_t rel, uint32_t blocks, const void *src)
+    __attribute__((weak_import));
+extern int native_ufs_tel_sync(void) __attribute__((weak_import));
+
+static uint32_t
+qud_trace_valid(void)
+{
+    uint64_t total = __atomic_load_n(&qud_trace_total, __ATOMIC_ACQUIRE);
+    return total > QUD_TRACE_RECORDS_MAX ? QUD_TRACE_RECORDS_MAX : (uint32_t)total;
+}
+
+static uint32_t
+qud_trace_oldest_seq(uint32_t valid)
+{
+    uint64_t total = __atomic_load_n(&qud_trace_total, __ATOMIC_ACQUIRE);
+    return (uint32_t)(total - (uint64_t)valid);
+}
+
+static void
+qud_trace_clear(void)
+{
+    __atomic_store_n(&qud_trace_total, UINT64_C(0), __ATOMIC_RELAXED);
+    __atomic_store_n(&qud_trace_head, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&qud_trace_dropped, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&qud_trace_last_ts, UINT64_C(0), __ATOMIC_RELAXED);
+    __atomic_store_n(&qud_trace_last_pressure, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&qud_trace_last_control, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&qud_trace_last_error, 0u, __ATOMIC_RELAXED);
+    qud_trace_next_at = 0;
+    qud_trace_armed = 0;
+}
+
+static void
+qud_trace_put(uint64_t ts, uint32_t type, uint32_t arg)
+{
+    struct qud_trace_rec *slot;
+    uint64_t last = __atomic_load_n(&qud_trace_last_ts, __ATOMIC_RELAXED);
+
+    /* CNTVCT_EL0 is monotonic; clamp rather than store a backwards stamp. */
+    if (ts < last) ts = last;
+    __atomic_store_n(&qud_trace_last_ts, ts, __ATOMIC_RELAXED);
+    if (qud_trace_valid() >= QUD_TRACE_RECORDS_MAX)
+        (void)__atomic_add_fetch(&qud_trace_dropped, 1u, __ATOMIC_RELAXED);
+    slot = &qud_trace_ring[__atomic_load_n(&qud_trace_head, __ATOMIC_RELAXED) &
+                           (QUD_TRACE_RECORDS_MAX - 1u)];
+    slot->ts = ts;
+    __atomic_store_n(&slot->type, type, __ATOMIC_RELAXED);
+    __atomic_store_n(&slot->arg, arg, __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&qud_trace_total, UINT64_C(1), __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&qud_trace_head, 1u, __ATOMIC_RELEASE);
+}
+
+static void
+qud_trace_start(uint32_t interval_ms, uint32_t mask)
+{
+    qud_trace_clear();
+    qud_trace_interval_ms = interval_ms;
+    qud_trace_mask = mask;
+}
+
+/* Called from qcom_usb_debug_poll() with the ARM virtual counter and its
+ * frequency.  Both arrive as arguments so this block compiles and can be
+ * tested without the counter instruction. */
+static void
+qud_trace_tick(uint64_t now, uint64_t hz, const struct qcom_usb_debug_status *status)
+{
+    uint64_t span;
+    uint32_t pressure, control, error;
+
+    if (!qud_trace_bootarg_gate || !qud_trace_mask || !hz || !status) return;
+    span = hz * (uint64_t)qud_trace_interval_ms / 1000u;
+    if (!span) span = hz / 1000u;             /* sub-tick interval */
+    if (!qud_trace_armed) {                    /* first tick after TRACEON */
+        qud_trace_next_at = now + span;
+        qud_trace_armed = 1;
+        return;
+    }
+    if (now < qud_trace_next_at) return;
+    /* Behind by more than one interval: skip the missed samples instead of
+     * writing a burst of back-dated rows. */
+    qud_trace_next_at = now + span;
+
+    if (qud_trace_mask & QUD_TRACE_TYPE_TICK)
+        qud_trace_put(now, QUD_TRACE_TYPE_TICK, status->poll_calls);
+
+    pressure = (uint32_t)status->buffer_overflow |
+               ((uint32_t)status->rx_overflow << 16);
+    if ((qud_trace_mask & QUD_TRACE_TYPE_PRESSURE) &&
+        pressure != qud_trace_last_pressure) {
+        qud_trace_last_pressure = pressure;
+        qud_trace_put(now, QUD_TRACE_TYPE_PRESSURE, pressure);
+    }
+
+    control = status->control_rejected;
+    if ((qud_trace_mask & QUD_TRACE_TYPE_CONTROL) &&
+        control != qud_trace_last_control) {
+        qud_trace_last_control = control;
+        qud_trace_put(now, QUD_TRACE_TYPE_CONTROL, control);
+    }
+
+    error = status->error | ((uint32_t)status->phase << 16);
+    if ((qud_trace_mask & QUD_TRACE_TYPE_ERROR) && error != qud_trace_last_error) {
+        qud_trace_last_error = error;
+        qud_trace_put(now, QUD_TRACE_TYPE_ERROR, error);
+    }
+}
+
+/* Count whitespace-separated tokens without a cap.  control_args_split stops
+ * at its caller's maximum, which would silently accept a third argument; the
+ * parsers below need to reject that. */
+static unsigned
+control_args_count(const uint8_t *text, size_t bytes)
+{
+    unsigned count = 0;
+    size_t i = 0;
+
+    if (!text || !bytes) return 0;
+    while (i < bytes) {
+        while (i < bytes && text[i] == (uint8_t)' ') i++;
+        if (i >= bytes) break;
+        count++;
+        while (i < bytes && text[i] != (uint8_t)' ') i++;
+    }
+    return count;
+}
+
+/* Decimal argument parser (control_args_hex parses bare digits as hex, which
+ * is the wrong default for an interval in milliseconds). */
+static int
+control_args_decimal(const uint8_t *text, size_t bytes, uint64_t *value)
+{
+    uint64_t result = 0;
+    size_t i;
+
+    if (!value || !bytes || bytes > 19u) return 0;
+    for (i = 0; i < bytes; i++) {
+        if (text[i] < (uint8_t)'0' || text[i] > (uint8_t)'9') return 0;
+        if (result > (UINT64_MAX - 9u) / 10u) return 0;
+        result = result * 10u + (uint64_t)(text[i] - (uint8_t)'0');
+    }
+    *value = result;
+    return 1;
+}
+
+/* TRACEON <interval-ms> <type-mask>.  Returns 1 when both arguments are in
+ * range; the caller turns 0 into ERR args.  Kept out of the switch so the
+ * offline self-check drives the real parser. */
+static int
+qud_trace_parse_start(const uint8_t *args, size_t bytes,
+                      uint32_t *interval_ms, uint32_t *mask)
+{
+    const uint8_t *tok[2]; size_t len[2];
+    uint64_t ms = 0, bits = 0;
+    unsigned argc;
+
+    if (control_args_count(args, bytes) != 2u) return 0;
+    argc = control_args_split(args, bytes, tok, len, 2);
+    if (argc != 2) return 0;
+    if (!control_args_decimal(tok[0], len[0], &ms) ||
+        ms < 1u || ms > QUD_TRACE_INTERVAL_MAX) return 0;
+    if (!control_args_hex(tok[1], len[1], &bits) || !bits ||
+        (bits & ~QUD_TRACE_TYPES)) return 0;
+    if (interval_ms) *interval_ms = (uint32_t)ms;
+    if (mask) *mask = (uint32_t)bits;
+    return 1;
+}
+
+/* TRACEREAD [start] [count]: defaults cover the whole window; the reply is
+ * capped at QUD_TRACE_READ_MAX records so one frame stays under 512 bytes. */
+static int
+qud_trace_parse_read(const uint8_t *args, size_t bytes,
+                     uint32_t *start, uint32_t *count)
+{
+    const uint8_t *tok[2]; size_t len[2];
+    uint64_t from = 0, want = QUD_TRACE_READ_MAX;
+    unsigned argc;
+
+    if (control_args_count(args, bytes) > 2u) return 0;
+    argc = control_args_split(args, bytes, tok, len, 2);
+    if (argc > 0 && !control_args_decimal(tok[0], len[0], &from)) return 0;
+    if (argc > 1 && !control_args_decimal(tok[1], len[1], &want)) return 0;
+    if (!want || want > QUD_TRACE_READ_MAX) return 0;
+    if (start) *start = (uint32_t)from;
+    if (count) *count = (uint32_t)want;
+    return 1;
+}
+
+static uint32_t
+qud_trace_read(uint32_t start, uint32_t count, struct qud_trace_rec *dst)
+{
+    uint32_t valid = qud_trace_valid(), i, base;
+
+    if (!dst || start >= valid) return 0;
+    if (count > valid - start) count = valid - start;
+    base = __atomic_load_n(&qud_trace_head, __ATOMIC_ACQUIRE) - valid;
+    for (i = 0; i < count; i++)
+        dst[i] = qud_trace_ring[(base + start + i) & (QUD_TRACE_RECORDS_MAX - 1u)];
+    return count;
+}
+
+/* ---- TELDUMP / TELREAD: NABUTEL1 skeleton (T103 section 4.2) ------------- */
+
+static int
+qud_tel_available(void)
+{
+    return &native_ufs_tel_open != 0 && &native_ufs_tel_read != 0 &&
+           &native_ufs_tel_write != 0;
+}
+
+static int
+qud_tel_parse_dump(const uint8_t *args, size_t bytes,
+                   uint64_t *pa, uint32_t *blocks,
+                   const uint8_t **tag, size_t *taglen)
+{
+    const uint8_t *tok[3]; size_t len[3];
+    uint64_t addr = 0, count = 0;
+    unsigned total, argc;
+
+    total = control_args_count(args, bytes);
+    if (total < 2u || total > 3u) return 0;
+    argc = control_args_split(args, bytes, tok, len, 3);
+    if (argc < 2 ||
+        !control_args_hex(tok[0], len[0], &addr) ||
+        !control_args_hex(tok[1], len[1], &count) ||
+        !count || (count & 0xfffu) || count > (64u << 20)) return 0;
+    if (pa) *pa = addr;
+    if (blocks) *blocks = (uint32_t)(count / 4096u);
+    if (tag) *tag = argc > 2 ? tok[2] : (const uint8_t *)"tel";
+    if (taglen) *taglen = argc > 2 ? len[2] : 3u;
+    return 1;
+}
+/* T142-trace: end */
+
+/* ---- T150: DEVTREE walk executed off the console worker ------------------- */
+
+#define QUD_DT_WAIT_MS  500u
+
+static void
+qud_dt_thread_main(void *argument, unsigned int wait_result)
+{
+    struct qud_dt_job *job = (struct qud_dt_job *)argument;
+    int ok;
+
+    (void)wait_result;
+    IOLog("nabu dt run begin path=%s max=%u\n", job->path,
+          (unsigned)job->max_entries);
+    ok = native_dt_explore(job->path, job->body, sizeof(job->body), &job->used,
+                           &job->why, job->max_entries, &job->truncated);
+    __atomic_store_n(&job->state, ok ? 2u : 3u, __ATOMIC_RELEASE);
+    IOLog("nabu dt run end path=%s rc=%d\n", job->path, ok);
+    thread_terminate_self();
+}
+
+/* Builder for a finished dump: identical wire format to the synchronous path
+ * so host scripts keep working when the gate is on. */
+static size_t
+qud_dt_reply_dump(char *reply, size_t capacity,
+                  const struct sxnu_control_frame *frame,
+                  const char *path, const struct qud_dt_job *job)
+{
+    struct sxnu_control_writer writer;
+
+    sxnu_control_writer_init(&writer, reply, capacity);
+    (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+    (void)sxnu_control_writer_text(&writer, " state=ready path=");
+    (void)sxnu_control_writer_text(&writer, path);
+    (void)sxnu_control_writer_text(&writer, " bytes=");
+    (void)sxnu_control_writer_decimal(&writer, job->used);
+    (void)sxnu_control_writer_text(&writer, " trunc=");
+    (void)sxnu_control_writer_decimal(&writer, (uint64_t)job->truncated);
+    (void)sxnu_control_writer_char(&writer, '\n');
+    (void)sxnu_control_writer_put(&writer, job->body, job->used);
+    return sxnu_control_reply_finish(&writer);
+}
+
+/* Path equality without libc: the module links no strcmp. */
+static int
+qud_dt_path_same(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static size_t
+qud_dt_thread_dispatch(char *reply, size_t capacity,
+                       const struct sxnu_control_frame *frame,
+                       const char *path, uint64_t max_entries)
+{
+    struct qud_dt_job *job = &qud_dt_job;
+    struct sxnu_control_writer writer;
+    uint32_t state;
+    size_t n = 0;
+
+    state = __atomic_load_n(&job->state, __ATOMIC_ACQUIRE);
+    if (state == 1u)
+        return control_reply_reboot(reply, capacity, frame, "ERR", "busy");
+
+    /* Cache hit: the same path and cap returns the finished walk as-is. */
+    if (state == 2u && job->max_entries == (uint32_t)max_entries &&
+        qud_dt_path_same(job->path, path))
+        return qud_dt_reply_dump(reply, capacity, frame, path, job);
+
+    /* Fresh request: bounded path copy (the caller validated the length). */
+    __builtin_memset(job, 0, sizeof(*job));
+    while (path[n] && n + 1u < sizeof(job->path)) {
+        job->path[n] = path[n];
+        n++;
+    }
+    job->path[n] = 0;
+    job->max_entries = (uint32_t)max_entries;
+    job->submit_tick = counter();
+    __atomic_store_n(&job->state, 1u, __ATOMIC_RELEASE);
+    {
+        void *thread = 0;
+        if (kernel_thread_start(qud_dt_thread_main, job, &thread) != 0) {
+            __atomic_store_n(&job->state, 0u, __ATOMIC_RELEASE);
+            return control_reply_reboot(reply, capacity, frame, "ERR", "nothread");
+        }
+        thread_deallocate(thread);
+    }
+
+    /* Bounded wait with interrupts on. A healthy walk finishes in
+     * milliseconds; a wedged one is reported instead of stalling the
+     * console. The helper thread keeps running either way. */
+    {
+        uint64_t hz = native.status.counter_frequency;
+        uint64_t deadline = job->submit_tick +
+                            (hz ? hz * QUD_DT_WAIT_MS / 1000u : 1000000u);
+        while (__atomic_load_n(&job->state, __ATOMIC_ACQUIRE) == 1u &&
+               counter() < deadline)
+            __asm__ volatile("yield" ::: "memory");
+    }
+
+    state = __atomic_load_n(&job->state, __ATOMIC_ACQUIRE);
+    if (state == 1u)
+        return control_reply_reboot(reply, capacity, frame, "ERR", "slow");
+    if (state == 3u) {
+        sxnu_control_writer_init(&writer, reply, capacity);
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "ERR");
+        (void)sxnu_control_writer_text(&writer, " state=");
+        (void)sxnu_control_writer_text(&writer, job->why ? job->why : "failed");
+        (void)sxnu_control_writer_text(&writer, " path=");
+        (void)sxnu_control_writer_text(&writer, path);
+        return sxnu_control_reply_finish(&writer);
+    }
+    return qud_dt_reply_dump(reply, capacity, frame, path, job);
+}
+
 static void control_handle_frame(const struct sxnu_control_frame *frame,
                                  const struct qcom_usb_debug_status *status,
                                  uint32_t generation)
@@ -1322,6 +1905,23 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
     size_t shot_bytes = 0;
 
     if (accepted == SXNU_CONTROL_VERB_INVALID) {
+        (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    /* T140 gate: without nabu-verbs-forensics=1 the three forensics verbs take
+     * the identical path an unknown verb takes, so a host cannot tell the
+     * difference on the wire. */
+    if (!usb_forensics_verbs &&
+        (accepted == SXNU_CONTROL_VERB_DEVTREE ||
+         accepted == SXNU_CONTROL_VERB_FBRAW ||
+         accepted == SXNU_CONTROL_VERB_NABULOGRING)) {
+        (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    /* T151 PIPE1STAT: diagnostics only exist when the optional second
+     * pipe is enabled.  With it off the verb takes the unknown-verb path,
+     * so single-port wire behaviour is unchanged. */
+    if (accepted == SXNU_CONTROL_VERB_PIPE1STAT && !cdc_second_port) {
         (void)__atomic_add_fetch(&control_rejected, 1u, __ATOMIC_RELAXED);
         return;
     }
@@ -2404,6 +3004,14 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
             break;
         }
+        /* T143: never nest a second Debugger().  A pipe-1 session blocks the
+         * worker thread that would service this verb, so the only way to reach
+         * here meanwhile is a re-entrant drain; refuse it rather than trip
+         * XNU's debugger-nesting guard. */
+        if (__atomic_load_n(&kdp_trap_active, __ATOMIC_ACQUIRE)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "busy");
+            break;
+        }
         if (frame->arg_bytes) {
             unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
             if (argc != 1 || (len[0] & 1u) || len[0] / 2u > 32u) {
@@ -2439,7 +3047,9 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
         kdp_gen_valid = 1;
         kdp_empty_drains = 0;
         __atomic_store_n(&kdp_rx_armed, 1u, __ATOMIC_RELEASE);
+        __atomic_store_n(&kdp_trap_active, 1u, __ATOMIC_RELEASE);
         Debugger("qcom_usb_debug");
+        __atomic_store_n(&kdp_trap_active, 0u, __ATOMIC_RELEASE);
 debugger_done:
         break;
     }
@@ -3150,6 +3760,346 @@ debugger_done:
         reply_bytes = sxnu_control_reply_finish(&writer);
         break;
     }
+    case SXNU_CONTROL_VERB_I2CREAD:
+    case SXNU_CONTROL_VERB_SPIREAD: {
+        /* Not built, on purpose. See the header of QcomUsbBusPrims.c: a GENI
+         * transfer needs the serial-engine clocks, pinmux and protocol engine
+         * brought up first, and this port's device tree ships every spi@/i2c@
+         * node as status="disabled" with no XNU-side GENI driver. The verbs
+         * exist so a host script gets a definite answer instead of a timeout;
+         * the argument list is intentionally not parsed because there is no
+         * transaction to parameterise yet. */
+        struct sxnu_control_writer writer;
+        const char *bus = frame->verb == SXNU_CONTROL_VERB_I2CREAD ? "i2c" : "spi";
+
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "ERR");
+        (void)sxnu_control_writer_text(&writer, " state=notavail bus=");
+        (void)sxnu_control_writer_text(&writer, bus);
+        (void)sxnu_control_writer_text(&writer, " need=W1-driver+geni-clocks+pinmux");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_GPIOGET:
+    case SXNU_CONTROL_VERB_GPIODIR: {
+        /* GPIOGET <index> / GPIODIR <index>: the two raw words of one TLMM
+         * GPIO block. Read-only, gated by nabu-verbs-bus=1. T149: an index
+         * outside the verified block set is refused before any address is
+         * mapped, so an unverified block can no longer reach MMIO -- that is
+         * the path on which GPIOGET 1 (0x03001000) wedged the CPU. Both words
+         * are reported under neutral names: the per-block register layout is
+         * not confirmed on this board (see QcomUsbBusPrims.c header). */
+        const uint8_t *tok[1]; size_t len[1];
+        struct sxnu_control_writer writer;
+        struct nabu_gpio_words words;
+        uint64_t index = 0;
+        int gpioret;
+
+        if (!nabu_bus_enabled()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 1) != 1 ||
+            !len[0] || len[0] > 8u ||
+            !control_args_hex(tok[0], len[0], &index) || index >= NABU_BUS_GPIO_MAX) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        gpioret = nabu_bus_gpio_read((unsigned)index, &words);
+        if (gpioret == NABU_GPIO_DENIED) {
+            /* Refused before any mapping. The log line emitted inside the
+             * primitive names the PA that was denied. */
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                                               "denied");
+            break;
+        }
+        if (gpioret != NABU_GPIO_OK) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "read");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " gpio=");
+        (void)sxnu_control_writer_decimal(&writer, index);
+        (void)sxnu_control_writer_text(&writer, " w0=0x");
+        (void)sxnu_control_writer_hex(&writer, words.w0, 8);
+        (void)sxnu_control_writer_text(&writer, " w1=0x");
+        (void)sxnu_control_writer_hex(&writer, words.w1, 8);
+        if (frame->verb == SXNU_CONTROL_VERB_GPIODIR)
+            (void)sxnu_control_writer_text(&writer, " dirfield=unverified");
+        (void)sxnu_control_writer_text(&writer, " layout=unverified");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_SYSREGSCAN: {
+        /* SYSREGSCAN <start> <count>: rows [start, start+count) of the
+         * generated table. Row group 0 is readable at EL1 by construction;
+         * group 1 (the expected-UNDEFINED probe) needs nabu-sysregscan-trap=1.
+         * Replies are text hex so an embedded 0x0a byte cannot truncate the
+         * frame, and the fault bitmap replaces sentinel-value guessing. */
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        struct nabu_scan_result res[NABU_SCAN_MAX];
+        uint64_t start = 0, count = 0;
+        uint32_t fault_mask = 0;
+        int rc;
+
+        if (!nabu_scan_enabled()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (control_args_split(frame->args, frame->arg_bytes, tok, len, 2) != 2 ||
+            !len[0] || len[0] > 9u || !len[1] || len[1] > 9u ||
+            !control_args_hex(tok[0], len[0], &start) ||
+            !control_args_hex(tok[1], len[1], &count) ||
+            start > NABU_SCAN_ROWS || count == 0 || count > NABU_SCAN_MAX) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        rc = nabu_sysreg_scan((unsigned)start, (unsigned)count, res, NABU_SCAN_MAX,
+                              nabu_scan_trap_allowed(), nabu_scan_exec, NULL);
+        if (rc < 0) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR",
+                                               rc == -2 ? "range" : "args");
+            break;
+        }
+        for (int i = 0; i < rc; i++)
+            if (res[i].faulted) fault_mask |= (uint32_t)(1u << i);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " start=");
+        (void)sxnu_control_writer_decimal(&writer, start);
+        (void)sxnu_control_writer_text(&writer, " count=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)rc);
+        (void)sxnu_control_writer_text(&writer, " faults=0x");
+        (void)sxnu_control_writer_hex(&writer, fault_mask, 8);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (int i = 0; i < rc; i++) {
+            (void)sxnu_control_writer_hex(&writer, res[i].enc, 8);
+            (void)sxnu_control_writer_hex(&writer, res[i].value, 16);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_GICSNAP: {
+        /* GICSNAP: distributor control/identity/status plus one redistributor
+         * type word per CPU that answered. Every register read here is a plain
+         * status read -- no ICC/IAR (read-to-ack) and no GICD_ISPENDR, which
+         * would change interrupt state (T49 risk R1). */
+        struct sxnu_control_writer writer;
+        struct nabu_gic_snap snap;
+
+        if (!nabu_bus_enabled()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (!nabu_bus_gic_snapshot(&snap)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "read");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " dist.ctlr=0x");
+        (void)sxnu_control_writer_hex(&writer, snap.dist.ctlr, 8);
+        (void)sxnu_control_writer_text(&writer, " dist.typer=0x");
+        (void)sxnu_control_writer_hex(&writer, snap.dist.typer, 8);
+        (void)sxnu_control_writer_text(&writer, " dist.iidr=0x");
+        (void)sxnu_control_writer_hex(&writer, snap.dist.iidr, 8);
+        (void)sxnu_control_writer_text(&writer, " dist.statusr=0x");
+        (void)sxnu_control_writer_hex(&writer, snap.dist.statusr, 8);
+        for (unsigned i = 0; i < NABU_BUS_GICR_COUNT; i++) {
+            if (!(snap.rd_ok & (1u << i))) continue;
+            (void)sxnu_control_writer_text(&writer, " rd");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)i);
+            (void)sxnu_control_writer_text(&writer, ".typer=0x");
+            (void)sxnu_control_writer_hex(&writer, snap.rd[i].typer, 8);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TRACEON: {
+        /* TRACEON <interval-ms> <type-mask>: start periodic sampling.
+         * Interval is decimal milliseconds (1..60000); mask is the usual
+         * bare-hex-or-0x bitmask of QUD_TRACE_TYPE_*. */
+        struct sxnu_control_writer writer;
+        uint32_t interval_ms = 0, mask = 0;
+
+        if (!qud_trace_bootarg_gate) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (!qud_trace_parse_start(frame->args, frame->arg_bytes, &interval_ms, &mask)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        qud_trace_start(interval_ms, mask);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=on interval=");
+        (void)sxnu_control_writer_decimal(&writer, interval_ms);
+        (void)sxnu_control_writer_text(&writer, " mask=0x");
+        (void)sxnu_control_writer_hex(&writer, mask, 8);
+        (void)sxnu_control_writer_text(&writer, " cap=");
+        (void)sxnu_control_writer_decimal(&writer, QUD_TRACE_RECORDS_MAX);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TRACEREAD: {
+        /* TRACEREAD [start] [count]: oldest-first window of the ring, as raw
+         * record bytes (16 bytes per record). */
+        struct qud_trace_rec recs[QUD_TRACE_READ_MAX];
+        struct sxnu_control_writer writer;
+        const uint8_t *data;
+        uint32_t valid = 0, start = 0, want = 0, got, base, i;
+
+        if (!qud_trace_bootarg_gate) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (!qud_trace_parse_read(frame->args, frame->arg_bytes, &start, &want)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        valid = qud_trace_valid();
+        got = start < valid ? qud_trace_read(start, want, recs) : 0;
+        base = qud_trace_oldest_seq(valid) + start;
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, start < valid ? " state=ok" : " state=done");
+        (void)sxnu_control_writer_text(&writer, " base=");
+        (void)sxnu_control_writer_decimal(&writer, base);
+        (void)sxnu_control_writer_text(&writer, " valid=");
+        (void)sxnu_control_writer_decimal(&writer, valid);
+        (void)sxnu_control_writer_text(&writer, " dropped=");
+        (void)sxnu_control_writer_decimal(&writer,
+            (uint32_t)__atomic_load_n(&qud_trace_dropped, __ATOMIC_RELAXED));
+        (void)sxnu_control_writer_text(&writer, " more=");
+        (void)sxnu_control_writer_decimal(&writer, (start + got < valid) ? 1u : 0u);
+        (void)sxnu_control_writer_text(&writer, " count=");
+        (void)sxnu_control_writer_decimal(&writer, got);
+        if (got) {
+            (void)sxnu_control_writer_text(&writer, " data=");
+            data = (const uint8_t *)recs;
+            for (i = 0; i < got * sizeof(struct qud_trace_rec) && !writer.failed; i++)
+                (void)sxnu_control_writer_hex(&writer, data[i], 2);
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TRACECLEAR: {
+        /* TRACECLEAR: drop the ring.  Sampling keeps its mask and interval, so
+         * an operator can empty the buffer without restarting the session. */
+        struct sxnu_control_writer writer;
+
+        if (!qud_trace_bootarg_gate) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        qud_trace_clear();
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=cleared");
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TELDUMP: {
+        /* TELDUMP <hexpa> <hexlen> <tag>: synchronous first-block probe into
+         * the NABUTEL1 window through native_ufs_tel_*.  The four-slot async
+         * worker and the 64-byte record framing belong to the storage driver
+         * (T103 section 4.2); this lands the ABI plus one blocking write so the
+         * host can prove hook and medium in a single command. */
+        static uint8_t tel_scratch[4096];
+        const uint8_t *tag = (const uint8_t *)"tel"; size_t taglen = 3;
+        struct sxnu_control_writer writer;
+        uint64_t pa = 0; uint32_t blocks = 0;
+        size_t got;
+        int synced = 0;
+
+        if (!qud_tel_bootarg_gate) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (!qud_tel_available()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (!qud_tel_parse_dump(frame->args, frame->arg_bytes, &pa, &blocks, &tag, &taglen) ||
+            !qud_read_pa_allowed(pa, (size_t)blocks * 4096u, NULL)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        got = qud_diag_read_phys_anno(pa, tel_scratch, 4096u, 1);
+        if (got != 4096u) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "read");
+            break;
+        }
+        if (!native_ufs_tel_write(0u, 1u, tel_scratch)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "write");
+            break;
+        }
+        if (&native_ufs_tel_sync != 0 && native_ufs_tel_sync()) synced = 1;
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=queued slot=0 est=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)blocks * 4096u);
+        (void)sxnu_control_writer_text(&writer, " blocks_written=1 write_err=0 synced=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)synced);
+        (void)sxnu_control_writer_text(&writer, " tag=");
+        for (size_t i = 0; i < taglen; i++)
+            (void)sxnu_control_writer_char(&writer, (char)tag[i]);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_TELREAD: {
+        /* TELREAD <relblock> [@off]: mirror READUFS against the telemetry
+         * window -- one 4 KiB block, 64 bytes of hex starting at <off>. */
+        static uint8_t tel_block[4096];
+        const uint8_t *tok[2]; size_t len[2];
+        struct sxnu_control_writer writer;
+        uint64_t rel = 0, offset = 0;
+        unsigned argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+
+        if (!qud_tel_bootarg_gate) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        if (!qud_tel_available()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "unsupported");
+            break;
+        }
+        if (argc < 1 || argc > 2 ||
+            !control_args_hex(tok[0], len[0], &rel) ||
+            (argc == 2 && !control_args_hex(tok[1], len[1], &offset)) ||
+            (offset & 0x3fu) || offset > 4096u - 64u) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (!native_ufs_tel_read(rel, 1u, tel_block)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "read");
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=ready rel=");
+        (void)sxnu_control_writer_decimal(&writer, (uint32_t)rel);
+        (void)sxnu_control_writer_text(&writer, " crc32=");
+        {
+            uint32_t crc = 0xffffffffu;
+            for (uint32_t i = 0; i < 4096u; i++) {
+                crc ^= tel_block[i];
+                for (unsigned bit = 0; bit < 8; bit++)
+                    crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+            }
+            (void)sxnu_control_writer_hex(&writer, (uint64_t)(crc ^ 0xffffffffu), 8);
+        }
+        (void)sxnu_control_writer_text(&writer, " off=");
+        (void)sxnu_control_writer_decimal(&writer, (uint32_t)offset);
+        (void)sxnu_control_writer_text(&writer, " data=");
+        for (uint32_t i = 0; i < 64u; i++)
+            (void)sxnu_control_writer_hex(&writer, tel_block[offset + i], 2);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     case SXNU_CONTROL_VERB_SYM:
     case SXNU_CONTROL_VERB_SYMS:
         /* The kernel symbol table is not reachable from this module; the host
@@ -3167,6 +4117,408 @@ debugger_done:
             reboot_accepted = 1;
         }
         break;
+    case SXNU_CONTROL_VERB_DEVTREE: {
+        /* DEVTREE [path] [max]: dump device-tree node names and a few key
+         * properties. The walk itself is kernel/QcomUsbDTDebug.cpp calling the
+         * IOKit registry; this handler only checks arguments and frames text.
+         * path defaults to "/" and max (child entries) to 4 so the reply stays
+         * inside the 512-byte cap; truncated dumps say trunc=1. */
+        const uint8_t *tok[2];
+        size_t len[2];
+        struct sxnu_control_writer writer;
+        char path[64];
+        char body[384];
+        const char *why = "";
+        size_t used = 0;
+        int truncated = 0;
+        uint64_t max_entries = 4;
+        int argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 2);
+        path[0] = '/';
+        path[1] = 0;
+        for (int ai = 0; ai < argc && ai < 2; ai++) {
+            if (len[ai] && tok[ai][0] == (uint8_t)'/') {
+                if (!qud_devtree_path_valid((const char *)tok[ai], len[ai]) ||
+                    len[ai] >= sizeof(path)) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                    break;
+                }
+                for (size_t i = 0; i < len[ai]; i++) path[i] = (char)tok[ai][i];
+                path[len[ai]] = 0;
+            } else if (!control_args_hex(tok[ai], len[ai], &max_entries) ||
+                       !max_entries || max_entries > 16u) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        if (reply_bytes) break;
+        /* T150: optional off-console execution. Default off keeps the
+         * synchronous walk below unchanged. */
+        if (qud_dt_thread_enabled()) {
+            reply_bytes = qud_dt_thread_dispatch(reply, sizeof(reply), frame, path,
+                                                 max_entries);
+            break;
+        }
+        if (!native_dt_explore(path, body, sizeof(body), &used, &why,
+                               (uint32_t)max_entries, &truncated)) {
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "ERR");
+            (void)sxnu_control_writer_text(&writer, " state=");
+            (void)sxnu_control_writer_text(&writer, why);
+            (void)sxnu_control_writer_text(&writer, " path=");
+            (void)sxnu_control_writer_text(&writer, path);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=ready path=");
+        (void)sxnu_control_writer_text(&writer, path);
+        (void)sxnu_control_writer_text(&writer, " bytes=");
+        (void)sxnu_control_writer_decimal(&writer, used);
+        (void)sxnu_control_writer_text(&writer, " trunc=");
+        (void)sxnu_control_writer_decimal(&writer, (uint64_t)truncated);
+        (void)sxnu_control_writer_char(&writer, '\n');
+        (void)sxnu_control_writer_put(&writer, body, used);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_FBRAW: {
+        /* FBRAW <pa|gop> <hexoff> [<hexlen>] [chunk] [raw]
+         *
+         * Raw framebuffer reads. A physical address goes through the same
+         * whitelist READPA uses; "gop" copies from the fixed framebuffer the
+         * display driver registered (qcom_usb_shot_framebuffer). One command
+         * moves one chunk; the host advances <off> until last=1.
+         *
+         * Default output is hex inside the SXNU1R reply (chunk capped at 128
+         * bytes so header+data stays under the 512-byte cap). The optional
+         * "raw" token instead emits a framed binary record
+         *   SXNUFBR1 <off:8hex> <crc:8hex> <len:4hex>\n<raw bytes>
+         * through the shared CDC log path (qcom_usb_debug_write), and the
+         * control reply reports ring backlog so a lost stream is visible. */
+        static uint8_t fbraw_buf[4096];
+        const uint8_t *tok[5];
+        size_t len[5];
+        struct sxnu_control_writer writer;
+        struct qcom_usb_framebuffer fb;
+        uint64_t off = 0, total = 0, chunk_arg = 128, pa = 0;
+        uint32_t chunk = 0, cap = 128;
+        int last = 0, raw = 0, is_gop = 0, argc;
+        int ai;
+        argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 5);
+        if (argc < 2) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (len[0] == 3u && tok[0][0] == (uint8_t)'g' && tok[0][1] == (uint8_t)'o' &&
+            tok[0][2] == (uint8_t)'p') {
+            is_gop = 1;
+            if (!qcom_usb_shot_framebuffer(&fb)) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "nofb");
+                break;
+            }
+        } else if (!control_args_hex(tok[0], len[0], &pa)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (!control_args_hex(tok[1], len[1], &off) || off > (1u << 30)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        for (ai = 2; ai < argc && ai < 5; ai++) {
+            if (len[ai] == 3u && tok[ai][0] == (uint8_t)'r' &&
+                tok[ai][1] == (uint8_t)'a' && tok[ai][2] == (uint8_t)'w') {
+                raw = 1;
+                continue;
+            }
+            if (!total) {
+                if (!control_args_hex(tok[ai], len[ai], &total) ||
+                    !total || total > (16u << 20)) {
+                    reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                    break;
+                }
+            } else if (!control_args_hex(tok[ai], len[ai], &chunk_arg) ||
+                       !chunk_arg || chunk_arg > 4096u) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        if (reply_bytes) break;
+        if (is_gop) {
+            if (off >= fb.bytes) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "eof");
+                break;
+            }
+            if (!total) total = fb.bytes - off;
+            if (total > fb.bytes - off) total = fb.bytes - off;
+        } else if (!total) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        cap = raw ? 4096u : 128u;
+        if (chunk_arg > cap) chunk_arg = cap;
+        if (!qud_fbraw_plan(off, total, (uint32_t)chunk_arg, &chunk, &last)) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (chunk > sizeof(fbraw_buf)) chunk = sizeof(fbraw_buf);
+        if (is_gop) {
+            for (uint32_t i = 0; i < chunk; i++)
+                fbraw_buf[i] = fb.pixels[off + (uint64_t)i];
+        } else {
+            const char *allow_why = "";
+            if (!qud_read_pa_allowed(pa + off, (size_t)chunk, &allow_why) ||
+                qud_diag_read_phys(pa + off, fbraw_buf, (size_t)chunk) != chunk) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame,
+                    "ERR", allow_why && *allow_why ? allow_why : "read");
+                break;
+            }
+        }
+        if (raw) {
+            char head[48];
+            size_t head_bytes = 0;
+            uint32_t crc = sxnu_control_crc32(fbraw_buf, chunk);
+            static const char hexal[] = "0123456789abcdef";
+            for (size_t i = 0; i < 9; i++) head[head_bytes++] = "SXNUFBR1 "[i];
+            for (int k = 7; k >= 0; k--)
+                head[head_bytes++] = hexal[(unsigned)((off >> (k * 4)) & 15u)];
+            head[head_bytes++] = ' ';
+            for (int k = 7; k >= 0; k--)
+                head[head_bytes++] = hexal[(crc >> (k * 4)) & 15u];
+            head[head_bytes++] = ' ';
+            for (int k = 3; k >= 0; k--)
+                head[head_bytes++] = hexal[(chunk >> (k * 4)) & 15u];
+            head[head_bytes++] = '\n';
+            (void)qcom_usb_debug_write(head, head_bytes);
+            if (chunk) (void)qcom_usb_debug_write(fbraw_buf, chunk);
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " state=raw src=");
+            (void)sxnu_control_writer_text(&writer, is_gop ? "gop" : "pa");
+            (void)sxnu_control_writer_text(&writer, " off=");
+            (void)sxnu_control_writer_decimal(&writer, off);
+            (void)sxnu_control_writer_text(&writer, " chunk=");
+            (void)sxnu_control_writer_decimal(&writer, chunk);
+            (void)sxnu_control_writer_text(&writer, " pending=");
+            (void)sxnu_control_writer_decimal(&writer, status->buffer_pending);
+            (void)sxnu_control_writer_text(&writer, " overflow=");
+            (void)sxnu_control_writer_decimal(&writer, status->buffer_overflow);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+        {
+            uint32_t crc = sxnu_control_crc32(fbraw_buf, chunk);
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+            (void)sxnu_control_writer_text(&writer, " state=ready src=");
+            (void)sxnu_control_writer_text(&writer, is_gop ? "gop" : "pa");
+            if (!is_gop) {
+                (void)sxnu_control_writer_text(&writer, " pa=0x");
+                (void)sxnu_control_writer_hex(&writer, pa, 16);
+            }
+            (void)sxnu_control_writer_text(&writer, " off=");
+            (void)sxnu_control_writer_decimal(&writer, off);
+            (void)sxnu_control_writer_text(&writer, " len=");
+            (void)sxnu_control_writer_decimal(&writer, total);
+            (void)sxnu_control_writer_text(&writer, " chunk=");
+            (void)sxnu_control_writer_decimal(&writer, chunk);
+            (void)sxnu_control_writer_text(&writer, " last=");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)last);
+            (void)sxnu_control_writer_text(&writer, " crc32=");
+            (void)sxnu_control_writer_hex(&writer, crc, 8);
+            (void)sxnu_control_writer_text(&writer, " data=");
+            for (uint32_t i = 0; i < chunk; i++)
+                (void)sxnu_control_writer_hex(&writer, fbraw_buf[i], 2);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+        }
+        break;
+    }
+    case SXNU_CONTROL_VERB_NABULOGRING: {
+        /* NABULOGRING [period|panic] [<hexoff> [<hexlen>]]
+         *
+         * The two NABULOG1 slots at the tail of the diagnostic log window:
+         * periodic = window block 0, panic = window blocks - 2. Geometry comes
+         * from qud_nabulog_open() (live, not hard-coded); the measured anchors
+         * are echoed so the host can cross-check. No arguments: both headers.
+         * One slot name: that header. Slot plus a window: body bytes from the
+         * 4 KiB block, hex encoded (<= 96 bytes to stay under the reply cap). */
+        static uint8_t blk[4096];
+        const uint8_t *tok[3];
+        size_t len[3];
+        struct sxnu_control_writer writer;
+        struct qud_nabulog_header h;
+        uint64_t first = 0, blocks = 0, rel = 0, off = 0, blen = 0, want = 0;
+        const char *why = "";
+        int slot = -1, argc, why_block = 0, parsed = -1;
+        argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 3);
+        if (argc > 3) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        if (argc >= 1) {
+            static const char period_name[] = "period";
+            static const char panic_name[] = "panic";
+            size_t i;
+            slot = -1;
+            if (len[0] == 6u) {
+                for (i = 0; i < 6u && tok[0][i] == (uint8_t)period_name[i]; i++) {}
+                if (i == 6u) slot = 0;
+            }
+            if (slot < 0 && len[0] == 5u) {
+                for (i = 0; i < 5u && tok[0][i] == (uint8_t)panic_name[i]; i++) {}
+                if (i == 5u) slot = 1;
+            }
+            if (slot < 0) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+            if (argc >= 2 && (!control_args_hex(tok[1], len[1], &off) || off >= 4096u)) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+            if (argc == 3 && !control_args_hex(tok[2], len[2], &blen)) {
+                reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+                break;
+            }
+        }
+        if (!qud_nabulog_open(&first, &blocks, &why)) {
+            sxnu_control_writer_init(&writer, reply, sizeof(reply));
+            (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "ERR");
+            (void)sxnu_control_writer_text(&writer, " state=");
+            (void)sxnu_control_writer_text(&writer, why);
+            reply_bytes = sxnu_control_reply_finish(&writer);
+            break;
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " state=ready first=");
+        (void)sxnu_control_writer_decimal(&writer, first);
+        (void)sxnu_control_writer_text(&writer, " blocks=");
+        (void)sxnu_control_writer_decimal(&writer, blocks);
+        (void)sxnu_control_writer_text(&writer, " anchor_match=");
+        (void)sxnu_control_writer_decimal(&writer,
+            (first == 121718715ull && blocks >= 2u && first + blocks - 2u == 121726905ull) ? 1u : 0u);
+        for (int s = 0; s < 2; s++) {
+            if (slot >= 0 && slot != s) continue;
+            if (!qud_nabulog_slot_rel(blocks, s == 1, &rel)) {
+                (void)sxnu_control_writer_text(&writer, " slot=");
+                (void)sxnu_control_writer_text(&writer, s ? "panic" : "period");
+                (void)sxnu_control_writer_text(&writer, " state=geom");
+                continue;
+            }
+            if (!qud_log_ufs_read_block(rel, blk, &why_block))
+                break;
+            parsed = qud_nabulog_header_parse(blk, 4096u, &h);
+            (void)sxnu_control_writer_text(&writer, " slot=");
+            (void)sxnu_control_writer_text(&writer, s ? "panic" : "period");
+            (void)sxnu_control_writer_text(&writer, " rel=");
+            (void)sxnu_control_writer_decimal(&writer, rel);
+            (void)sxnu_control_writer_text(&writer, " lba=");
+            (void)sxnu_control_writer_decimal(&writer, first + rel);
+            (void)sxnu_control_writer_text(&writer, " hdr=");
+            (void)sxnu_control_writer_decimal(&writer, (uint64_t)parsed);
+            if (parsed != 1) continue;
+            (void)sxnu_control_writer_text(&writer, " version=");
+            (void)sxnu_control_writer_decimal(&writer, h.version);
+            (void)sxnu_control_writer_text(&writer, " is_panic=");
+            (void)sxnu_control_writer_decimal(&writer, h.is_panic);
+            (void)sxnu_control_writer_text(&writer, " available=");
+            (void)sxnu_control_writer_decimal(&writer, h.available);
+            (void)sxnu_control_writer_text(&writer, " dropped=");
+            (void)sxnu_control_writer_decimal(&writer, h.dropped);
+            (void)sxnu_control_writer_text(&writer, " total=");
+            (void)sxnu_control_writer_decimal(&writer,
+                ((uint64_t)h.total_hi << 32) | h.total_lo);
+            if (slot == s && (argc >= 2 || blen)) {
+                if (!qud_nabulog_body_window(off, blen, h.available, &want)) {
+                    (void)sxnu_control_writer_text(&writer, " win=badoff");
+                    continue;
+                }
+                if (want > 96u) want = 96u;
+                (void)sxnu_control_writer_text(&writer, " off=");
+                (void)sxnu_control_writer_decimal(&writer, off);
+                (void)sxnu_control_writer_text(&writer, " n=");
+                (void)sxnu_control_writer_decimal(&writer, want);
+                (void)sxnu_control_writer_text(&writer, " crc32=");
+                (void)sxnu_control_writer_hex(&writer,
+                    sxnu_control_crc32(blk + off, (size_t)want), 8);
+                (void)sxnu_control_writer_text(&writer, " data=");
+                for (uint64_t i = 0; i < want; i++)
+                    (void)sxnu_control_writer_hex(&writer, blk[off + i], 2);
+            }
+        }
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_FGREAD: {
+        /* T144 / T91 P1: one read-only pass over the PM8150B Gen4 fuel gauge.
+         * Optional decimal argument overrides this reply's capacity basis
+         * (mAh); nabu-fg-design-mah is the persistent knob.  The [fg] line is
+         * also pushed to the console stream so a headless capture keeps the
+         * sample even if the request frame itself never reaches the host. */
+        struct nabu_fg_sample sample;
+        struct sxnu_control_writer writer;
+        const uint8_t *tok[1]; size_t len[1];
+        char line[192];
+        size_t used;
+        unsigned argc;
+        uint64_t mah = 0;
+
+        if (!nabu_fg_enabled()) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "disabled");
+            break;
+        }
+        argc = control_args_split(frame->args, frame->arg_bytes, tok, len, 1);
+        if (argc > 1 || (argc == 1 && (!len[0] || len[0] > 6u ||
+            !control_args_decimal(tok[0], len[0], &mah) ||
+            mah < 1000u || mah > 20000u))) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "args");
+            break;
+        }
+        nabu_fg_set_design_mah(argc == 1 ? (uint32_t)mah : 0u);
+        (void)nabu_fg_read(&sample);
+        used = nabu_fg_format(line, sizeof(line), &sample);
+        if (used && used < sizeof(line)) {
+            (void)qcom_usb_debug_write(line, used);
+            (void)qcom_usb_debug_write("\n", 1);
+        }
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb,
+                                       sample.status == NABU_FG_OK ? "OK" : "ERR");
+        (void)sxnu_control_writer_text(&writer, " ");
+        (void)sxnu_control_writer_text(&writer, line);
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
+    case SXNU_CONTROL_VERB_PIPE1STAT: {
+        /* T151: read-only pipe1 wiring state.  Answers the P1-vs-P2
+         * question without a host-side USB capture: dtr1 tells whether the
+         * host driver completed SET_CONTROL_LINE_STATE on interface 2,
+         * tx2q is the pipe1 TX ring occupancy, epa9 is the armed state of
+         * physical EP_IN2 (0x84), dale is DALEPENA and rx2 is the pipe1 RX
+         * ring occupancy.  No MMIO is touched beyond dwc3_snapshot(). */
+        struct dwc3_snapshot snap;
+        struct sxnu_control_writer writer;
+        if (!native.core_initialized) {
+            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "noinit");
+            break;
+        }
+        dwc3_snapshot(native.core, &snap);
+        sxnu_control_writer_init(&writer, reply, sizeof(reply));
+        (void)sxnu_control_reply_start(&writer, frame->session, frame->seq, frame->verb, "OK");
+        (void)sxnu_control_writer_text(&writer, " dtr1=");
+        (void)sxnu_control_writer_decimal(&writer, (snap.dtr >> 1) & 1u);
+        (void)sxnu_control_writer_text(&writer, " tx2q=");
+        (void)sxnu_control_writer_decimal(&writer, dwc3_queued_pipe(native.core, 1u));
+        (void)sxnu_control_writer_text(&writer, " epa9=");
+        (void)sxnu_control_writer_decimal(&writer, (snap.active_endpoints >> 9) & 1u);
+        (void)sxnu_control_writer_text(&writer, " dale=");
+        (void)sxnu_control_writer_hex(&writer, snap.enabled_endpoints, 8);
+        (void)sxnu_control_writer_text(&writer, " rx2=");
+        (void)sxnu_control_writer_decimal(&writer, dwc3_rx_pending_pipe(native.core, 1u));
+        reply_bytes = sxnu_control_reply_finish(&writer);
+        break;
+    }
     default:
         return;
     }
@@ -3435,6 +4787,20 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
     size_t accepted = 0;
     if (!bytes || !count || native.status.phase == QCOM_USB_DEBUG_DISABLED ||
         native.status.phase == QCOM_USB_DEBUG_STOPPED) return 0;
+    /* T131: with the second CDC data interface enabled, KDP bytes (serial
+     * reply framing or KDPF net frames) go to pipe 1 instead of the console
+     * backlog, so the two host handles never carry each other's traffic.
+     * Everything outside those gates keeps the historical path verbatim. */
+    if (cdc_second_port && (qcom_usb_debug_kdp_tx_active() ||
+                            qcom_usb_debug_kdp_net_active())) {
+        if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return 0;
+        if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) {
+            if (dwc3_queue_pipe(native.core, 1u, bytes, count) == count) accepted = count;
+            (void)poll_owned();
+        }
+        release(flags);
+        return accepted;
+    }
     accepted = backlog_write(bytes, count);
     /* Armed == the kernel is inside the debugger.
      *
@@ -3471,7 +4837,7 @@ size_t qcom_usb_debug_write(const void *bytes, size_t count)
          * delay_us() with interrupts already off and the other cores halted;
          * one poll per character is all the entry banner needs, and a stuck
          * controller must not turn every character into a 1 ms stall. */
-        if (usb_diag_enabled && !__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) &&
+        if (usb_diag_enabled && !kdp_session_active() &&
             native.status.phase == QCOM_USB_DEBUG_ACTIVE && dwc3_ready(native.core)) {
             uint64_t start = counter();
             unsigned int attempts = 128u;
@@ -3617,7 +4983,7 @@ qcom_usb_debug_serial_pending(void)
      * Constraint recorded here so nobody repeats it: this predicate must not
      * touch DWC3 outside the worker's lock. A reset exit from a panic needs a
      * change in osfmk/kern/debug.c (reset before kdp_connection_wait), not here. */
-    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
+    if (!kdp_session_active()) return 0;
     if (kdp_rx_used == 0) serial_rx_drain();
     return kdp_rx_used;
 }
@@ -3628,7 +4994,7 @@ qcom_usb_debug_serial_getc(void)
     uint8_t c = 0;
     /* While armed only the KDP ring is served, so a keyboard poll can never
      * steal a staged frame. Disarmed consumers see the console ring as before. */
-    if (__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+    if (kdp_session_active()) {
         if (kdp_rx_used == 0) serial_rx_drain();   /* kb-32: see serial_pending() */
         if (!kdp_rx_pop(&c)) return 0;
         return c;
@@ -3683,7 +5049,7 @@ static uint32_t
 kdp_channel_death_check(uint32_t generation, uint32_t rx_count)
 {
     uint32_t seconds;
-    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) return 0;
+    if (!kdp_session_active()) return 0;
     seconds = kdp_death_reset_seconds();
     if (!seconds) return 0;
     if (!kdp_gen_valid) {
@@ -3722,6 +5088,7 @@ kdp_channel_degrade(void)
         (void)kdp_rx_push((uint8_t)SERIAL_KDP_END);
     usb_serial_rx_kdp = 0;
     __atomic_store_n(&kdp_rx_armed, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&kdp_rx_armed1, 0u, __ATOMIC_RELEASE);
     (void)__atomic_add_fetch(&kdp_death_count, 1u, __ATOMIC_RELAXED);
 }
 
@@ -3755,7 +5122,7 @@ kdp_channel_degrade(void)
 void
 nabu_kdp_release_wire(void)
 {
-    if (!__atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE))
+    if (!kdp_session_active())
         return;
     if (kdp_release_resync_enabled()) {
         while (kdp_rx_used != 0) {
@@ -3774,6 +5141,59 @@ nabu_kdp_release_wire(void)
         }
     }
     __atomic_store_n(&kdp_rx_armed, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&kdp_rx_armed1, 0u, __ATOMIC_RELEASE);
+}
+
+/* T143: pipe-1 activation.  Called from serial_rx_drain() once a complete KDP
+ * frame (0xFA..0xFB -- the same boundary the console scanner uses) has been
+ * pushed into kdp_rx.  This runs on the USB worker thread, exactly the context
+ * the DEBUGGER verb already traps from, with no lock held; that is the
+ * proven-safe context, and the module links no thread-create API to do better.
+ *
+ * The latch is self-clearing on return: pipe 1 does not depend on debug.c's
+ * release hook, so a host detach cannot leave it latched the way pipe 0
+ * historically could (T132 §5 kb164). */
+static void
+kdp_pipe1_enter(uint32_t generation)
+{
+    if (&Debugger == 0) return;
+    kdp_gen_seen = generation;
+    kdp_gen_valid = 1;
+    kdp_empty_drains = 0;
+    __atomic_store_n(&kdp_rx_armed1, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&kdp_trap_active, 1u, __ATOMIC_RELEASE);
+    Debugger("qcom_usb_debug_pipe1");
+    __atomic_store_n(&kdp_trap_active, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&kdp_rx_armed1, 0u, __ATOMIC_RELEASE);
+    (void)__atomic_add_fetch(&kdp_pipe1_enters, 1u, __ATOMIC_RELAXED);
+}
+
+/* T143: scan one drain chunk from pipe 1 for a single complete KDP frame.
+ * Framing is the same boundary serial_rx_drain() uses for the console copy:
+ * a raw 0xFA opens the run and a raw 0xFB closes it.  Escaping guarantees
+ * neither byte appears inside a payload (kdp_serial.c emits 0xFE + ~byte), so
+ * no unescaper is needed here -- the bytes are pushed exactly as the wire
+ * delivered them, which is what kdp_unserialize_packet() expects. */
+static void
+kdp_pipe1_feed(const uint8_t *p, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        uint8_t b = p[i];
+        if (!kdp_pipe1_in_frame) {
+            if (b == SERIAL_KDP_START) {
+                kdp_pipe1_in_frame = 1;
+                (void)kdp_rx_push(b);
+            } else {
+                kdp_pipe1_stray++;
+            }
+            continue;
+        }
+        (void)kdp_rx_push(b);
+        if (b == SERIAL_KDP_END) {
+            kdp_pipe1_in_frame = 0;
+            kdp_pipe1_arm_pending = 1;
+        }
+    }
 }
 
 /* One bounded drain of the DWC3 RX ring.  Master CPU only, same constraint as
@@ -3794,11 +5214,12 @@ serial_rx_drain(void)
     uint64_t flags;
     uint8_t rx[SXNU_CONTROL_WORK_BYTES];
     uint8_t text[SXNU_CONTROL_WORK_BYTES];
+    uint8_t rx1[SXNU_CONTROL_WORK_BYTES];
     struct qcom_usb_debug_status status = {0};
     uint32_t generation = 0;
-    size_t rx_count = 0, text_count = 0;
-    size_t wire_count = rx_count;
-    const uint8_t *wire = rx;
+    size_t rx_count = 0, rx1_count = 0, text_count = 0;
+    size_t wire_count = rx_count, wire1_count = 0;
+    const uint8_t *wire = rx, *wire1 = rx1;
     int observed = 0;
     int suppress_control = 0;
 
@@ -3809,6 +5230,7 @@ serial_rx_drain(void)
         bytes_copy(&status, &native.status, sizeof(status));
         generation = dwc3_rx_generation(native.core);
         rx_count = dwc3_read(native.core, rx, sizeof(rx));
+        rx1_count = cdc_second_port ? dwc3_read_pipe(native.core, 1u, rx1, sizeof(rx1)) : 0;
         observed = 1;
     }
     release(flags);
@@ -3865,6 +5287,44 @@ serial_rx_drain(void)
         }
     }
 
+    /* T131: pipe 1 is the dedicated KDP data interface.  Bytes the host sends
+     * there never touch the SXNU1 parser or the console ring.  Net mode feeds
+     * the same KDPF scanner as the shared stream; serial-KDP mode pushes into
+     * kdp_rx exactly like the re-parse above, but only while armed so a stale
+     * request cannot be waiting when the debugger next enters. */
+    if (rx1_count != 0 && cdc_second_port) {
+        if (qcom_usb_debug_kdp_net_active()) {
+            (void)qcom_usb_debug_kdp_net_route(rx1, rx1_count, generation, &wire1, &wire1_count);
+        } else if (__atomic_load_n(&kdp_rx_armed1, __ATOMIC_ACQUIRE) ||
+                   __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE)) {
+            /* A live KDP session on either pipe consumes pipe 1 verbatim.
+             * Mode 2 makes one exception: a stale pipe-0 latch (armed but no
+             * Debugger() on the stack, e.g. the aftermath of a host detach)
+             * must not block pipe 1, so those bytes go to the detector. */
+            if (kdp_pipe1_mode &&
+                !__atomic_load_n(&kdp_rx_armed1, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&kdp_rx_armed, __ATOMIC_ACQUIRE) &&
+                !__atomic_load_n(&kdp_trap_active, __ATOMIC_ACQUIRE)) {
+                kdp_pipe1_feed(rx1, rx1_count);
+            } else {
+                for (size_t i = 0; i < rx1_count; i++) {
+                    (void)kdp_rx_push(rx1[i]);
+                }
+            }
+        } else if (kdp_pipe1_mode) {
+            /* T131 kept pipe 1 receive-only-while-armed; T143 lets an idle
+             * pipe 1 recognise one complete KDP frame and activate by itself.
+             * Bytes outside a frame are still dropped (S5): they must not
+             * accumulate in kdp_rx for a session that never comes. */
+            kdp_pipe1_feed(rx1, rx1_count);
+        }
+    }
+    if (kdp_pipe1_arm_pending) {
+        kdp_pipe1_arm_pending = 0;
+        if (!__atomic_load_n(&kdp_trap_active, __ATOMIC_ACQUIRE))
+            kdp_pipe1_enter(generation);
+    }
+
     if (text_count != 0 && __atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE)) {
         /* While the debugger owns the wire, the host sends bare control
          * characters ('c' to continue, 'r' to reset) and KDP frames -- none of
@@ -3895,6 +5355,9 @@ void qcom_usb_debug_poll(void)
     /* nabu: idempotent, boot-arg gated, waits for phase ACTIVE. */
     (void)qcom_usb_debug_kdp_net_try_attach();
     qud_dump_ufs_progress();   /* async UFS dump, outside the USB lock */
+    /* T142: periodic trace sample; no-op unless nabu-trace=1 and TRACEON
+     * has armed a window. */
+    qud_trace_tick(counter(), native.status.counter_frequency, &native.status);
 }
 void qcom_usb_debug_panic_prepare(void)
 {

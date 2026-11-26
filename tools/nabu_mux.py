@@ -217,7 +217,14 @@ class Sxnu1:
             body = "SXNU1 %016x %08x %s" % (0, 0, "HELLO")
         else:
             if not self.hello_done:
-                raise RuntimeError("HELLO has not succeeded yet")
+                # DEBUGGER and REBOOT are the only way out of a wedged kernel,
+                # so they must build even when the handshake never completed.
+                # The device rejects a bad seq itself; a local refusal here
+                # would leave the operator with no lever at all (measured on
+                # b5: "HELLO has not succeeded yet" blocked debugger/reboot
+                # while COM5 was still open and writable).
+                if verb.upper() not in ("DEBUGGER", "REBOOT"):
+                    raise RuntimeError("HELLO has not succeeded yet")
             self.seq = (self.seq + 1) & 0xFFFFFFFF
             body = "SXNU1 %016x %08x %s" % (self.session, self.seq, verb.upper())
         if arg:
@@ -268,13 +275,15 @@ class Sxnu1:
 
 class Mux:
     def __init__(self, port: str, tag: str, outdir: str, verbose: bool,
-                 kernel_path: str | None = None):
+                 kernel_path: str | None = None,
+                 exit_on_port_loss: float = 0.0):
         try:
             import serial
         except ImportError:
             raise SystemExit("pyserial is required: python -m pip install pyserial")
         self._serial_mod = serial
         self.port = port
+        self.exit_on_port_loss = exit_on_port_loss
         self.serial = None
         self.verbose = verbose
         self.tag = tag
@@ -294,6 +303,9 @@ class Mux:
         if not os.path.exists(self.cmd_path):
             open(self.cmd_path, "w", encoding="utf-8").close()
         self.cmd_pos = os.path.getsize(self.cmd_path)
+        # T148: set once a device verb went unanswered. Stops the queue so a
+        # wedged kernel is not buried under later commands that cannot arrive.
+        self.halted_on_silence = False
 
         self.deframer = KdpfDeframer()
         self.sxnu = Sxnu1()
@@ -518,6 +530,43 @@ class Mux:
             self.log("! %s failed: %s" % (v, exc))
         return True
 
+    # Recovery verbs must always be allowed through the silence latch and
+    # through an incomplete HELLO handshake. If a wedged device could not be
+    # sent DEBUGGER/REBOOT, the tool that reported the wedge would also be the
+    # tool that prevented fixing it -- measured on b5: COM5 went silent, HELLO
+    # failed, and every subsequent command (including debugger and reboot) was
+    # refused locally with "HELLO has not succeeded yet" while the port was
+    # still enumerated and writable.
+    RECOVERY_VERBS = frozenset(("DEBUGGER", "REBOOT", "PING", "HELLO", "RESUME"))
+
+    def _silence_gate(self, verb: str) -> bool:
+        """True when this verb must NOT be sent because the last one never
+        answered.
+
+        The reply timeout already re-syncs the sequence, but re-syncing assumes
+        the device is alive -- it sends another HELLO, which a wedged kernel
+        also swallows. Queueing more verbs on top of that produces a log where
+        the first unanswered command is indistinguishable from the ones behind
+        it. `resume` is the escape hatch: it clears the latch so a human can
+        try again after power-cycling the device.
+
+        Recovery verbs bypass the latch on purpose: they are what a human
+        reaches for exactly when the latch is set.
+        """
+        up = verb.upper()
+        if up == "RESUME":
+            self.halted_on_silence = False
+            self.log(">>> silence latch cleared, queue resumed")
+            return True
+        if not self.halted_on_silence:
+            return False
+        if up in self.RECOVERY_VERBS:
+            self.log(">>> %s allowed through the silence latch (recovery verb)" % up)
+            return False
+        self.log("! suppressed %s: the device stopped answering; "
+                 "send 'resume' after a power cycle" % up)
+        return True
+
     def send_sxnu1(self, verb: str, arg: str = "") -> bool:
         # "kdp" is a host-side shorthand, matching nabu_console.py: it is not a
         # device verb, it sends DEBUGGER with an empty payload, which makes the
@@ -557,6 +606,7 @@ class Mux:
         if time.time() - at < self.reply_timeout:
             return
         self._pending = None
+        self.halted_on_silence = True
         self.log("! no reply for %s (seq=%d) in %.0fs; resyncing with HELLO"
                  % (verb, seq, self.reply_timeout))
         # Do NOT roll the counter back by hand: HELLO's reply carries last_seq
@@ -571,6 +621,14 @@ class Mux:
         self._write_cdc(wire, "SXNU1")
 
     # -- reads -----------------------------------------------------------
+    def _port_present(self) -> bool:
+        """True if our COM port is still enumerated (Windows)."""
+        try:
+            from serial.tools import list_ports
+            return any(p.device == self.port for p in list_ports.comports())
+        except Exception:
+            return False
+
     def _try_reopen(self) -> None:
         """Reopen the port after a failure. Best-effort, called only while dead.
 
@@ -615,6 +673,17 @@ class Mux:
                     self._dead_since = time.time()
                     self.log("! serial read failed: %s" % exc)
                     self.log("! waiting for the device to come back (reopen loop)")
+                elif (self.exit_on_port_loss > 0 and self._dead_since
+                      and time.time() - self._dead_since >= self.exit_on_port_loss
+                      and not self._port_present()):
+                    # The device rebooted to recovery and COM3 is gone. Close
+                    # the port and stop every thread so the next round does not
+                    # have to kill a stale mux that still holds COM3.
+                    self.log(">>> COM3 gone for %.0fs; closing port and exiting"
+                             % self.exit_on_port_loss)
+                    self.close()
+                    self.stop_event.set()
+                    return
                 elif self._dead_since and time.time() - self._dead_since > 60 and not self._gave_up:
                     self._gave_up = True
                     self.log("! device gone for 60 s; still retrying quietly")
@@ -681,6 +750,12 @@ class Mux:
         if text.startswith("SXNU1R") or text.startswith("SXNU1"):
             self.counters["sxnu1_rx"] += 1
             self._pending = None
+            # T148: any reply proves the kernel is still servicing the console,
+            # so a latch set by a slow (not dead) command releases itself. A
+            # real wedge never reaches this line and stays latched.
+            if self.halted_on_silence:
+                self.halted_on_silence = False
+                self.log(">>> device answered again, silence latch cleared")
             self.sxnu.note_reply(text)
             self._replies.put(text)
             self.log("RX %s" % text)
@@ -756,6 +831,13 @@ class Mux:
                 try:
                     if self._dispatch_host_command(parts[0], " ".join(parts[1:])):
                         continue
+                    # T148: a device verb that never got a reply means the
+                    # kernel stopped servicing the console. Sending the next
+                    # queued verb hides which one actually killed it (t140v:
+                    # GPIOGET 1 wedged at 07:47:06; SYSREGSCAN was sent at
+                    # 07:47:26 to a dead device and got blamed).
+                    if self._silence_gate(parts[0]):
+                        continue
                     if not self.send_sxnu1(parts[0], " ".join(parts[1:])):
                         self.log("! command dropped: %s" % line)
                 except Exception as exc:
@@ -811,17 +893,50 @@ class Mux:
         for t in threads:
             t.start()
         last_report = time.time()
+        # T136 watchdog: STAT's four deframer counters frozen for a long time is a
+        # death signal (50.6% of dead sessions, 5.6% of controls). Probe only --
+        # never reopen the port and never kill a process, because either would
+        # manufacture the half-open state this is meant to detect.
+        wd_last = None
+        wd_since = None
+        wd_frozen_reports = 0
         try:
             while not self.stop_event.is_set():
                 time.sleep(0.5)
                 if time.time() - last_report >= 30:
                     last_report = time.time()
+                    stats = self.deframer.stats()
                     self.log("STAT %s kdp_rx=%d kdp_tx=%d kdp_drop=%d sxnu1_rx=%d sxnu1_tx=%d"
-                             % (self.deframer.stats(), self.counters["kdp_rx"],
+                             % (stats, self.counters["kdp_rx"],
                                 self.counters["kdp_tx"],
                                 self.counters.get("kdp_unparsed", 0),
                                 self.counters["sxnu1_rx"],
                                 self.counters["sxnu1_tx"]))
+                    # Four-count freeze probe. The log byte counter is included so
+                    # "log still flowing" keeps the watchdog quiet: a frozen
+                    # deframer while LOG keeps arriving is normal (idle device,
+                    # no KDP traffic), not a dead session.
+                    probe = (stats, self.counters["kdp_rx"], self.counters["sxnu1_rx"],
+                             self.counters["sxnu1_tx"], self.counters["bytes_rx"])
+                    if probe == wd_last:
+                        wd_frozen_reports += 1
+                        if wd_since is None:
+                            wd_since = last_report
+                    else:
+                        if wd_frozen_reports >= 3:
+                            self.log("WATCHDOG recovered after %.0fs frozen"
+                                     % (last_report - wd_since if wd_since else 0))
+                        wd_last = probe
+                        wd_since = None
+                        wd_frozen_reports = 0
+                    if wd_frozen_reports == 10:      # 10 x 30 s = 5 min
+                        self.log("WATCHDOG ALERT: all counters frozen for %.0fs "
+                                 "(frames=%d kdp_rx=%d sxnu1_rx=%d sxnu1_tx=%d bytes_rx=%d). "
+                                 "Probe only: not reopening, not killing."
+                                 % (last_report - wd_since if wd_since else 0,
+                                    stats[0], self.counters["kdp_rx"],
+                                    self.counters["sxnu1_rx"], self.counters["sxnu1_tx"],
+                                    self.counters["bytes_rx"]))
         except KeyboardInterrupt:
             self.log(">>> interrupted")
         finally:
@@ -844,6 +959,9 @@ def main(argv=None) -> int:
                    help="seconds to wait for the port (default 400, same as "
                         "nabu_console.py: start the console before flashing)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--exit-on-port-loss", type=float, default=0.0,
+                   help="exit and release COM3 if the port stays absent for "
+                        "this many seconds (0=off, keep the reopen loop)")
     p.add_argument("--kernel", default=None,
                    help="kernel.macho of the build on the board; enables the "
                         "host-side pseudo-commands (framestat / gpubusy / "
@@ -851,7 +969,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     KDP_UDP_PORT = a.udp_port
-    mux = Mux(a.port, a.tag, a.out, a.verbose, a.kernel)
+    mux = Mux(a.port, a.tag, a.out, a.verbose, a.kernel, a.exit_on_port_loss)
     return mux.run(a.wait)
 
 

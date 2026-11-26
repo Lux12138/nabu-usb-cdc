@@ -1,19 +1,34 @@
 /* SPDX-License-Identifier: MIT
  * Derived from Asahi Linux m1n1 v1.4.17 usb_dwc3.c. See LICENSE.m1n1 and
- * ../docs/architecture.md. DART, allocation, Apple platform and the second CDC port removed.
+ * ../docs/architecture.md. DART, allocation and Apple platform removed.
+ *
+ * T131: an optional second CDC ACM function (pipe 1) can be compiled in while
+ * keeping the default enumeration byte-for-byte identical.  It is selected by
+ * DWC3_ID_OPTION_SECOND_PORT in struct dwc3_identity; with the option clear
+ * every descriptor, endpoint action and DMA offset below is exactly the
+ * single-function behaviour this file has always had.
  */
 #include "Dwc3.h"
 #include "Dwc3Regs.h"
 
-#define EP_COUNT 6u
+#define EP_COUNT 6u             /* pipe 0: the original function */
+#define EP_COUNT_MAX 10u        /* pipe 0 + optional pipe 1 */
 #define EP_NOTIFY 3u
 #define EP_OUT 4u
 #define EP_IN 5u
+#define EP_NOTIFY2 7u
+#define EP_OUT2 8u
+#define EP_IN2 9u
 #define EVENT_BYTES 4096u
 #define TRB_OFFSET 4096u
 #define BUFFER_OFFSET 8192u
-#define EP_BUFFER_BYTES 4096u
-#define TX_BYTES DWC3_TX_BYTES
+#define EP_BUFFER_BYTES 4096u   /* bulk pipes */
+#define EP_CTL_BUFFER_BYTES 1024u
+#define EP_NOTIFY_BUFFER_BYTES 512u
+#define PIPE0_TX_BYTES DWC3_TX_BYTES
+#define PIPE1_TX_BYTES 4096u    /* KDP frame + 12-byte KDPF header is <= 1530 */
+#define PIPE1_RX_BYTES 4096u
+#define TX_BYTES PIPE0_TX_BYTES
 #define COMMAND_POLLS 10000u
 #define CONFIG_ACTION_MODIFY (2u << 30)
 
@@ -29,14 +44,17 @@ struct dwc3 {
     uint64_t dma_device;
     uint32_t event_offset, tx_head, tx_tail, tx_used, in_length;
     uint32_t rx_head, rx_tail, rx_used, rx_generation;
-    uint64_t rx_overflow;
+    uint32_t tx2_head, tx2_tail, tx2_used, in_length2;
+    uint32_t rx2_head, rx2_tail, rx2_used;
+    uint64_t rx_overflow, rx_overflow2;
     uint32_t packet_size;
-    uint32_t resource[EP_COUNT];
-    uint8_t active[EP_COUNT];
-    uint8_t tx[TX_BYTES], rx[DWC3_RX_BYTES], line_coding[7], control_reply[256];
+    uint32_t resource[EP_COUNT_MAX];
+    uint8_t active[EP_COUNT_MAX];
+    uint8_t tx[TX_BYTES], rx[DWC3_RX_BYTES], line_coding[2][7], control_reply[256];
+    uint8_t tx2[PIPE1_TX_BYTES], rx2[PIPE1_RX_BYTES];
     uint16_t control_length;
-    uint8_t control_state, control_three_stage, configured, dtr;
-    uint8_t zlp_pending, running, initialized, full_speed, usb31;
+    uint8_t control_state, control_three_stage, control_if, configured, dtr[2];
+    uint8_t zlp_pending, zlp_pending2, running, initialized, full_speed, usb31, second_port;
     int failed;
     uint32_t events, commands, last_event;
     uint64_t dropped;
@@ -66,6 +84,41 @@ static const uint8_t config_hs[] = {CONFIG_BYTES(0, 2, 2)};
 static const uint8_t config_fs[] = {CONFIG_BYTES(64, 0, 2)};
 static const uint8_t other_hs[] = {CONFIG_BYTES(0, 2, 7)};
 static const uint8_t other_fs[] = {CONFIG_BYTES(64, 0, 7)};
+/* T131 composite variant: bDeviceClass=0xEF/02/01 plus one IAD per function,
+ * so Windows usbccgp groups each union-functional CDC function into its own
+ * PDO (one COM port each).  Only selected when the identity asks for pipe 1;
+ * the arrays above are returned unchanged otherwise. */
+static const uint8_t device_descriptor_dual[] = {
+    18, 1, 0, 2, 0xef, 2, 1, 64, 0, 0, 0, 0,
+    0, 1, 1, 2, 3, 1
+};
+static const uint8_t qualifier_dual[] = {10, 6, 0, 2, 0xef, 2, 1, 64, 1, 0};
+#define DUAL_BYTES(mpslo, mpshi, dtype) \
+    9, dtype, 141, 0, 4, 1, 0, 0x80, 50, \
+    8, 0x0b, 0, 2, 2, 2, 1, 0, \
+    9, 4, 0, 0, 1, 2, 2, 1, 0, \
+    5, 0x24, 0, 0x10, 1, \
+    5, 0x24, 1, 0, 1, \
+    4, 0x24, 2, 2, \
+    5, 0x24, 6, 0, 1, \
+    7, 5, 0x81, 3, 16, 0, 10, \
+    9, 4, 1, 0, 2, 0x0a, 0, 0, 0, \
+    7, 5, 0x02, 2, mpslo, mpshi, 0, \
+    7, 5, 0x82, 2, mpslo, mpshi, 0, \
+    8, 0x0b, 2, 2, 2, 2, 1, 0, \
+    9, 4, 2, 0, 1, 2, 2, 1, 0, \
+    5, 0x24, 0, 0x10, 1, \
+    5, 0x24, 1, 0, 3, \
+    4, 0x24, 2, 2, \
+    5, 0x24, 6, 2, 3, \
+    7, 5, 0x83, 3, 16, 0, 10, \
+    9, 4, 3, 0, 2, 0x0a, 0, 0, 0, \
+    7, 5, 0x04, 2, mpslo, mpshi, 0, \
+    7, 5, 0x84, 2, mpslo, mpshi, 0
+static const uint8_t config_dual_hs[] = {DUAL_BYTES(0, 2, 2)};
+static const uint8_t config_dual_fs[] = {DUAL_BYTES(64, 0, 2)};
+static const uint8_t other_dual_hs[] = {DUAL_BYTES(0, 2, 7)};
+static const uint8_t other_dual_fs[] = {DUAL_BYTES(64, 0, 7)};
 static const uint8_t language[] = {4, 3, 9, 4};
 /* Per-instance fixed storage; identity does not retain caller pointers. */
 static size_t identity_chars(const char *text)
@@ -111,9 +164,29 @@ static void sync(struct dwc3 *d, void *p, size_t n, enum dwc3_sync_direction dir
     d->io.dma_sync(d->io.cookie, p, n, dir);
     d->io.barrier(d->io.cookie);
 }
+/* T131: per-endpoint buffer sizes keep ten endpoints inside the same 32 KiB
+ * arena the single-function build has always used (event 4K + TRB 4K +
+ * buffers 21.5K).  Control and notification endpoints need far less than a
+ * bulk pipe, so the compacted layout leaves the SMMU/domain mapping untouched.
+ * Exported so host conformance tests can compute the same offsets. */
+size_t dwc3_ep_buffer_size(unsigned int ep)
+{
+    switch (ep) {
+    case EP_OUT: case EP_IN: case EP_OUT2: case EP_IN2: return EP_BUFFER_BYTES;
+    case EP_NOTIFY: case EP_NOTIFY2: return EP_NOTIFY_BUFFER_BYTES;
+    default: return EP_CTL_BUFFER_BYTES;
+    }
+}
+size_t dwc3_ep_buffer_offset(unsigned int ep)
+{
+    size_t off = BUFFER_OFFSET;
+    unsigned int i;
+    for (i = 0; i < ep; i++) off += dwc3_ep_buffer_size(i);
+    return off;
+}
 static uint8_t *buffer(struct dwc3 *d, unsigned ep)
 {
-    return d->dma_cpu + BUFFER_OFFSET + ep * EP_BUFFER_BYTES;
+    return d->dma_cpu + dwc3_ep_buffer_offset(ep);
 }
 static struct dwc3_trb *trb(struct dwc3 *d, unsigned ep)
 {
@@ -123,6 +196,10 @@ static void rx_reset(struct dwc3 *d)
 {
     zero(d->rx, sizeof(d->rx));
     d->rx_head = d->rx_tail = d->rx_used = 0;
+    if (d->second_port) {
+        zero(d->rx2, sizeof(d->rx2));
+        d->rx2_head = d->rx2_tail = d->rx2_used = 0;
+    }
     d->rx_generation++;
 }
 static void rx_push(struct dwc3 *d, const uint8_t *bytes, size_t count)
@@ -136,6 +213,19 @@ static void rx_push(struct dwc3 *d, const uint8_t *bytes, size_t count)
     }
     d->rx_used += (uint32_t)accepted;
     d->rx_overflow += count - accepted;
+}
+static void rx2_push(struct dwc3 *d, const uint8_t *bytes, size_t count)
+{
+    size_t i, accepted = count;
+    if (!d->second_port) return;
+    if (accepted > PIPE1_RX_BYTES - d->rx2_used)
+        accepted = PIPE1_RX_BYTES - d->rx2_used;
+    for (i = 0; i < accepted; i++) {
+        d->rx2[d->rx2_head] = bytes[i];
+        d->rx2_head = (d->rx2_head + 1u) % PIPE1_RX_BYTES;
+    }
+    d->rx2_used += (uint32_t)accepted;
+    d->rx_overflow2 += count - accepted;
 }
 static int wait_mask(struct dwc3 *d, uint32_t reg, uint32_t mask, uint32_t want)
 {
@@ -192,8 +282,9 @@ static int end_transfer(struct dwc3 *d, unsigned ep)
 static int end_noncontrol(struct dwc3 *d)
 {
     unsigned ep;
-    for (ep = EP_NOTIFY; ep < EP_COUNT; ep++) if (end_transfer(d, ep)) return -4;
+    for (ep = EP_NOTIFY; ep < EP_COUNT_MAX; ep++) if (end_transfer(d, ep)) return -4;
     d->zlp_pending = 0;
+    d->zlp_pending2 = 0;
     return 0;
 }
 static int configure_ep(struct dwc3 *d, unsigned ep, unsigned type,
@@ -213,15 +304,16 @@ static int configure_ep(struct dwc3 *d, unsigned ep, unsigned type,
 static int transfer(struct dwc3 *d, unsigned ep, uint32_t type, unsigned bytes)
 {
     struct dwc3_trb *t = trb(d, ep);
-    uint64_t data_dma = d->dma_device + BUFFER_OFFSET + ep * EP_BUFFER_BYTES;
+    size_t ep_bytes = dwc3_ep_buffer_size(ep);
+    uint64_t data_dma = d->dma_device + dwc3_ep_buffer_offset(ep);
     uint64_t trb_dma = d->dma_device + TRB_OFFSET + ep * 64u;
-    if (d->active[ep] || bytes > EP_BUFFER_BYTES) return -5;
+    if (d->active[ep] || bytes > ep_bytes) return -5;
     t->bpl = (uint32_t)data_dma;
     t->bph = (uint32_t)(data_dma >> 32);
     t->size = bytes;
     t->ctrl = type | DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_LST |
               DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_IOC;
-    sync(d, buffer(d, ep), EP_BUFFER_BYTES, DWC3_TO_DEVICE);
+    sync(d, buffer(d, ep), ep_bytes, DWC3_TO_DEVICE);
     sync(d, t, 64, DWC3_TO_DEVICE);
     if (ep_command(d, ep, DWC3_DEPCMD_STARTTRANSFER,
                    (uint32_t)(trb_dma >> 32), (uint32_t)trb_dma, 0)) return -4;
@@ -246,11 +338,24 @@ const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index,
     size_t n = 0;
     if (!d || !d->initialized) { if (length) *length = 0; return 0; }
     if (index == 0) {
-        switch (type) {
-        case 1: p = d->device_descriptor; n = sizeof(d->device_descriptor); break;
-        case 2: p = fs ? config_fs : config_hs; n = sizeof(config_hs); break;
-        case 6: p = qualifier; n = sizeof(qualifier); break;
-        case 7: p = fs ? other_hs : other_fs; n = sizeof(other_hs); break;
+        if (d->second_port) {
+            switch (type) {
+            case 1: p = device_descriptor_dual; n = sizeof(device_descriptor_dual); break;
+            case 2: p = fs ? config_dual_fs : config_dual_hs;
+                    n = fs ? sizeof(config_dual_fs) : sizeof(config_dual_hs); break;
+            case 6: p = qualifier_dual; n = sizeof(qualifier_dual); break;
+            case 7: p = fs ? other_dual_hs : other_dual_fs;
+                    n = fs ? sizeof(other_dual_hs) : sizeof(other_dual_fs); break;
+            }
+        } else {
+            switch (type) {
+            case 1: p = d->device_descriptor; n = sizeof(d->device_descriptor); break;
+            case 2: p = fs ? config_fs : config_hs;
+                    n = fs ? sizeof(config_fs) : sizeof(config_hs); break;
+            case 6: p = qualifier; n = sizeof(qualifier); break;
+            case 7: p = fs ? other_hs : other_fs;
+                    n = fs ? sizeof(other_hs) : sizeof(other_fs); break;
+            }
         }
     }
     if (type == 3) {
@@ -267,12 +372,14 @@ const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index,
 
 static int set_configuration(struct dwc3 *d, unsigned value)
 {
+    unsigned mask = 3u | (1u << EP_NOTIFY) | (1u << EP_OUT) | (1u << EP_IN);
     if (value > 1) return -1;
     if (d->configured && end_noncontrol(d)) return -4;
     d->configured = (uint8_t)value;
-    d->dtr = 0;
-    wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_NOTIFY) | (1u << EP_OUT) |
-                                       (1u << EP_IN)) : 0u));
+    d->dtr[0] = 0;
+    d->dtr[1] = 0;
+    if (d->second_port) mask |= (1u << EP_NOTIFY2) | (1u << EP_OUT2) | (1u << EP_IN2);
+    wr(d, DWC3_DALEPENA, value ? mask : 0u);
     return 0;
 }
 static int setup_request(struct dwc3 *d)
@@ -280,6 +387,7 @@ static int setup_request(struct dwc3 *d)
     const uint8_t *s = buffer(d, 0), *reply = 0;
     uint16_t value = le16(s + 2), index = le16(s + 4), length = le16(s + 6);
     size_t n = 0;
+    unsigned int ifaces = d->second_port ? 4u : 2u;
     int ok = 0;
     trace(d, DWC3_TRACE_SETUP, ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | value,
           ((uint32_t)index << 16) | length);
@@ -290,9 +398,11 @@ static int setup_request(struct dwc3 *d)
         ok = reply != 0;
     } else if ((s[0] == 0x80 || s[0] == 0x81 || s[0] == 0x82) && s[1] == 0 &&
                value == 0 && length == 2 && ((s[0] == 0x80 && index == 0) ||
-               (s[0] == 0x81 && index < 2) ||
+               (s[0] == 0x81 && index < ifaces) ||
                (s[0] == 0x82 && (index == 0 || index == 0x80 || index == 0x81 ||
-                                  index == 2 || index == 0x82)))) {
+                                  index == 2 || index == 0x82 ||
+                                  (d->second_port && (index == 3 || index == 0x83 ||
+                                   index == 4 || index == 0x84)))))) {
         d->control_reply[0] = 0; d->control_reply[1] = 0;
         reply = d->control_reply; n = 2; ok = 1;
     } else if (s[0] == 0 && s[1] == 5 && value <= 127 && index == 0 && length == 0) {
@@ -305,19 +415,26 @@ static int setup_request(struct dwc3 *d)
         ok = 1;
     } else if (s[0] == 0x80 && s[1] == 8 && value == 0 && index == 0 && length == 1) {
         d->control_reply[0] = d->configured; reply = d->control_reply; n = 1; ok = 1;
-    } else if (s[0] == 0x81 && s[1] == 10 && value == 0 && index < 2 && length == 1) {
+    } else if (s[0] == 0x81 && s[1] == 10 && value == 0 && index < ifaces && length == 1) {
         d->control_reply[0] = 0; reply = d->control_reply; n = 1; ok = 1;
-    } else if (s[0] == 1 && s[1] == 11 && value == 0 && index < 2 && length == 0) {
+    } else if (s[0] == 1 && s[1] == 11 && value == 0 && index < ifaces && length == 0) {
         ok = 1;
-    } else if (s[0] == 0x21 && s[1] == 0x22 && index == 0 && length == 0 && value <= 3) {
-        d->dtr = (uint8_t)(value & 1);
-        trace(d, DWC3_TRACE_READY, d->configured, d->dtr); ok = 1;
-    } else if (s[0] == 0xa1 && s[1] == 0x21 && index == 0 && value == 0 && length == 7) {
-        reply = d->line_coding; n = 7; ok = 1;
-    } else if (s[0] == 0x21 && s[1] == 0x20 && index == 0 && value == 0 && length == 7) {
+    } else if (s[0] == 0x21 && s[1] == 0x22 && (index == 0 || (d->second_port && index == 2)) &&
+               length == 0 && value <= 3) {
+        unsigned int pipe = index == 0 ? 0u : 1u;
+        d->dtr[pipe] = (uint8_t)(value & 1);
+        trace(d, DWC3_TRACE_READY, d->configured, d->dtr[pipe]); ok = 1;
+    } else if (s[0] == 0xa1 && s[1] == 0x21 &&
+               (index == 0 || (d->second_port && index == 2)) && value == 0 && length == 7) {
+        reply = d->line_coding[index == 0 ? 0 : 1]; n = 7; ok = 1;
+    } else if (s[0] == 0x21 && s[1] == 0x20 &&
+               (index == 0 || (d->second_port && index == 2)) && value == 0 && length == 7) {
+        d->control_if = (uint8_t)(index == 0 ? 0 : 1);
         d->control_length = 7; d->control_state = CTRL_OUT_WAIT; return 0;
     } else if (s[0] == 2 && s[1] == 1 && value == 0 && length == 0 &&
-               (index == 0x81 || index == 2 || index == 0x82)) {
+               (index == 0x81 || index == 2 || index == 0x82 ||
+                (d->second_port && (index == 0x83 || index == 3 ||
+                                    index == 4 || index == 0x84)))) {
         unsigned ep = ((index & 15u) << 1) | ((index >> 7) & 1u);
         ok = ep_command(d, ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0) == 0;
     }
@@ -362,15 +479,15 @@ static int control_complete(struct dwc3 *d, unsigned ep, uint32_t residual)
     switch (d->control_state) {
     case CTRL_SETUP:
         if (ep != 0 || residual) return stall(d);
-        sync(d, buffer(d, 0), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
+        sync(d, buffer(d, 0), dwc3_ep_buffer_size(0), DWC3_FROM_DEVICE);
         return setup_request(d);
     case CTRL_IN_ACTIVE:
         if (ep != 1 || residual) return stall(d);
         d->control_state = CTRL_STATUS_OUT_WAIT; return 0;
     case CTRL_OUT_ACTIVE:
         if (ep != 0 || residual != 64u - d->control_length) return stall(d);
-        sync(d, buffer(d, 0), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
-        copy(d->line_coding, buffer(d, 0), 7);
+        sync(d, buffer(d, 0), dwc3_ep_buffer_size(0), DWC3_FROM_DEVICE);
+        copy(d->line_coding[d->control_if], buffer(d, 0), 7);
         d->control_state = CTRL_STATUS_IN_WAIT; return 0;
     case CTRL_STATUS_IN_ACTIVE:
     case CTRL_STATUS_OUT_ACTIVE: return setup_phase(d);
@@ -381,15 +498,27 @@ static int pump(struct dwc3 *d)
 {
     uint32_t n, i;
     if (!d->configured) return 0;
-    /* Keep one bulk-OUT transfer armed. Completed bytes are copied into the
-     * finite RX ring by handle_event before this function rearms it. */
+    /* Keep one bulk-OUT transfer armed per pipe. Completed bytes are copied
+     * into the finite RX ring by handle_event before this function rearms it. */
     if (!d->active[EP_OUT] && transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
-    if (!d->dtr || d->active[EP_IN]) return 0;
-    n = d->tx_used < EP_BUFFER_BYTES ? d->tx_used : EP_BUFFER_BYTES;
-    if (!n && !d->zlp_pending) return 0;
-    for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = d->tx[(d->tx_tail + i) % TX_BYTES];
-    if (transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, n)) return -4;
-    d->in_length = n;
+    if (d->second_port && !d->active[EP_OUT2] &&
+        transfer(d, EP_OUT2, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
+    if (d->dtr[0] && !d->active[EP_IN]) {
+        n = d->tx_used < EP_BUFFER_BYTES ? d->tx_used : EP_BUFFER_BYTES;
+        if (n || d->zlp_pending) {
+            for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = d->tx[(d->tx_tail + i) % TX_BYTES];
+            if (transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, n)) return -4;
+            d->in_length = n;
+        }
+    }
+    if (d->second_port && d->dtr[1] && !d->active[EP_IN2]) {
+        n = d->tx2_used < PIPE1_TX_BYTES ? d->tx2_used : PIPE1_TX_BYTES;
+        if (n || d->zlp_pending2) {
+            for (i = 0; i < n; i++) buffer(d, EP_IN2)[i] = d->tx2[(d->tx2_tail + i) % PIPE1_TX_BYTES];
+            if (transfer(d, EP_IN2, DWC3_TRBCTL_NORMAL, n)) return -4;
+            d->in_length2 = n;
+        }
+    }
     return 0;
 }
 static int device_event(struct dwc3 *d, unsigned event)
@@ -397,14 +526,16 @@ static int device_event(struct dwc3 *d, unsigned event)
     unsigned i, speed;
     trace(d, DWC3_TRACE_DEVICE_EVENT, event, rd(d, DWC3_DSTS));
     if (event == DWC3_DEVT_USBRST || event == DWC3_DEVT_DISCONN) {
-        d->configured = d->dtr = d->zlp_pending = 0;
+        d->configured = 0;
+        d->dtr[0] = d->dtr[1] = 0;
+        d->zlp_pending = d->zlp_pending2 = 0;
         rx_reset(d);
         if (end_noncontrol(d)) return -4;
         /* EP0 SETUP/STATUS have special hardware rules; only an active DATA
          * transfer needs ENDTRANSFER before resetting the control state. */
         if (d->control_state == CTRL_IN_ACTIVE && end_transfer(d, 1)) return -4;
         if (d->control_state == CTRL_OUT_ACTIVE && end_transfer(d, 0)) return -4;
-        for (i = 0; i < EP_COUNT; i++) d->active[i] = 0;
+        for (i = 0; i < EP_COUNT_MAX; i++) d->active[i] = 0;
         wr(d, DWC3_DALEPENA, 3);
         wr(d, DWC3_DCFG, rd(d, DWC3_DCFG) & ~DWC3_DCFG_DEVADDR_MASK);
         d->control_state = CTRL_SETUP;
@@ -421,6 +552,10 @@ static int device_event(struct dwc3 *d, unsigned event)
             configure_ep(d, 1, DWC3_DEPCMD_TYPE_CONTROL, 64, 1) ||
             configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1) ||
             configure_ep(d, EP_OUT, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1)) return -4;
+        if (d->second_port &&
+            (configure_ep(d, EP_NOTIFY2, DWC3_DEPCMD_TYPE_INTR, 16, 1) ||
+             configure_ep(d, EP_IN2, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1) ||
+             configure_ep(d, EP_OUT2, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1))) return -4;
         return setup_phase(d);
     }
     if (event == DWC3_DEVT_EVNTOVERFLOW || event == DWC3_DEVT_ERRTICERR) return -7;
@@ -437,7 +572,7 @@ static int handle_event(struct dwc3 *d, uint32_t event)
     ep = (event >> 1) & 31u;
     type = (event >> 6) & 15u;
     status = (event >> 12) & 15u;
-    if (ep >= EP_COUNT || ep == 2) {
+    if (ep >= EP_COUNT_MAX || ep == 2 || ep == 6) {
         trace(d, DWC3_TRACE_BAD_EVENT, event, 1); return 0;
     }
     if (type == DWC3_DEPEVT_XFERCOMPLETE) {
@@ -450,17 +585,27 @@ static int handle_event(struct dwc3 *d, uint32_t event)
             return setup_phase(d);
         if (ep < 2) return control_complete(d, ep, residual);
         if (DWC3_TRB_SIZE_TRBSTS(trb(d, ep)->size) != DWC3_TRBSTS_OK) return -8;
-        if (ep == EP_OUT) {
-            if (residual > EP_BUFFER_BYTES) return -8;
-            sync(d, buffer(d, EP_OUT), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
-            rx_push(d, buffer(d, EP_OUT), EP_BUFFER_BYTES - residual);
+        if (ep == EP_OUT || ep == EP_OUT2) {
+            size_t ep_bytes = dwc3_ep_buffer_size(ep);
+            if (residual > ep_bytes) return -8;
+            sync(d, buffer(d, ep), ep_bytes, DWC3_FROM_DEVICE);
+            if (ep == EP_OUT) rx_push(d, buffer(d, EP_OUT), ep_bytes - residual);
+            else rx2_push(d, buffer(d, EP_OUT2), ep_bytes - residual);
         }
-        if (ep == EP_IN) {
-            if (residual > d->in_length) return -8;
-            d->tx_tail = (d->tx_tail + d->in_length - residual) % TX_BYTES;
-            d->tx_used -= d->in_length - residual;
-            d->zlp_pending = d->in_length != 0 && residual == 0 &&
-                             (d->in_length % d->packet_size) == 0;
+        if (ep == EP_IN || ep == EP_IN2) {
+            uint32_t sent = ep == EP_IN ? d->in_length : d->in_length2;
+            if (residual > sent) return -8;
+            if (ep == EP_IN) {
+                d->tx_tail = (d->tx_tail + sent - residual) % TX_BYTES;
+                d->tx_used -= sent - residual;
+                d->zlp_pending = sent != 0 && residual == 0 &&
+                                 (sent % d->packet_size) == 0;
+            } else {
+                d->tx2_tail = (d->tx2_tail + sent - residual) % PIPE1_TX_BYTES;
+                d->tx2_used -= sent - residual;
+                d->zlp_pending2 = sent != 0 && residual == 0 &&
+                                  (sent % d->packet_size) == 0;
+            }
         }
     } else if (type == DWC3_DEPEVT_XFERNOTREADY && !d->active[ep] && ep < 2) {
         return control_not_ready(d, ep, status);
@@ -490,7 +635,12 @@ int dwc3_init(void *context, size_t context_bytes,
         !(product_chars = identity_chars(identity->product)) ||
         !(serial_chars = identity_chars(identity->serial))) return -1;
     zero(d, sizeof(*d)); copy(&d->io, platform, sizeof(*platform));
-    copy(d->device_descriptor, device_descriptor, sizeof(device_descriptor));
+    /* T131: pipe 1 is opt-in through the identity.  With the option clear the
+     * copied device descriptor and every later decision are the original ones. */
+    d->second_port = (identity->options & DWC3_ID_OPTION_SECOND_PORT) ? 1u : 0u;
+    copy(d->device_descriptor,
+         d->second_port ? device_descriptor_dual : device_descriptor,
+         sizeof(d->device_descriptor));
     d->device_descriptor[8] = (uint8_t)identity->vid;
     d->device_descriptor[9] = (uint8_t)(identity->vid >> 8);
     d->device_descriptor[10] = (uint8_t)identity->pid;
@@ -500,8 +650,10 @@ int dwc3_init(void *context, size_t context_bytes,
     string_descriptor(d->serial, identity->serial, serial_chars);
     d->dma_cpu = dma_cpu; d->dma_device = dma_device;
     d->packet_size = 512;
-    d->line_coding[0] = 0; d->line_coding[1] = 0xc2;
-    d->line_coding[2] = 1; d->line_coding[6] = 8;
+    d->line_coding[0][0] = 0; d->line_coding[0][1] = 0xc2;
+    d->line_coding[0][2] = 1; d->line_coding[0][6] = 8;
+    d->line_coding[1][0] = 0; d->line_coding[1][1] = 0xc2;
+    d->line_coding[1][2] = 1; d->line_coding[1][6] = 8;
     id = rd(d, DWC3_GSNPSID); trace(d, DWC3_TRACE_ID, id, 0);
     if ((id & 0xffff0000u) != 0x55330000u && (id & 0xffff0000u) != 0x33310000u)
         return -2;
@@ -509,8 +661,15 @@ int dwc3_init(void *context, size_t context_bytes,
     params = rd(d, DWC3_GHWPARAMS3);
     total_eps = (params >> 12) & 63u;
     in_eps = (params >> 18) & 31u;
-    if (total_eps < EP_COUNT || in_eps < 3 || in_eps > total_eps || total_eps - in_eps < 3)
-        return -2;
+    {
+        unsigned int need_total = d->second_port ? EP_COUNT_MAX : EP_COUNT;
+        unsigned int need_in = d->second_port ? 5u : 3u;
+        /* Single-function builds keep the exact historical gate; pipe 1 needs
+         * two bulk pairs (phys 8/9 plus notify 7), i.e. 10 endpoints. */
+        if (total_eps < need_total || in_eps < need_in ||
+            in_eps > total_eps || total_eps - in_eps < need_in)
+            return -2;
+    }
     interrupts = (rd(d, DWC3_GHWPARAMS1) >> 15) & 63u;
     if (!interrupts || interrupts > 32) return -2;
     wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
@@ -540,11 +699,14 @@ int dwc3_init(void *context, size_t context_bytes,
     wr(d, DWC3_DEVTEN, DWC3_DEVTEN_DISCONNEVTEN | DWC3_DEVTEN_USBRSTEN |
          DWC3_DEVTEN_CONNECTDONEEN | DWC3_DEVTEN_EVNTOVERFLOWEN | DWC3_DEVTEN_ERRTICERREN);
     if (ep_command(d, 0, DWC3_DEPCMD_DEPSTARTCFG, 0, 0, 0)) goto fail;
-    for (ep = 0; ep < EP_COUNT; ep++) {
-        if (ep == 2) continue;
-        unsigned type = ep < 2 ? DWC3_DEPCMD_TYPE_CONTROL :
-                        ep == EP_NOTIFY ? DWC3_DEPCMD_TYPE_INTR : DWC3_DEPCMD_TYPE_BULK;
-        unsigned mps = ep < 2 ? 64 : ep == EP_NOTIFY ? 16 : 512;
+    for (ep = 0; ep < EP_COUNT_MAX; ep++) {
+        unsigned type, mps;
+        if (ep == 2 || ep == 6) continue;
+        if (ep >= EP_NOTIFY2 && !d->second_port) continue;
+        type = ep < 2 ? DWC3_DEPCMD_TYPE_CONTROL :
+               (ep == EP_NOTIFY || ep == EP_NOTIFY2) ? DWC3_DEPCMD_TYPE_INTR :
+                                                       DWC3_DEPCMD_TYPE_BULK;
+        mps = ep < 2 ? 64 : (ep == EP_NOTIFY || ep == EP_NOTIFY2) ? 16 : 512;
         if (configure_ep(d, ep, type, mps, 0)) goto fail;
     }
     wr(d, DWC3_DALEPENA, 3);
@@ -584,34 +746,80 @@ int dwc3_poll(struct dwc3 *d, unsigned budget)
     if (ret) { d->failed = ret; return ret; }
     return (int)done;
 }
-size_t dwc3_queue(struct dwc3 *d, const void *bytes, size_t count)
+size_t dwc3_queue_pipe(struct dwc3 *d, unsigned int pipe, const void *bytes, size_t count)
 {
     const uint8_t *p = bytes;
-    size_t n = count, i;
+    size_t n = count, i, cap;
+    uint8_t *ring;
+    uint32_t *head, *used;
     if (!d || !d->initialized || !bytes) return 0;
-    if (n > TX_BYTES - d->tx_used) n = TX_BYTES - d->tx_used;
-    for (i = 0; i < n; i++) { d->tx[d->tx_head] = p[i]; d->tx_head = (d->tx_head + 1) % TX_BYTES; }
-    d->tx_used += (uint32_t)n;
+    if (pipe == 0) {
+        ring = d->tx; head = &d->tx_head; used = &d->tx_used; cap = TX_BYTES;
+    } else {
+        if (!d->second_port) return 0;
+        ring = d->tx2; head = &d->tx2_head; used = &d->tx2_used; cap = PIPE1_TX_BYTES;
+    }
+    if (n > cap - *used) n = cap - *used;
+    for (i = 0; i < n; i++) { ring[*head] = p[i]; *head = (*head + 1u) % cap; }
+    *used += (uint32_t)n;
     d->dropped += count - n;
+    return n;
+}
+size_t dwc3_queue(struct dwc3 *d, const void *bytes, size_t count)
+{
+    return dwc3_queue_pipe(d, 0u, bytes, count);
+}
+size_t dwc3_read_pipe(struct dwc3 *d, unsigned int pipe, void *bytes, size_t count)
+{
+    uint8_t *to = bytes;
+    size_t n, i, cap;
+    uint8_t *ring;
+    uint32_t *tail, *used;
+    if (!d || !bytes || !count) return 0;
+    if (pipe == 0) {
+        ring = d->rx; tail = &d->rx_tail; used = &d->rx_used; cap = DWC3_RX_BYTES;
+    } else {
+        if (!d->second_port) return 0;
+        ring = d->rx2; tail = &d->rx2_tail; used = &d->rx2_used; cap = PIPE1_RX_BYTES;
+    }
+    n = count < *used ? count : *used;
+    for (i = 0; i < n; i++) {
+        to[i] = ring[*tail];
+        *tail = (*tail + 1u) % cap;
+    }
+    *used -= (uint32_t)n;
     return n;
 }
 size_t dwc3_read(struct dwc3 *d, void *bytes, size_t count)
 {
-    uint8_t *to = bytes;
-    size_t n, i;
-    if (!d || !bytes || !count) return 0;
-    n = count < d->rx_used ? count : d->rx_used;
-    for (i = 0; i < n; i++) {
-        to[i] = d->rx[d->rx_tail];
-        d->rx_tail = (d->rx_tail + 1u) % DWC3_RX_BYTES;
-    }
-    d->rx_used -= (uint32_t)n;
-    return n;
+    return dwc3_read_pipe(d, 0u, bytes, count);
 }
-int dwc3_ready(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured && d->dtr; }
+int dwc3_ready(const struct dwc3 *d)
+{
+    return d && d->running && !d->failed && d->configured &&
+           (d->dtr[0] != 0 || (d->second_port && d->dtr[1] != 0));
+}
+size_t dwc3_queued_pipe(const struct dwc3 *d, unsigned int pipe)
+{
+    if (!d) return 0;
+    if (pipe == 0) return d->tx_used;
+    return d->second_port ? d->tx2_used : 0;
+}
 size_t dwc3_queued(const struct dwc3 *d) { return d ? d->tx_used : 0; }
 uint64_t dwc3_dropped(const struct dwc3 *d) { return d ? d->dropped : 0; }
+size_t dwc3_rx_pending_pipe(const struct dwc3 *d, unsigned int pipe)
+{
+    if (!d) return 0;
+    if (pipe == 0) return d->rx_used;
+    return d->second_port ? d->rx2_used : 0;
+}
 size_t dwc3_rx_pending(const struct dwc3 *d) { return d ? d->rx_used : 0; }
+uint64_t dwc3_rx_overflow_pipe(const struct dwc3 *d, unsigned int pipe)
+{
+    if (!d) return 0;
+    if (pipe == 0) return d->rx_overflow;
+    return d->second_port ? d->rx_overflow2 : 0;
+}
 uint64_t dwc3_rx_overflow(const struct dwc3 *d) { return d ? d->rx_overflow : 0; }
 uint32_t dwc3_rx_generation(const struct dwc3 *d) { return d ? d->rx_generation : 0; }
 void dwc3_snapshot(struct dwc3 *d, struct dwc3_snapshot *s)
@@ -624,18 +832,19 @@ void dwc3_snapshot(struct dwc3 *d, struct dwc3_snapshot *s)
     s->snpsid = rd(d, DWC3_GSNPSID); s->gctl = rd(d, DWC3_GCTL);
     s->dcfg = rd(d, DWC3_DCFG); s->dctl = rd(d, DWC3_DCTL); s->dsts = rd(d, DWC3_DSTS);
     s->event_count = rd(d, DWC3_GEVNTCOUNT(0)); s->enabled_endpoints = rd(d, DWC3_DALEPENA);
-    s->configured = d->configured; s->dtr = d->dtr; s->queued = d->tx_used;
+    s->configured = d->configured; s->dtr = d->dtr[0] | (d->dtr[1] << 1); s->queued = d->tx_used;
     s->rx_pending = d->rx_used; s->rx_generation = d->rx_generation;
     s->rx_overflow = d->rx_overflow;
-    for (ep = 0; ep < EP_COUNT; ep++) if (d->active[ep]) s->active_endpoints |= 1u << ep;
+    for (ep = 0; ep < EP_COUNT_MAX; ep++) if (d->active[ep]) s->active_endpoints |= 1u << ep;
 }
 int dwc3_stop(struct dwc3 *d)
 {
     unsigned ep;
     if (!d || !d->initialized) return -1;
-    d->dtr = d->configured = 0;
+    d->configured = 0;
+    d->dtr[0] = d->dtr[1] = 0;
     rx_reset(d);
-    for (ep = 0; ep < EP_COUNT; ep++) {
+    for (ep = 0; ep < EP_COUNT_MAX; ep++) {
         if (ep < 2 && d->control_state != CTRL_IN_ACTIVE && d->control_state != CTRL_OUT_ACTIVE)
             continue;
         if (end_transfer(d, ep)) return -4;

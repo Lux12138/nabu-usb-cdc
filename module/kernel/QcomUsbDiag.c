@@ -412,6 +412,20 @@ static const struct qud_read_range qud_read_whitelist[] = {
     { UINT64_C(0x01050000), UINT64_C(0x01090000), "gcc"    },
     { UINT64_C(0x0af00000), UINT64_C(0x0af01000), "discc"  },
     { UINT64_C(0x0a600000), UINT64_C(0x0a700000), "dwc3"   },
+    /* ---- T149 additions: blocks a board round actually read ----------------
+     * GICv3 distributor and redistributors. The t140 batch ran GICSNAP nine
+     * times (four distributor words, then eight redistributor TYPER reads) and
+     * every read answered; the raw reply is t140v-com.bin offs 144253 with
+     * dist.ctlr=0x12. That is the evidence this list is supposed to hold, so
+     * the bus primitives ask READPA's policy instead of keeping a private
+     * window table (T149 R1). */
+    { UINT64_C(0x17a00000), UINT64_C(0x17a10000), "gic-dist" },
+    { UINT64_C(0x17a60000), UINT64_C(0x17b60000), "gic-rdist" },
+    /* TLMM block 0 only -- one block, not the dts's 0xdc2000. On the same
+     * batch, 0x03000000/0x03000004 answered and 0x03001000 wedged the CPU,
+     * so this window is per verified block index and grows one block per board
+     * round (T149 R3). Only +0x00 and +0x04 are ever touched inside it. */
+    { UINT64_C(0x03000000), UINT64_C(0x03001000), "tlmm0"  },
     /* 0x9b000000 is deliberately NOT here. kb-46 measured `readpa 0x9b000000`
      * as returning zeros and it was whitelisted on that basis, but two later
      * board rounds showed the address has no usable backing at all:
@@ -577,6 +591,25 @@ int qud_log_ufs_read_block(uint64_t rel, void *dst, int *why)
     if (&native_ufs_log_read == 0) { if (why) *why = 1; return 0; }
     if (!qud_dump_ufs_available()) { if (why) *why = 2; return 0; }
     if (native_ufs_log_read(rel, 1u, dst) != 1) { if (why) *why = 3; return 0; }
+    return 1;
+}
+
+/* T140 NABULOGRING: open the diagnostic log window and report its live
+ * geometry (first absolute 4 KiB block, size in blocks). The caller derives
+ * the periodic slot (block 0 of the window) and the panic slot (blocks - 2)
+ * from this instead of hard-coded LBAs. Weak import: a kernel without the UFS
+ * log window answers 0 with why="unsupported". */
+int qud_nabulog_open(uint64_t *first, uint64_t *blocks, const char **why)
+{
+    const char *reason = "";
+    uint64_t f = 0, b = 0;
+    int ok;
+    if (why) *why = "";
+    if (&native_ufs_log_open == 0) { if (why) *why = "unsupported"; return 0; }
+    ok = native_ufs_log_open(&f, &b, &reason);
+    if (!ok) { if (why) *why = reason && *reason ? reason : "closed"; return 0; }
+    if (first) *first = f;
+    if (blocks) *blocks = b;
     return 1;
 }
 

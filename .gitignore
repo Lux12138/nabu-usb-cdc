@@ -15,3 +15,6 @@ docs/OPERATIONS.md
 # KDP client runtime state (session key and breakpoint list belong to a boot)
 kdp_client/kdp_session.json
 kdp_client/kdp_breakpoints.json
+
+# local backup snapshots, never publish
+*.bak*

@@ -74,7 +74,7 @@ def kdp(args: list[str], transport: str = "udp") -> subprocess.CompletedProcess:
     cmd = [exe, os.path.join(KDP_CLIENT, "kdp_cli.py"),
            "--transport", transport]
     if transport == "udp":
-        cmd += ["--host", "127.0.0.1", "--udp-port", "41139"]
+        cmd += ["--host", "127.0.0.1", "--udp-port", "41139", "--fresh"]
     cmd += args
     return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
@@ -131,8 +131,7 @@ def resolve_symbol(name: str, kernel: str) -> int:
 
 
 def read_bytes(addr: int, length: int, transport: str) -> bytes:
-    r = kdp(["readmem", hex(addr), str(length), "--format", "hex",
-             "--fresh"], transport)
+    r = kdp(["readmem", hex(addr), str(length), "--format", "hex"], transport)
     if r.returncode != 0:
         raise SystemExit(f"readmem failed:\n{r.stdout}\n{r.stderr}")
     hexpart = "".join(r.stdout.split())
@@ -145,8 +144,7 @@ def read_bytes(addr: int, length: int, transport: str) -> bytes:
 
 
 def write_bytes(addr: int, data: bytes, transport: str) -> None:
-    r = kdp(["writemem", hex(addr), "--hexdata", data.hex(), "--fresh"],
-            transport)
+    r = kdp(["writemem", hex(addr), "--hexdata", data.hex()], transport)
     if r.returncode != 0:
         raise SystemExit(f"writemem failed:\n{r.stdout}\n{r.stderr}")
     print(r.stdout.strip())

@@ -8,13 +8,19 @@ Xiaomi Pad 5（nabu / SM8150）上的 XNU 17.7.11 调试控制台。
 
 ---
 
-## 现在的状态（2026-11-25 16:00）
+## 现在的状态（2026-11-26 21:15）
 
-**48 个设备端命令 + 15 条主机侧命令 + KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
+**双 CDC 通道 + 51 个设备端命令 + KDP 网络链路 + 原生 lldb 直连，全部真机验证。**
+
+> ★ **双通道（2026-11-26 新增）**：主机同时看到 `COM5`（MI_00，控制口：SXNU1 verb + 回复）
+> 和 `COM6`（MI_02，数据口：内核日志 + KDPF）。**两个口都完整可用**。
+> 关键：`COM6` 必须被宿主程序 `open()`（DTR 置位），设备侧 `Dwc3.c:514` 的
+> `d->dtr[1]` 门控才会把日志发到 EP_IN2。历史上「pipe1 OUT 不可用 / 缺陷 C」的判断
+> 全部是误报（只枚举端口、没有 open 它）。详见下方「双 CDC 通道」一节。
 
 | 指标 | 状态 |
 |---|---|
-| 设备端 verb | **48** 个（`module/kernel/QcomUsbControl.h`）|
+| 设备端 verb | **51** 个（`module/kernel/QcomUsbControl.h`；新增 FGREAD/GPIOGET/PIPE1STAT 等）|
 | 主机侧命令 | **15** 条（读已导出数组，不需要内核改动）|
 | 内核日志 | 开机到复位连续，无需第二串口 |
 | 读内存 | 内核虚拟地址 + 物理地址/MMIO，带白名单防护 |
@@ -96,6 +102,36 @@ SXNU1 控制台沉默，历史上只能断电。根因有两条：
 > ```
 
 ---
+
+## 双 CDC 通道（2026-11-26 实测可用）
+
+刷入带 `nabu-cdc-second-port=2` 的 payload 后，Windows 枚举出两个 CDC ACM 接口：
+
+```
+USB 串行设备 (COM5)  USB\VID_0000&PID_0000&MI_00   ← 控制口 pipe0
+USB 串行设备 (COM6)  USB\VID_0000&PID_0000&MI_02   ← 数据口 pipe1
+```
+
+| 口 | 用途 | 用法 |
+|---|---|---|
+| **COM5**（pipe0）| SXNU1 verb / 回复 / HELLO / STATUS / DEBUGGER | mux 用 `--port COM5` 连接 |
+| **COM6**（pipe1）| 内核日志（`nabu: spawn` / `GPUACC` / `mount-complete`）+ KDPF 帧 | **必须由宿主程序持续 `open()`** |
+
+**★ DTR 门控（`Dwc3.c:514`）**：
+```c
+if (d->second_port && d->dtr[1] && !d->active[EP_IN2]) {
+    /* 把 tx2 环里的字节发到 EP_IN2 */
+}
+```
+COM6 没有应用程序打开时 DTR=0，设备侧不会发数据 —— 这不是 bug。
+实测：Python `serial.Serial('COM6', 115200)` 保持打开，15 秒收到 490 字节内核日志。
+
+**`nabu-kdp-net=1` 的作用**：把内核日志从 pipe0 改道到 pipe1（由
+`qcom_usb_debug_kdp_net_active()` 的 `net_mode` 决定，USB ACTIVE 后的 tick 置位）。
+因此双口调试时**必须打开 COM6 才能看到日志**。
+
+**静态描述符自检**：`answers/T131-dual-cdc-interface/desc_walk.py`（在 E:/nabu/state/bridge/answers/）
+展开 `Dwc3.c` 的 CONFIG_BYTES/DUAL_BYTES 并逐项校验端点/IAD/union，RESULT: PASS。
 
 ## 快速开始
 

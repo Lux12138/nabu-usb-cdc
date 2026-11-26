@@ -61,6 +61,8 @@
 
 通用 DWC3 core 采用无分配轮询模型、一个 CDC ACM 功能，当前参考端点为 notification IN `0x81`、bulk OUT `0x02`、bulk IN `0x82`。提供 full/high-speed 描述符，主动禁用 SuperSpeed，降低首轮 PHY 和链路范围。
 
+T131 起 `struct dwc3_identity.options` 的 `DWC3_ID_OPTION_SECOND_PORT` 可选第二个 CDC ACM 功能（复合设备 `0xEF/02/01` + IAD，通知 `0x83`、bulk `0x04`/`0x84`），把 KDP 裸帧分到独立接口；选项清零时描述符、端点动作与 DMA 偏移与单功能版本逐字节一致。DMA arena 仍为 32 KiB：控制/通知端点使用更小的紧凑缓冲区布局（`dwc3_ep_buffer_offset()`）。
+
 先在独立 UEFI 候选接收固定测试行，再验证 ExitBootServices 与 MMU 切换后的内存/控制器所有权。XNU 阶段通过原生映射、缓存和计时回调重建自己的上下文。保留图形控制台，将 USB 作为额外日志出口。
 
 当前默认 serial 是 `QcomXnuUsbDebug`。参考 VID/PID `1209:316d` 沿用 m1n1 的隔离开发测试标识；发布组件/设备前应落实适当产品标识，不能把它当作新模块已获分配的 ID。
